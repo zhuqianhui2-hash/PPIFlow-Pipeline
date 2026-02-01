@@ -281,6 +281,17 @@ def normalize_input(
     ranking.setdefault("top_k", 30)
     ranking.setdefault("composite_score", "iptm*100 - interface_score")
     out["ranking"] = ranking
+
+    work_queue = out.get("work_queue") or {}
+    work_queue.setdefault("enabled", True)
+    work_queue.setdefault("lease_seconds", 1800)
+    work_queue.setdefault("max_attempts", 1)
+    work_queue.setdefault("retry_failed", False)
+    work_queue.setdefault("batch_size", 1)
+    work_queue.setdefault("leader_timeout", 600)
+    work_queue.setdefault("wait_timeout", None)
+    work_queue.setdefault("allow_reuse", True)
+    out["work_queue"] = work_queue
     return out
 
 
@@ -378,6 +389,17 @@ def build_input_from_cli(args: Any) -> InputSpec:
         "samples_per_target": partial_samples,
     }
     ranking = {"top_k": args.rank_top_k}
+    work_queue = {
+        "enabled": True if args.work_queue else None,
+        "lease_seconds": args.work_queue_lease_seconds,
+        "max_attempts": args.work_queue_max_attempts,
+        "batch_size": args.work_queue_batch_size,
+        "leader_timeout": args.work_queue_leader_timeout,
+        "wait_timeout": args.work_queue_wait_timeout,
+        "retry_failed": True if args.retry_failed else None,
+        "allow_reuse": False if getattr(args, "work_queue_strict", False) else True,
+        "rebuild_from_outputs": True if getattr(args, "work_queue_rebuild", False) else None,
+    }
     data = {
         "protocol": protocol,
         "name": args.name,
@@ -389,6 +411,7 @@ def build_input_from_cli(args: Any) -> InputSpec:
         "filters": filters,
         "partial": partial,
         "ranking": ranking,
+        "work_queue": work_queue,
         "optional_af3_refold": bool(args.af3_refold) if args.af3_refold else None,
         "tools": {
             "ppiflow_ckpt": args.ppiflow_ckpt,

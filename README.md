@@ -3,13 +3,17 @@
 ![](./assets/model.png)
 
 PPIFlow is a flow-matching framework and unified design pipeline for de novo
-protein binders. This repo supports binder, antibody, and VHH protocols with a
-single resumable CLI pipeline. Legacy scripts and notebooks remain available for
-reference.
+protein binders. This fork supports binder, antibody, and VHH protocols with a
+single resumable CLI pipeline.
 
 ## Quickstart (Unified Pipeline)
 
 ### 1) Install
+
+Clone this repo:
+```bash
+git clone https://github.com/cytokineking/PPIFlow-Pipeline
+```
 
 Recommended: use the install script to set up the environment, external tool
 repos, and paths in one place. This fork expects you to supply:
@@ -35,15 +39,11 @@ Optional flags:
 - `--no-install-dockq` to skip DockQ
 - `--rosetta-db-path /path/to/rosetta/database` to override Rosetta DB
 
+Note: the full pipeline cannot be run without installing all tools.
+
 After install, load tool paths:
 ```bash
 source ./env.sh
-```
-
-If AbMPNN weights are tracked via Git LFS in this fork, make sure you have them:
-```bash
-git lfs install
-git lfs pull
 ```
 
 Manual option (if you want to manage tools yourself):
@@ -77,7 +77,7 @@ python ppiflow.py pipeline \
   --name il7ra_001 \
   --target_pdb /path/to/target.pdb \
   --target_chains B \
-  --hotspots B119,B141,B200 \
+  --hotspots B3,B5-25,B72,B75 \
   --binder_length 75-90 \
   --samples_per_target 100 \
   --ppiflow_ckpt /path/to/binder.ckpt \
@@ -89,12 +89,13 @@ output directory and then run the pipeline.
 
 ## Pipeline CLI
 
-The unified CLI lives in `ppiflow.py` and exposes four commands:
+The unified CLI lives in `ppiflow.py` and exposes these commands:
 
 - `pipeline`: configure + execute
 - `configure`: write per-step configs + `steps.yaml`
 - `execute`: run from `steps.yaml`
 - `rank`: run the rank step only
+- `orchestrate`: run per-step pools (advanced)
 
 Common flags:
 
@@ -102,27 +103,44 @@ Common flags:
 - `--preset`: `fast|full|custom` (default: `full`)
 - `--input`: path to `design.yaml` (optional)
 - `--output`: output directory (required)
-- `--steps`: `all|gen,seq,score,rosetta,partial,rank`
+- `--steps`: `all|gen,seq1,flowpacker1,af3score1,rosetta_interface,interface_enrich,partial,seq2,flowpacker2,af3score2,relax,af3_refold,dockq,rank_features,rank_finalize`
 - `--reuse`: skip outputs that already exist
-- `--partial_start_t`: partial flow start_t (default 0.6)
-- `--af3score1_iptm_min`: round-1 ipTM threshold (default 0.2)
-- `--af3score2_iptm_min`: round-2 ipTM threshold (default 0.5)
-- `--af3score2_ptm_min`: round-2 pTM threshold (default 0.8)
-- `--interface_energy_min`: interface energy cutoff (default -5.0)
-- `--interface_distance`: interface distance cutoff (default 12.0)
-- `--relax_max_iter`: Rosetta relax max iterations (default 170)
-- `--relax_fixbb`: fix backbone for chains listed in `--fixed_chains`
-- `--fixed_chains`: chains to fix (underscore or comma-separated, e.g. `A_B` or `A,B`)
-- `--dockq_min`: DockQ threshold (default 0.49)
-- `--rank_top_k`: number of finalists (default 30)
+- `--work-queue`: enable parallel/resume engine (default in configs)
+- `--num-devices`: number of GPUs/workers (e.g. `4` or `all`). For specific GPUs: `--num-devices 3 --devices 0,2,3`
+- `--skip-config`: reuse existing configs if present (auto-configure if missing)
+- `--force-config`: always regenerate configs before running
+
+Notes:
+
+- `rank` command runs `rank_features` + `rank_finalize`.
+- `--continue-on-error` allows a step to complete even if some items fail.
 
 CLI-only input flags (when `--input` is omitted):
 
-- `--name`
-- `--target_pdb`, `--target_chains`, `--hotspots`
-- Binder: `--binder_length`
-- Antibody/VHH: `--framework_pdb`, `--heavy_chain`, `--light_chain` (omit for VHH), `--cdr_length`
-- Tools: `--ppiflow_ckpt`, `--mpnn_ckpt`, `--abmpnn_ckpt`, `--af3score_repo`,
+- **Required (no YAML):**
+  - `--protocol`, `--name`
+  - `--target_pdb`, `--target_chains`
+  - Binder: `--binder_length`
+  - Antibody/VHH: `--framework_pdb`, `--heavy_chain`, `--cdr_length` (plus `--light_chain` for antibody)
+- **Optional:**
+  - `--hotspots`
+  - `--samples_per_target` (default 100)
+  - `--ppiflow_ckpt` (required if not provided by your install/env)
+
+If you used the installer and `source ./env.sh`, most tool paths can be omitted.
+
+Advanced knobs (optional):
+
+- Work-queue tuning: `--work-queue-max-attempts`, `--retry-failed`, `--work-queue-strict`,
+  `--work-queue-rebuild`, `--work-queue-lease-seconds`, `--work-queue-wait-timeout`
+- Filters: `--af3score1_iptm_min`, `--af3score2_iptm_min`, `--af3score2_ptm_min`,
+  `--dockq_min`
+- Rosetta: `--interface_energy_min`, `--interface_distance`, `--relax_max_iter`,
+  `--relax_fixbb`, `--fixed_chains`
+- Ranking: `--rank_top_k`
+- GPU binding (advanced): `--devices 0,1,2` or `--devices all`
+- AF3Score: `--af3-num-workers` (defaults to run_af3score.py default)
+- Tool paths: `--ppiflow_ckpt`, `--mpnn_ckpt`, `--abmpnn_ckpt`, `--af3score_repo`,
   `--flowpacker_repo`, `--af3_weights`, `--mpnn_repo`, `--rosetta_bin`,
   `--rosetta_db`, `--abmpnn_repo`, `--mpnn_run`, `--abmpnn_run`, `--dockq_bin`
 - Sequence design knobs: `--seq1_num_per_backbone`, `--seq1_temp`,
@@ -131,98 +149,11 @@ CLI-only input flags (when `--input` is omitted):
 
 ## Input Schema (`design.yaml`)
 
-Minimal binder example:
+Example templates:
 
-```yaml
-protocol: binder
-name: il7ra_001
-
-target:
-  pdb: /path/to/target.pdb
-  chains: ["B"]
-  hotspots: ["B119", "B141", "B200"]
-
-binder:
-  length: "75-90"
-
-sampling:
-  samples_per_target: 100
-
-tools:
-  ppiflow_ckpt: /path/to/binder.ckpt
-  mpnn_ckpt: /path/to/proteinmpnn
-  mpnn_run: /path/to/protein_mpnn_run.py
-  af3score_repo: /path/to/af3score
-  flowpacker_repo: /path/to/flowpacker
-  # rosetta_bin optional if installer wires assets/tools/rosetta_scripts
-  rosetta_bin: /path/to/rosetta_scripts
-  # rosetta_db is optional; installer wires it if available.
-  rosetta_db: /path/to/rosetta/database
-  af3_weights: /path/to/af3/weights/dir   # contains af3.bin (installer sets this)
-sequence_design:
-  round1:
-    num_seq_per_backbone: 16
-    sampling_temp: 0.2
-    bias_large_residues: true
-    bias_num: 8
-  round2:
-    num_seq_per_backbone: 8
-    sampling_temp: 0.1
-partial:
-  start_t: 0.6
-  samples_per_target: 8
-filters:
-  af3score:
-    round1:
-      iptm_min: 0.2
-    round2:
-      iptm_min: 0.5
-      ptm_min: 0.8
-  rosetta:
-    interface_energy_min: -5.0
-    interface_distance: 12.0
-    relax_max_iter: 170
-    relax_fixbb: false
-    fixed_chains: ""   # e.g. "A_B" to fix A and B backbones
-    # Defaults above mirror the legacy VHH notebook relax settings.
-  dockq:
-    min: 0.49
-ranking:
-  top_k: 30
-  composite_score: "iptm*100 - interface_score"
-
-# Set dockq.min to null to disable the DockQ step.
-```
-
-Antibody or VHH example:
-
-```yaml
-protocol: antibody  # or vhh
-name: il13_001
-
-target:
-  pdb: /path/to/antigen.pdb
-  chains: ["C"]
-  hotspots: ["C11", "C14", "C15"]
-
-framework:
-  pdb: /path/to/framework.pdb
-  heavy_chain: A
-  light_chain: B        # omit for vhh
-  cdr_length: "CDRH1,8-8,CDRH2,8-8,CDRH3,10-20,CDRL1,6-9,CDRL2,3-3,CDRL3,9-11"
-
-sampling:
-  samples_per_target: 100
-
-tools:
-  ppiflow_ckpt: /path/to/antibody.ckpt
-  abmpnn_ckpt: /path/to/abmpnn
-  abmpnn_run: /path/to/protein_mpnn_run.py
-  af3score_repo: /path/to/af3score
-  flowpacker_repo: /path/to/flowpacker
-  rosetta_db: /path/to/rosetta/database
-  af3_weights: /path/to/af3.bin.zst
-```
+- [assets/examples/binder_minimal.yaml](assets/examples/binder_minimal.yaml)
+- [assets/examples/antibody_minimal.yaml](assets/examples/antibody_minimal.yaml)
+- [assets/examples/vhh_minimal.yaml](assets/examples/vhh_minimal.yaml)
 
 Validation highlights:
 
@@ -231,19 +162,112 @@ Validation highlights:
 - Antibody: `framework.pdb`, `framework.heavy_chain`, `framework.light_chain`, `framework.cdr_length` required.
 - VHH: `framework.pdb`, `framework.heavy_chain`, `framework.cdr_length` required; omit `framework.light_chain`.
 
+## Antibody & VHH Framework Quickstart
+
+Bundled frameworks live in `assets/frameworks/`. Use the following copy‑paste flag blocks.
+
+VHH (nanobody) frameworks (single‑chain A):
+
+- 5JDS nanobody
+  ```bash
+  --framework_pdb assets/frameworks/5jds_nanobody_framework.pdb \
+  --heavy_chain A \
+  --cdr_length "CDRH1,8-8,CDRH2,8-8,CDRH3,21-21"
+  ```
+
+- 7EOW nanobody
+  ```bash
+  --framework_pdb assets/frameworks/7eow_nanobody_framework.pdb \
+  --heavy_chain A \
+  --cdr_length "CDRH1,8-8,CDRH2,8-8,CDRH3,20-20"
+  ```
+
+- 7XL0 nanobody
+  ```bash
+  --framework_pdb assets/frameworks/7xl0_nanobody_framework.pdb \
+  --heavy_chain A \
+  --cdr_length "CDRH1,8-8,CDRH2,7-7,CDRH3,15-15"
+  ```
+
+- 8COH nanobody
+  ```bash
+  --framework_pdb assets/frameworks/8coh_nanobody_framework.pdb \
+  --heavy_chain A \
+  --cdr_length "CDRH1,8-8,CDRH2,8-8,CDRH3,19-19"
+  ```
+
+- 8Z8V nanobody
+  ```bash
+  --framework_pdb assets/frameworks/8z8v_nanobody_framework.pdb \
+  --heavy_chain A \
+  --cdr_length "CDRH1,8-8,CDRH2,8-8,CDRH3,8-8"
+  ```
+
+scFv/antibody frameworks (heavy A, light B):
+
+- 6NOU scFv
+  ```bash
+  --framework_pdb assets/frameworks/6nou_scfv_framework.pdb \
+  --heavy_chain A --light_chain B \
+  --cdr_length "CDRH1,8-8,CDRH2,8-8,CDRH3,12-12,CDRL1,11-11,CDRL2,3-3,CDRL3,9-9"
+  ```
+
+- 6TCS scFv
+  ```bash
+  --framework_pdb assets/frameworks/6tcs_scfv_framework.pdb \
+  --heavy_chain A --light_chain B \
+  --cdr_length "CDRH1,9-9,CDRH2,7-7,CDRH3,14-14,CDRL1,10-10,CDRL2,3-3,CDRL3,9-9"
+  ```
+
+- 6ZQK scFv
+  ```bash
+  --framework_pdb assets/frameworks/6zqk_scfv_framework.pdb \
+  --heavy_chain A --light_chain B \
+  --cdr_length "CDRH1,8-8,CDRH2,8-8,CDRH3,13-13,CDRL1,6-6,CDRL2,3-3,CDRL3,9-9"
+  ```
+
+Full runnable examples:
+
+```bash
+python ppiflow.py pipeline \
+  --protocol vhh \
+  --name vhh_demo \
+  --target_pdb /path/to/antigen.pdb \
+  --target_chains C \
+  --framework_pdb assets/frameworks/7eow_nanobody_framework.pdb \
+  --heavy_chain A \
+  --cdr_length "CDRH1,8-8,CDRH2,8-8,CDRH3,20-20" \
+  --samples_per_target 50 \
+  --output /path/to/out_dir
+```
+
+```bash
+python ppiflow.py pipeline \
+  --protocol antibody \
+  --name ab_demo \
+  --target_pdb /path/to/antigen.pdb \
+  --target_chains C \
+  --framework_pdb assets/frameworks/6nou_scfv_framework.pdb \
+  --heavy_chain A --light_chain B \
+  --cdr_length "CDRH1,8-8,CDRH2,8-8,CDRH3,12-12,CDRL1,11-11,CDRL2,3-3,CDRL3,9-9" \
+  --samples_per_target 50 \
+  --output /path/to/out_dir
+```
+
 ## Multi-Chain Targets, Concatenation, and Chain Conventions
 
 Supported hotspot specs (ColabDesign/BindCraft-style):
 
-- `C` → whole chain C is hotspot
-- `C62-73` → range on chain C
-- `C62` → single residue
-- Mixed list: `A,C1-10,C45`
+- Chain ID is always required:
+  - `C` → whole chain C is hotspot
+  - `C62` → single residue
+  - `C62-73` → range on chain C
+  - Mixed list: `A3,A5-25,B72,B75`
 
 Behavior (pipeline runs):
 
 - **All protocols** accept multi-chain targets via `target.chains`. During
-  `configure`, all target chains are concatenated into a single **chain B** PDB
+  `configure`, all target chains are concatenated into a single gapped **chain B** PDB
   written under `output/inputs/`.
 - **Chain conventions**:
   - Binder/VHH: binder is **A**, target is **B**
@@ -281,7 +305,7 @@ After `configure`, edit these per-step configs to provide commands:
 Each step config supports a `command` field that can be a string or list, and
 will be executed as a subprocess during `execute`.
 
-## Output Layout and Resume
+## Output Layout
 
 The pipeline writes a deterministic layout under your output directory:
 
@@ -289,22 +313,40 @@ The pipeline writes a deterministic layout under your output directory:
 - `steps.yaml`: manifest of pipeline steps
 - `pipeline_input.json`: normalized input (resume identity)
 - `pipeline_state.json`: run metadata + tool stamps
-- `runs/run_XXX/`: per-run artifacts
-- `runs/run_XXX/interface_enrich/`: fixed positions from Rosetta interface energies
-- `runs/run_XXX/flowpacker_round2/`, `runs/run_XXX/af3score_round2/`: round-2 maturation
-- `runs/run_XXX/dockq/`: optional DockQ results
-- `results/` and `results_vN/`: ranked outputs (rank step snapshots)
-
-Resume behavior:
-
-- `--reuse` skips outputs that already exist
-- missing-index fill supports changing `WORLD_SIZE` across resumes
-- mismatched input hash or tool stamps requires a new output directory
+- `output/`: step outputs (backbones, seqs, scores, rosetta, etc.)
+- `results/`: ranked outputs (rank step; reruns may create `results_vN/`)
+- `.work/<step>/queue.db`: progress ledger for resume
 
 Heartbeat/status files (optional):
 
 - `status.json` and `status_rank*.json` written to the output root
 - set `PPIFLOW_HEARTBEAT=0` to disable
+
+## Parallelization & Resume
+
+PPIFlow runs on a single GPU or many GPUs. To scale out, set `--num-devices`
+(one worker per GPU). You can stop and resume later with a different number of
+GPUs. Defaults are tuned for large design batches where some failures are
+expected.
+
+Common patterns:
+
+```bash
+# Parallelize across multiple GPUs (one worker per GPU)
+python ppiflow.py execute --output out_dir --num-devices all
+
+# Resume after interruption (any GPU count)
+python ppiflow.py execute --output out_dir --num-devices all
+
+# Retry failed items only
+python ppiflow.py execute --output out_dir --retry-failed
+
+# Strict mode: verify outputs for completed items (fails if missing)
+python ppiflow.py execute --output out_dir --work-queue-strict
+
+# If the progress DB is missing or corrupted, rebuild from outputs
+python ppiflow.py execute --output out_dir --work-queue-rebuild
+```
 
 ## Troubleshooting
 

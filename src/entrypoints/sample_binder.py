@@ -6,6 +6,8 @@ import os
 import shutil
 import argparse
 import json
+import threading
+import time
 import re
 import random
 import sys
@@ -257,7 +259,53 @@ def run_pipeline(args) -> None:
     exp = Experiment(cfg=cfg)
 
     print("\nRunning inference...")
-    exp.test()
+    expected_total = len(sample_ids_override) if sample_ids_override is not None else int(args.samples_per_target)
+    progress_path = Path(output_dir) / "progress.json"
+
+    def _count_outputs() -> int:
+        name = args.name
+        count = 0
+        for fp in Path(output_dir).glob(f"{name}_*.pdb"):
+            stem = fp.stem
+            if not stem.startswith(f"{name}_"):
+                continue
+            suffix = stem[len(name) + 1 :]
+            if suffix.isdigit():
+                count += 1
+        return count
+
+    def _write_progress(produced: int, status: str) -> None:
+        payload = {
+            "expected_total": max(int(expected_total), 0),
+            "produced_total": max(int(produced), 0),
+            "status": status,
+            "updated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        }
+        try:
+            tmp = progress_path.with_suffix(".json.tmp")
+            tmp.write_text(json.dumps(payload, separators=(",", ":")))
+            tmp.replace(progress_path)
+        except Exception:
+            pass
+
+    stop_event = threading.Event()
+
+    def _progress_loop() -> None:
+        while not stop_event.wait(30.0):
+            try:
+                _write_progress(_count_outputs(), "running")
+            except Exception:
+                pass
+
+    _write_progress(0, "running")
+    t = threading.Thread(target=_progress_loop, daemon=True)
+    t.start()
+    try:
+        exp.test()
+    finally:
+        stop_event.set()
+        t.join(timeout=1.0)
+        _write_progress(_count_outputs(), "completed")
     print("Sampling finished.")
 
 

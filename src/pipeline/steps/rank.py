@@ -11,12 +11,15 @@ from typing import Any
 
 from .base import Step, StepContext, StepError
 from ..io import ensure_dir, read_json, write_json
+from ..work_queue import WorkItem
 
 
 class RankStep(Step):
     name = "rank"
     stage = "rank"
     supports_indices = False
+    supports_work_queue = True
+    work_queue_mode = "leader"
 
     def expected_total(self, ctx: StepContext) -> int:
         sampling = ctx.input_data.get("sampling") or {}
@@ -257,15 +260,9 @@ class RankStep(Step):
                         mapping_by_id.setdefault(int(parts[0]), fp)
         return mapping_by_id, mapping_by_name
 
-    def run_full(self, ctx: StepContext) -> None:
+    def _compute_rows(self, ctx: StepContext) -> tuple[list[dict[str, Any]], bool]:
         out_dir = ctx.out_dir
         run_dir = out_dir / "output"
-        results_dir = self._allocate_results_dir(out_dir)
-        ensure_dir(results_dir)
-        structures_dir = results_dir / "structures"
-        top_dir = structures_dir / "top"
-        ensure_dir(top_dir)
-
         name = ctx.input_data.get("name", "design")
         metrics_path = self._find_metrics_csv(run_dir)
 
@@ -276,16 +273,13 @@ class RankStep(Step):
             interface_scores = self._augment_binder_interface_scores(run_dir, interface_scores)
         dockq_scores = self._load_dockq_scores(run_dir)
         using_refold = bool(metrics_path and "af3_refold" in str(metrics_path))
+
         if metrics_path and metrics_path.exists():
             try:
                 import pandas as pd
 
                 df = pd.read_csv(metrics_path)
-                score_col = self._pick_score_column(
-                    list(df.columns),
-                    df=df,
-                    protocol=str(ctx.input_data.get("protocol") or ""),
-                )
+                score_col = self._pick_score_column(list(df.columns), df=df, protocol=protocol)
                 ptm_col = self._pick_ptm_column(list(df.columns))
                 if score_col:
                     df = df.sort_values(score_col, ascending=False)
@@ -360,7 +354,6 @@ class RankStep(Step):
                 passed = False
             r["passed_filter"] = passed
 
-        # Composite score: iptm*100 - interface_score
         for r in rows:
             try:
                 iptm = float(r.get("iptm")) if r.get("iptm") is not None else None
@@ -372,6 +365,32 @@ class RankStep(Step):
                 r["composite_score"] = iptm * 100.0 - interface_score
             else:
                 r["composite_score"] = None
+
+        return rows, using_refold
+
+    def run_full(self, ctx: StepContext) -> None:
+        out_dir = ctx.out_dir
+        results_dir = self._allocate_results_dir(out_dir)
+        ensure_dir(results_dir)
+        structures_dir = results_dir / "structures"
+        top_dir = structures_dir / "top"
+        ensure_dir(top_dir)
+        rows: list[dict[str, Any]] = []
+        features_dir = self.cfg.get("features_dir")
+        if features_dir:
+            p = Path(str(features_dir))
+            if not p.is_absolute():
+                p = ctx.out_dir / p
+            if p.exists():
+                for fp in sorted(p.glob("*.json")):
+                    try:
+                        data = read_json(fp)
+                        if isinstance(data, dict):
+                            rows.append(data)
+                    except Exception:
+                        continue
+        if not rows:
+            rows, _ = self._compute_rows(ctx)
 
         ranking_rows = [r for r in rows if r.get("passed_filter")]
         if not ranking_rows:
@@ -443,3 +462,55 @@ class RankStep(Step):
             },
             indent=2,
         )
+
+
+class RankFeaturesStep(RankStep):
+    name = "rank_features"
+    stage = "rank"
+    supports_indices = False
+    supports_work_queue = True
+    work_queue_mode = "items"
+
+    def expected_total(self, ctx: StepContext) -> int:
+        return 1
+
+    def build_items(self, ctx: StepContext) -> list[WorkItem]:
+        rows, _ = self._compute_rows(ctx)
+        items: list[WorkItem] = []
+        seen: set[str] = set()
+        for idx, row in enumerate(rows):
+            raw_id = row.get("design_id")
+            base_id = str(raw_id) if raw_id is not None and str(raw_id) != "nan" else f"row_{idx}"
+            item_id = base_id
+            if item_id in seen:
+                item_id = f"{base_id}_{idx}"
+            seen.add(item_id)
+            payload = dict(row)
+            payload["design_id"] = raw_id
+            items.append(WorkItem(id=item_id, payload=payload))
+        return items
+
+    def item_done(self, ctx: StepContext, item: WorkItem) -> bool:
+        out_dir = self.output_dir(ctx)
+        return (out_dir / f"{item.id}.json").exists()
+
+    def run_item(self, ctx: StepContext, item: WorkItem) -> None:
+        out_dir = self.output_dir(ctx)
+        out_dir.mkdir(parents=True, exist_ok=True)
+
+        def _coerce(val: Any) -> Any:
+            if val is None:
+                return None
+            if isinstance(val, (str, int, float, bool)):
+                return val
+            try:
+                # numpy scalars
+                return val.item()
+            except Exception:
+                pass
+            if isinstance(val, Path):
+                return str(val)
+            return str(val)
+
+        payload = {k: _coerce(v) for k, v in (item.payload or {}).items()}
+        write_json(out_dir / f"{item.id}.json", payload, indent=2)

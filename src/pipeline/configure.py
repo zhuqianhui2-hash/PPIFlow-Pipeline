@@ -118,13 +118,20 @@ def _step_config(name: str, run_id: int, input_data: dict) -> dict:
             "manifest": f"{manifests_dir}/dockq.csv",
             "input_dir": f"{run_dir}/af3_refold/pdbs" if use_refold else f"{run_dir}/relax",
         })
-    elif name == "rank":
+    elif name == "rank_features":
+        cfg.update({
+            "stage": "rank",
+            "output_dir": "results/features",
+            "manifest": None,
+        })
+    elif name == "rank_finalize":
         cfg.update({
             "stage": "rank",
             "output_dir": "results",
             "manifest": "results/summary.csv",
         })
         cfg["ranking"] = input_data.get("ranking") or {}
+        cfg["features_dir"] = "results/features"
     elif name == "af3_refold":
         cfg.update({
             "stage": "score",
@@ -233,7 +240,15 @@ def _resolve_binder_chain(input_data: dict) -> str:
     return str(input_data.get("binder_chain") or "A")
 
 
-def _apply_default_command(step_name: str, run_id: int, out_dir: Path, input_data: dict, cfg: dict) -> None:
+def _apply_default_command(
+    step_name: str,
+    run_id: int,
+    out_dir: Path,
+    input_data: dict,
+    cfg: dict,
+    *,
+    args: Any | None = None,
+) -> None:
     tools = input_data.get("tools") or {}
     root = repo_root()
 
@@ -307,6 +322,10 @@ def _apply_default_command(step_name: str, run_id: int, out_dir: Path, input_dat
             "--export_pdb_dir",
             str(output_dir / "pdbs"),
         ]
+        if args is not None:
+            num_workers = getattr(args, "af3_num_workers", None)
+            if num_workers is not None and "--num_workers" not in cfg["command"]:
+                cfg["command"].extend(["--num_workers", str(int(num_workers))])
         af3_db = tools.get("af3_db")
         if af3_db:
             cfg["command"].extend(["--db_dir", str(af3_db)])
@@ -346,6 +365,10 @@ def _apply_default_command(step_name: str, run_id: int, out_dir: Path, input_dat
             "--export_pdb_dir",
             str(output_dir / "pdbs"),
         ]
+        if args is not None:
+            num_workers = getattr(args, "af3_num_workers", None)
+            if num_workers is not None and "--num_workers" not in cfg["command"]:
+                cfg["command"].extend(["--num_workers", str(int(num_workers))])
         if num_samples is not None:
             cfg["command"].extend(["--num_samples", str(int(num_samples))])
         if model_seeds:
@@ -390,6 +413,14 @@ def _apply_default_command(step_name: str, run_id: int, out_dir: Path, input_dat
             "10",
             "--skip_existing",
         ]
+        cfg["dockq"] = {
+            "dockq_bin": str(dockq_bin),
+            "input_pdb_dir": str(input_pdb_dir),
+            "reference_pdb_dir": str(reference_pdb_dir),
+            "output_dir": str(output_dir),
+            "allowed_mismatches": 10,
+            "skip_existing": True,
+        }
         return
 
 def configure_pipeline(args) -> dict:
@@ -457,7 +488,7 @@ def configure_pipeline(args) -> dict:
     for step_name in steps_to_write:
         cfg = _step_config(step_name, run_id, normalized)
         cfg["input"] = normalized
-        _apply_default_command(step_name, run_id, out_dir, normalized, cfg)
+        _apply_default_command(step_name, run_id, out_dir, normalized, cfg, args=args)
         cfg_path = config_dir / f"step_{step_name}.yaml"
         write_yaml(cfg_path, cfg)
         steps_info.append({"name": step_name, "config_file": str(cfg_path.relative_to(out_dir))})

@@ -4,6 +4,8 @@ import os
 from pathlib import Path
 
 from .base import Step, StepContext
+from ..work_queue import WorkItem
+from ..io import collect_pdbs
 from ..logging_utils import run_command
 from ..manifests import extract_design_id, structure_id_from_name, write_csv
 
@@ -12,6 +14,8 @@ class DockQStep(Step):
     name = "dockq"
     stage = "score"
     supports_indices = False
+    supports_work_queue = True
+    work_queue_mode = "items"
 
     def expected_total(self, ctx: StepContext) -> int:
         return 1
@@ -44,6 +48,97 @@ class DockQStep(Step):
             return
         if isinstance(cmd, str):
             cmd = [cmd]
+        run_command(
+            cmd,
+            env=os.environ.copy(),
+            log_file=self.cfg.get("_log_file"),
+            verbose=bool(self.cfg.get("_verbose")),
+        )
+
+    def _dockq_config(self) -> dict:
+        cfg = dict(self.cfg.get("dockq") or {})
+        if cfg:
+            return cfg
+        cmd = self.cfg.get("command") or []
+        if isinstance(cmd, str):
+            cmd = [cmd]
+        out: dict[str, object] = {}
+        for idx, token in enumerate(cmd):
+            if token in {"--dockq_bin", "--input_pdb_dir", "--reference_pdb_dir", "--output_dir", "--allowed_mismatches"}:
+                if idx + 1 < len(cmd):
+                    out[token.lstrip("-")] = cmd[idx + 1]
+            elif token == "--skip_existing":
+                out["skip_existing"] = True
+        return out
+
+    def build_items(self, ctx: StepContext) -> list[WorkItem]:
+        cfg = self._dockq_config()
+        input_dir = cfg.get("input_pdb_dir")
+        if not input_dir:
+            return []
+        input_path = Path(str(input_dir))
+        if not input_path.is_absolute():
+            input_path = ctx.out_dir / input_path
+        models = collect_pdbs(input_path)
+        items: list[WorkItem] = []
+        for model in models:
+            rel = model.relative_to(input_path).as_posix()
+            item_id = rel.replace("/", "__")
+            items.append(
+                WorkItem(
+                    id=item_id,
+                    payload={
+                        "model_path": str(model),
+                        "model_name": model.stem,
+                    },
+                )
+            )
+        return items
+
+    def item_done(self, ctx: StepContext, item: WorkItem) -> bool:
+        cfg = self._dockq_config()
+        output_dir = cfg.get("output_dir")
+        if not output_dir:
+            return False
+        out_path = Path(str(output_dir))
+        if not out_path.is_absolute():
+            out_path = ctx.out_dir / out_path
+        model_name = str((item.payload or {}).get("model_name"))
+        return (out_path / f"{model_name}_dockq_score").exists()
+
+    def run_item(self, ctx: StepContext, item: WorkItem) -> None:
+        cfg = self._dockq_config()
+        dockq_bin = cfg.get("dockq_bin")
+        input_pdb = (item.payload or {}).get("model_path")
+        reference_dir = cfg.get("reference_pdb_dir")
+        output_dir = cfg.get("output_dir")
+        allowed = cfg.get("allowed_mismatches") or 10
+        skip_existing = bool(cfg.get("skip_existing"))
+        if not dockq_bin or not input_pdb or not reference_dir or not output_dir:
+            raise RuntimeError("dockq config missing required fields")
+        script = Path(__file__).resolve().parents[3] / "scripts" / "run_dockq.py"
+        ref_path = Path(str(reference_dir))
+        if not ref_path.is_absolute():
+            ref_path = ctx.out_dir / ref_path
+        out_path = Path(str(output_dir))
+        if not out_path.is_absolute():
+            out_path = ctx.out_dir / out_path
+        cmd = [
+            "python",
+            str(script),
+            "--dockq_bin",
+            str(dockq_bin),
+            "--input_pdb",
+            str(input_pdb),
+            "--reference_pdb_dir",
+            str(ref_path),
+            "--output_dir",
+            str(out_path),
+            "--allowed_mismatches",
+            str(int(allowed)),
+        ]
+        if skip_existing:
+            cmd.append("--skip_existing")
         run_command(
             cmd,
             env=os.environ.copy(),

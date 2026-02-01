@@ -63,6 +63,23 @@ def list_files(path: str | Path, pattern: str) -> list[Path]:
     return list(p.glob(pattern))
 
 
+def is_ignored_path(path: Path, *, ignored: tuple[str, ...] = (".tmp", ".work", ".done")) -> bool:
+    return any(part in ignored for part in path.parts)
+
+
+def collect_pdbs(root: str | Path) -> list[Path]:
+    base = Path(root)
+    if not base.exists():
+        return []
+    pdbs: list[Path] = []
+    for fp in base.rglob("*.pdb"):
+        if is_ignored_path(fp):
+            continue
+        pdbs.append(fp)
+    pdbs.sort(key=lambda p: p.as_posix())
+    return pdbs
+
+
 def safe_relpath(path: str | Path, base: str | Path) -> str:
     try:
         return str(Path(path).resolve().relative_to(Path(base).resolve()))

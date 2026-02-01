@@ -211,7 +211,8 @@ class HeartbeatReporter:
 
         _atomic_write_json(self._rank_path(), payload)
 
-        if self.rank == 0:
+        wq_dir = os.environ.get("PPIFLOW_WORK_QUEUE_DIR")
+        if self.rank == 0 or wq_dir:
             agg = self._aggregate(now=now)
             _atomic_write_json(self._global_path(), agg)
 
@@ -261,6 +262,20 @@ class HeartbeatReporter:
                 per_rank.append(
                     {"rank": r, "produced_total": 0, "expected_total": 0, "updated_at": None}
                 )
+
+        # If work queue progress is available, prefer ledger-derived totals.
+        wq_dir = os.environ.get("PPIFLOW_WORK_QUEUE_DIR")
+        if wq_dir:
+            try:
+                from .work_queue import load_progress
+
+                progress = load_progress(Path(wq_dir))
+                if progress:
+                    expected_sum = int(progress.get("expected_total") or 0)
+                    produced_sum = int(progress.get("produced_total") or 0)
+                    self._state = str(progress.get("status") or self._state)
+            except Exception:
+                pass
 
         expected = max(expected_sum, 1)
         percent = min(max(produced_sum / expected, 0.0), 1.0)

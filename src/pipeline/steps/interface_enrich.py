@@ -36,6 +36,8 @@ class InterfaceEnrichStep(Step):
     name = "interface_enrich"
     stage = "rosetta"
     supports_indices = False
+    supports_work_queue = True
+    work_queue_mode = "leader"
 
     def expected_total(self, ctx: StepContext) -> int:
         return 1

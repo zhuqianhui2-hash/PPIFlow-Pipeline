@@ -12,7 +12,7 @@ from .external import (
     AF3RefoldStep,
 )
 from .rosetta_steps import RosettaInterfaceStep, RosettaRelaxStep
-from .rank import RankStep
+from .rank import RankStep, RankFeaturesStep
 
 STEP_REGISTRY = {
     "gen": GenStep,
@@ -27,7 +27,8 @@ STEP_REGISTRY = {
     "af3score2": AF3ScoreStep,
     "relax": RosettaRelaxStep,
     "dockq": DockQStep,
-    "rank": RankStep,
+    "rank_features": RankFeaturesStep,
+    "rank_finalize": RankStep,
     "af3_refold": AF3RefoldStep,
 }
 
@@ -45,17 +46,8 @@ STEP_ORDER = [
     "relax",
     "af3_refold",
     "dockq",
-    "rank",
+    "rank_features",
+    "rank_finalize",
 ]
 
-STEP_GROUPS = {
-    "gen": ["gen"],
-    "seq": ["seq1", "seq2"],
-    "score": ["flowpacker1", "flowpacker2", "af3score1", "af3score2", "af3_refold", "dockq"],
-    "rosetta": ["rosetta_interface", "interface_enrich", "relax"],
-    "partial": ["partial"],
-    "rank": ["rank"],
-    "all": STEP_ORDER,
-}
-
-__all__ = ["STEP_REGISTRY", "STEP_ORDER", "STEP_GROUPS", "Step"]
+__all__ = ["STEP_REGISTRY", "STEP_ORDER", "Step"]

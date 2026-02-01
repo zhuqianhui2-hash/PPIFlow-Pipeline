@@ -5,6 +5,8 @@ from pathlib import Path
 
 from .configure import configure_pipeline
 from .execute import execute_pipeline
+from .orchestrate import orchestrate_pipeline
+from .wizard import run_wizard
 
 
 def _add_common_args(parser: argparse.ArgumentParser) -> None:
@@ -16,7 +18,7 @@ def _add_common_args(parser: argparse.ArgumentParser) -> None:
         "--steps",
         type=str,
         default="all",
-        help="Step groups or step names (all|gen,seq,score,rosetta,partial,rank)",
+        help="Step names (all or comma-separated step list)",
     )
     parser.add_argument("--reuse", action="store_true", help="Reuse existing outputs")
     parser.add_argument(
@@ -29,8 +31,21 @@ def _add_common_args(parser: argparse.ArgumentParser) -> None:
         action="store_true",
         help="Stream step subprocess output to console (also logs to file)",
     )
-    parser.add_argument("--num-workers", type=int, default=8)
-    parser.add_argument("--devices", type=str, default=None)
+    parser.add_argument("--num-devices", type=str, default=None, help="Number of GPUs/workers (e.g. 4 or 'all')")
+    parser.add_argument("--devices", type=str, default=None, help="Comma-separated GPU list or 'all'")
+
+
+def _add_work_queue_args(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--work-queue", action="store_true", help="Enable work queue")
+    parser.add_argument("--work-queue-lease-seconds", type=int, default=None)
+    parser.add_argument("--work-queue-max-attempts", type=int, default=None)
+    parser.add_argument("--work-queue-batch-size", type=int, default=None)
+    parser.add_argument("--work-queue-leader-timeout", type=int, default=None)
+    parser.add_argument("--work-queue-wait-timeout", type=int, default=None)
+    parser.add_argument("--retry-failed", action="store_true")
+    parser.add_argument("--work-queue-reuse", action="store_true")
+    parser.add_argument("--work-queue-strict", action="store_true", help="Disable reuse; enforce strict checks")
+    parser.add_argument("--work-queue-rebuild", action="store_true", help="Drop/rebuild queue.db from outputs")
 
 
 def _add_cli_input_args(parser: argparse.ArgumentParser) -> None:
@@ -81,6 +96,12 @@ def _add_cli_input_args(parser: argparse.ArgumentParser) -> None:
         default=None,
         help="AF3 refold: disable templates",
     )
+    parser.add_argument(
+        "--af3-num-workers",
+        type=int,
+        default=None,
+        help="AF3Score: num_workers (advanced; defaults to run_af3score.py default)",
+    )
     parser.add_argument("--interface_energy_min", type=float, help="Rosetta interface energy cutoff (REU)")
     parser.add_argument("--interface_distance", type=float, help="Rosetta interface distance cutoff (A)")
     parser.add_argument("--relax_max_iter", type=int, help="Rosetta relax max iterations (legacy)")
@@ -119,10 +140,22 @@ def build_parser() -> argparse.ArgumentParser:
 
     p_pipeline = sub.add_parser("pipeline", help="Configure then execute")
     _add_common_args(p_pipeline)
+    p_pipeline.add_argument(
+        "--skip-config",
+        action="store_true",
+        help="Skip configure if config files already exist (auto-configure if missing)",
+    )
+    p_pipeline.add_argument(
+        "--force-config",
+        action="store_true",
+        help="Always regenerate configs before running",
+    )
+    _add_work_queue_args(p_pipeline)
     _add_cli_input_args(p_pipeline)
 
     p_configure = sub.add_parser("configure", help="Write step configs and steps.yaml")
     _add_common_args(p_configure)
+    _add_work_queue_args(p_configure)
     _add_cli_input_args(p_configure)
 
     p_execute = sub.add_parser("execute", help="Execute from steps.yaml")
@@ -131,12 +164,39 @@ def build_parser() -> argparse.ArgumentParser:
     p_execute.add_argument("--reuse", action="store_true")
     p_execute.add_argument("--continue-on-error", action="store_true")
     p_execute.add_argument("--verbose", action="store_true")
+    p_execute.add_argument("--num-devices", type=str, default=None, help="Number of GPUs/workers (e.g. 4 or 'all')")
+    p_execute.add_argument("--devices", type=str, default=None, help="Comma-separated GPU list or 'all'")
+    _add_work_queue_args(p_execute)
 
     p_rank = sub.add_parser("rank", help="Run rank step only")
     p_rank.add_argument("--output", type=str, required=True)
     p_rank.add_argument("--reuse", action="store_true")
     p_rank.add_argument("--continue-on-error", action="store_true")
     p_rank.add_argument("--verbose", action="store_true")
+    p_rank.add_argument("--num-devices", type=str, default=None, help="Number of GPUs/workers (e.g. 4 or 'all')")
+    p_rank.add_argument("--devices", type=str, default=None, help="Comma-separated GPU list or 'all'")
+    _add_work_queue_args(p_rank)
+
+    p_orch = sub.add_parser("orchestrate", help="Run per-step work-queue pools")
+    p_orch.add_argument("--output", type=str, required=True)
+    p_orch.add_argument("--input", type=str, help="Path to design.yaml (used with --configure)")
+    p_orch.add_argument("--preset", type=str, choices=["fast", "full", "custom"], default="full")
+    p_orch.add_argument("--configure", action="store_true", help="Run configure if steps.yaml is missing")
+    p_orch.add_argument("--steps", type=str, default=None, help="Run a single step only")
+    p_orch.add_argument("--pool-size", type=int, default=None, help="Override pool size (advanced)")
+    p_orch.add_argument("--num-devices", type=str, default=None, help="Number of GPUs/workers (e.g. 4 or 'all')")
+    p_orch.add_argument("--max-retries", type=int, default=None, help="Max attempts per step")
+    p_orch.add_argument(
+        "--failure-policy",
+        type=str,
+        choices=["allow", "strict", "threshold"],
+        default=None,
+        help="Failure policy for item failures",
+    )
+    p_orch.add_argument("--no-bind", action="store_true", help="Do not set CUDA_VISIBLE_DEVICES or rank env vars")
+    p_orch.add_argument("--devices", type=str, default=None, help="Comma-separated GPU list or 'all'")
+
+    sub.add_parser("wizard", help="Interactive setup wizard")
 
     return parser
 
@@ -146,15 +206,48 @@ def main(argv: list[str] | None = None) -> None:
     args = parser.parse_args(argv)
 
     if args.command == "pipeline":
-        configure_pipeline(args)
-        execute_pipeline(args)
+        out_dir = Path(args.output).resolve()
+        steps_yaml = out_dir / "steps.yaml"
+        config_dir = out_dir / "config"
+        input_json = out_dir / "pipeline_input.json"
+        missing_config = not steps_yaml.exists() or not config_dir.exists() or not input_json.exists()
+
+        if getattr(args, "force_config", False):
+            configure_pipeline(args)
+        elif missing_config:
+            if getattr(args, "skip_config", False):
+                print("[pipeline] config files missing; running configure first.")
+            configure_pipeline(args)
+        else:
+            if getattr(args, "input", None) and not getattr(args, "skip_config", False):
+                print("[pipeline] using existing config; use --force-config to regenerate.")
+
+        if getattr(args, "num_devices", None):
+            step_arg = getattr(args, "steps", None)
+            if step_arg and "," in step_arg and step_arg not in {"all", ""}:
+                raise SystemExit("--num-devices requires a single step or --steps all")
+            orchestrate_pipeline(args)
+        else:
+            execute_pipeline(args)
     elif args.command == "configure":
         configure_pipeline(args)
     elif args.command == "execute":
-        execute_pipeline(args)
+        if getattr(args, "num_devices", None):
+            step_arg = getattr(args, "steps", None)
+            if step_arg and "," in step_arg and step_arg not in {"all", ""}:
+                raise SystemExit("--num-devices requires a single step or --steps all")
+            orchestrate_pipeline(args)
+        else:
+            execute_pipeline(args)
     elif args.command == "rank":
-        args.steps = "rank"
+        if getattr(args, "num_devices", None):
+            raise SystemExit("rank does not support --num-devices (use execute/orchestrate instead)")
+        args.steps = "rank_features,rank_finalize"
         execute_pipeline(args)
+    elif args.command == "orchestrate":
+        orchestrate_pipeline(args)
+    elif args.command == "wizard":
+        run_wizard()
     else:
         raise SystemExit(f"Unknown command: {args.command}")
 

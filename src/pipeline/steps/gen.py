@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Any
 
 from .base import Step, StepContext, StepError
+from ..work_queue import WorkItem
 from ..logging_utils import log_command_progress, run_command
 from ..io import repo_root, write_json
 from ..manifests import extract_design_id, structure_id_from_name, write_csv
@@ -23,6 +24,8 @@ class GenStep(Step):
     name = "gen"
     stage = "gen"
     supports_indices = True
+    supports_work_queue = True
+    work_queue_mode = "items"
 
     def expected_total(self, ctx: StepContext) -> int:
         sampling = ctx.input_data.get("sampling") or {}
@@ -260,3 +263,29 @@ class GenStep(Step):
             return
         manifest = self.manifest_path(ctx)
         write_csv(manifest, rows, ["design_id", "structure_id", "pdb_path", "parent_id"])
+
+    def build_items(self, ctx: StepContext) -> list[WorkItem]:
+        total = self.expected_total(ctx)
+        items = []
+        for i in range(total):
+            items.append(WorkItem(id=str(i), payload={"sample_id": i}))
+        return items
+
+    def item_done(self, ctx: StepContext, item: WorkItem) -> bool:
+        out_dir = self.output_dir(ctx)
+        name = ctx.input_data.get("name", "")
+        sample_id = int((item.payload or {}).get("sample_id"))
+        target = out_dir / f"{name}_{sample_id}.pdb"
+        if target.exists():
+            return True
+        # Antibody/VHH outputs use a different naming pattern.
+        protocol = ctx.input_data.get("protocol")
+        if protocol in {"antibody", "vhh"}:
+            alt = out_dir / f"{name}_antigen_antibody_sample_{sample_id}.pdb"
+            if alt.exists():
+                return True
+        return False
+
+    def run_item(self, ctx: StepContext, item: WorkItem) -> None:
+        sample_id = int((item.payload or {}).get("sample_id"))
+        self.run_indices(ctx, [sample_id])

@@ -11,8 +11,9 @@ from Bio import PDB
 from Bio.SeqUtils import seq1
 
 from .base import Step, StepContext, StepError
+from ..work_queue import WorkItem
 from ..logging_utils import log_command_progress, run_command
-from ..io import repo_root
+from ..io import repo_root, is_ignored_path
 from ..manifests import extract_design_id, structure_id_from_name, write_csv
 
 
@@ -100,6 +101,8 @@ class PartialFlowStep(Step):
     name = "partial"
     stage = "partial"
     supports_indices = True
+    supports_work_queue = True
+    work_queue_mode = "items"
 
     def expected_total(self, ctx: StepContext) -> int:
         rows = self._load_fixed_positions(ctx)
@@ -327,6 +330,8 @@ class PartialFlowStep(Step):
         out_dir = self.output_dir(ctx)
         rows = []
         for fp in out_dir.rglob("sample*.pdb"):
+            if is_ignored_path(fp):
+                continue
             stem = fp.stem
             did = extract_design_id(stem) or extract_design_id(fp.parent.name)
             rows.append({
@@ -337,3 +342,24 @@ class PartialFlowStep(Step):
         if not rows:
             return
         write_csv(self.manifest_path(ctx), rows, ["design_id", "structure_id", "pdb_path"])
+
+    def build_items(self, ctx: StepContext) -> list[WorkItem]:
+        rows = self._load_fixed_positions(ctx)
+        items: list[WorkItem] = []
+        for idx, row in enumerate(rows):
+            sid = str(row.get("structure_id") or row.get("pdb_name") or idx)
+            items.append(WorkItem(id=str(idx), payload={"row_idx": idx, "sid": sid}))
+        return items
+
+    def item_done(self, ctx: StepContext, item: WorkItem) -> bool:
+        out_dir = self.output_dir(ctx)
+        sid = str((item.payload or {}).get("sid"))
+        sub = out_dir / sid
+        if sub.exists():
+            if list(sub.rglob("sample*.pdb")) or list(sub.rglob("sample*_*.pdb")):
+                return True
+        return False
+
+    def run_item(self, ctx: StepContext, item: WorkItem) -> None:
+        row_idx = int((item.payload or {}).get("row_idx"))
+        self.run_indices(ctx, [row_idx])

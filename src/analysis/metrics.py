@@ -27,22 +27,23 @@ def get_chain_sasa(pdb):
     params.setProbeRadius(2.4)
     try:
         # Read PDB file with "separate-chains" option to process each chain individually
-        structureArray = freesasa.structureArray(
-            pdb, options={"separate-chains": True}
-        )
+        with suppress_stderr():
+            structureArray = freesasa.structureArray(
+                pdb, options={"separate-chains": True}
+            )
 
-        # Iterate over each structure (each structure corresponds to one chain)
-        sasa_A_B = 0
-        for structure in structureArray:
-            result = freesasa.calc(structure, params)
-            sasa_tmp = result.totalArea()
-            sasa_A_B += sasa_tmp
-            # print(structure.chainLabel(1), sasa_tmp)
+            # Iterate over each structure (each structure corresponds to one chain)
+            sasa_A_B = 0
+            for structure in structureArray:
+                result = freesasa.calc(structure, params)
+                sasa_tmp = result.totalArea()
+                sasa_A_B += sasa_tmp
+                # print(structure.chainLabel(1), sasa_tmp)
 
-        # Process the entire pdb
-        sasa_AB = freesasa.calc(
-            freesasa.Structure(pdb), params
-        ).totalArea()
+            # Process the entire pdb
+            sasa_AB = freesasa.calc(
+                freesasa.Structure(pdb), params
+            ).totalArea()
 
         dsasa = sasa_A_B - sasa_AB
 

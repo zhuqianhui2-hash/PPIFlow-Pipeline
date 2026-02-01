@@ -1,0 +1,26 @@
+protocol: antibody
+name: example_antibody_001
+
+target:
+  pdb: /path/to/antigen.pdb
+  chains: ["C"]
+  hotspots: ["C11", "C14", "C15"]
+
+framework:
+  pdb: /path/to/framework.pdb
+  heavy_chain: A
+  light_chain: B
+  cdr_length: "CDRH1,8-8,CDRH2,8-8,CDRH3,10-20,CDRL1,6-9,CDRL2,3-3,CDRL3,9-11"
+
+sampling:
+  samples_per_target: 100
+
+tools:
+  ppiflow_ckpt: /path/to/antibody.ckpt
+  abmpnn_ckpt: /path/to/abmpnn
+  abmpnn_run: /path/to/protein_mpnn_run.py
+  af3score_repo: /path/to/af3score
+  flowpacker_repo: /path/to/flowpacker
+  af3_weights: /path/to/af3/weights/dir
+  rosetta_bin: /path/to/rosetta_scripts
+  rosetta_db: /path/to/rosetta/database

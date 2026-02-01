@@ -3,6 +3,8 @@ from __future__ import annotations
 import csv
 import re
 from pathlib import Path
+
+from .io import is_ignored_path
 from typing import Any, Iterable
 
 
@@ -54,5 +56,7 @@ def find_metrics_file(output_dir: str | Path) -> Path | None:
 def build_name_map(root: str | Path, pattern: str = "*.pdb") -> dict[str, Path]:
     mapping: dict[str, Path] = {}
     for fp in Path(root).rglob(pattern):
+        if is_ignored_path(fp):
+            continue
         mapping[fp.stem] = fp
     return mapping

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import subprocess
 import sys
 import time
@@ -14,11 +15,34 @@ def run_command(
     cwd: str | Path | None = None,
     log_file: str | Path | None = None,
     verbose: bool = False,
+    prefix: str | None = None,
 ) -> None:
+    if prefix is None:
+        prefix = os.environ.get("PPIFLOW_LOG_PREFIX")
     if log_file:
         log_path = Path(log_file)
         log_path.parent.mkdir(parents=True, exist_ok=True)
-        if verbose:
+        if prefix:
+            with log_path.open("a") as handle:
+                proc = subprocess.Popen(
+                    list(cmd),
+                    cwd=str(cwd) if cwd else None,
+                    env=env,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
+                    text=True,
+                    bufsize=1,
+                )
+                assert proc.stdout is not None
+                for line in proc.stdout:
+                    out_line = f"[{prefix}] {line}"
+                    handle.write(out_line)
+                    if verbose:
+                        sys.stdout.write(out_line)
+                ret = proc.wait()
+                if ret != 0:
+                    raise subprocess.CalledProcessError(ret, list(cmd))
+        elif verbose:
             with log_path.open("a") as handle:
                 proc = subprocess.Popen(
                     list(cmd),

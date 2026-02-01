@@ -11,8 +11,11 @@ from pathlib import Path
 from typing import Any
 
 from .base import Step, StepContext, StepError
+from ..direct_legacy import compute_run_stems, promote_file, promote_tree
+from ..io import collect_pdbs, is_ignored_path
 from ..logging_utils import log_command_progress, run_command
 from ..manifests import extract_design_id, structure_id_from_name, write_csv
+from ..work_queue import WorkItem
 
 
 def _pipeline_root() -> Path:
@@ -89,10 +92,34 @@ def _resolve_target_chains(input_data: dict[str, Any]) -> list[str]:
 
 
 def _run(cmd: list[str], cwd: Path | None, stdout_path: Path | None, env: dict[str, str], verbose: bool) -> None:
-    if stdout_path is None:
-        run_command(cmd, cwd=cwd, env=env, log_file=None, verbose=verbose)
+    log_prefix = env.get("PPIFLOW_LOG_PREFIX")
+    worker_log = env.get("PPIFLOW_LOG_PATH")
+    if stdout_path is None or not (log_prefix and worker_log):
+        # Default path: single log file (or console) via run_command.
+        run_command(cmd, cwd=cwd, env=env, log_file=stdout_path, verbose=verbose)
         return
-    run_command(cmd, cwd=cwd, env=env, log_file=stdout_path, verbose=verbose)
+
+    stdout_path.parent.mkdir(parents=True, exist_ok=True)
+    Path(worker_log).parent.mkdir(parents=True, exist_ok=True)
+    with stdout_path.open("a") as out_handle, Path(worker_log).open("a") as worker_handle:
+        proc = subprocess.Popen(
+            list(cmd),
+            cwd=str(cwd) if cwd else None,
+            env=env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            bufsize=1,
+        )
+        assert proc.stdout is not None
+        for line in proc.stdout:
+            out_handle.write(line)
+            worker_handle.write(f"[{log_prefix}] {line}")
+            if verbose:
+                sys.stdout.write(f"[{log_prefix}] {line}")
+        ret = proc.wait()
+        if ret != 0:
+            raise subprocess.CalledProcessError(ret, list(cmd))
 
 
 def _run_job(
@@ -111,15 +138,149 @@ class RosettaInterfaceStep(Step):
     name = "rosetta_interface"
     stage = "rosetta"
     supports_indices = False
+    supports_work_queue = True
+    work_queue_mode = "items"
 
     def expected_total(self, ctx: StepContext) -> int:
         return 1
+
+    def _collect_input_pdbs(self, ctx: StepContext) -> list[Path]:
+        input_dir = self.cfg.get("input_dir")
+        if not input_dir:
+            raise StepError("rosetta_interface missing input_dir")
+        input_path = Path(input_dir)
+        if not input_path.is_absolute():
+            input_path = ctx.out_dir / input_path
+        if not input_path.exists():
+            raise StepError(f"rosetta_interface input_dir not found: {input_path}")
+        pdbs = collect_pdbs(input_path)
+        if not pdbs:
+            raise StepError("No PDBs found for rosetta_interface")
+        return pdbs
 
     def scan_done(self, ctx: StepContext) -> set[int]:
         out_dir = self.output_dir(ctx)
         if (out_dir / "residue_energy.csv").exists():
             return {0}
         return set()
+
+    def build_items(self, ctx: StepContext) -> list[WorkItem]:
+        pdbs = self._collect_input_pdbs(ctx)
+        items: list[WorkItem] = []
+        input_root = Path(self.cfg.get("input_dir") or "")
+        if not input_root.is_absolute():
+            input_root = ctx.out_dir / input_root
+        run_stems = compute_run_stems(pdbs, input_root)
+        for pdb_path in pdbs:
+            run_stem = run_stems[pdb_path]
+            items.append(
+                WorkItem(
+                    id=run_stem,
+                    payload={
+                        "pdb_path": str(pdb_path),
+                        "pdb_name": pdb_path.stem,
+                        "run_stem": run_stem,
+                    },
+                )
+            )
+        return items
+
+    def item_done(self, ctx: StepContext, item: WorkItem) -> bool:
+        out_dir = self.output_dir(ctx)
+        items_dir = out_dir / "residue_energy_items"
+        return (items_dir / f"{item.id}.csv").exists()
+
+    def run_item(self, ctx: StepContext, item: WorkItem) -> None:
+        pdb_path = Path(str((item.payload or {}).get("pdb_path") or ""))
+        if not pdb_path.exists():
+            raise FileNotFoundError(f"PDB not found: {pdb_path}")
+
+        tools = ctx.input_data.get("tools") or {}
+        rosetta_bin = tools.get("rosetta_bin") or os.environ.get("ROSETTA_BIN")
+        if not rosetta_bin:
+            raise StepError("rosetta_bin is required for rosetta_interface")
+        rosetta_db = tools.get("rosetta_db") or os.environ.get("ROSETTA_DB")
+
+        template_path = _find_rosetta_resource("native.xml")
+        template_text = template_path.read_text()
+
+        out_dir = self.output_dir(ctx)
+        item_dir = out_dir / ".tmp" / item.id
+        item_dir.mkdir(parents=True, exist_ok=True)
+        item_out = item_dir
+
+        input_dir = item_dir / "input"
+        input_dir.mkdir(parents=True, exist_ok=True)
+        run_stem = str((item.payload or {}).get("run_stem") or pdb_path.stem)
+        input_pdb = input_dir / f"{run_stem}.pdb"
+        if not input_pdb.exists():
+            shutil.copy2(pdb_path, input_pdb)
+
+        job_root = item_out / "rosetta_jobs"
+        job_root.mkdir(parents=True, exist_ok=True)
+        name = run_stem
+        job_dir = job_root / name
+        out_dir_job = job_dir / "out"
+        out_dir_job.mkdir(parents=True, exist_ok=True)
+        job_pdb = job_dir / f"{name}.pdb"
+        if not job_pdb.exists():
+            shutil.copy2(input_pdb, job_pdb)
+        xml_path = job_dir / "update.xml"
+        _write_update_xml(template_text, job_pdb, xml_path)
+        out_path = out_dir_job / f"{name}.out"
+        if not out_path.exists():
+            cmd = _resolve_rosetta_cmd(str(rosetta_bin)) + [
+                "-parser:protocol",
+                str(xml_path),
+                "-s",
+                str(job_pdb),
+                "-overwrite",
+                "-ignore_zero_occupancy",
+                "false",
+            ]
+            if rosetta_db:
+                cmd.extend(["-database", str(rosetta_db)])
+            _run(cmd, job_dir, out_path, os.environ.copy(), bool(self.cfg.get("_verbose")))
+
+        script = _find_rosetta_resource("get_interface_energy.py")
+        binder_id = _resolve_binder_chain(ctx.input_data)
+        target_ids = _resolve_target_chains(ctx.input_data)
+        interface_dist = float((ctx.input_data.get("filters") or {}).get("rosetta", {}).get("interface_distance") or 12.0)
+        target_id_arg = ",".join(target_ids)
+        cmd = [
+            sys.executable,
+            str(script),
+            "--input_pdbdir",
+            str(input_dir),
+            "--rosetta_dir",
+            str(job_root),
+            "--binder_id",
+            binder_id,
+            "--target_id",
+            target_id_arg,
+            "--output_dir",
+            str(item_out),
+            "--interface_dist",
+            str(interface_dist),
+        ]
+        env = os.environ.copy()
+        env.setdefault("MPLBACKEND", "Agg")
+        run_command(
+            cmd,
+            env=env,
+            cwd=str(item_dir),
+            log_file=self.cfg.get("_log_file"),
+            verbose=bool(self.cfg.get("_verbose")),
+        )
+
+        allow_reuse = bool((ctx.work_queue or {}).get("allow_reuse", True))
+        promote_tree(job_root, out_dir / "rosetta_jobs", allow_reuse=allow_reuse)
+        residue_items = out_dir / "residue_energy_items"
+        residue_items.mkdir(parents=True, exist_ok=True)
+        residue_src = item_out / "residue_energy.csv"
+        if residue_src.exists():
+            promote_file(residue_src, residue_items / f"{item.id}.csv", allow_reuse=allow_reuse)
+        shutil.rmtree(item_dir, ignore_errors=True)
 
     def run_full(self, ctx: StepContext) -> None:
         input_dir = self.cfg.get("input_dir")
@@ -140,17 +301,11 @@ class RosettaInterfaceStep(Step):
         template_path = _find_rosetta_resource("native.xml")
         template_text = template_path.read_text()
 
-        pdbs = sorted(input_path.glob("*.pdb"))
-        if not pdbs:
-            flat_dir = self.output_dir(ctx) / "pdbs_flat"
-            flat_dir.mkdir(parents=True, exist_ok=True)
-            for fp in sorted(input_path.rglob("*.pdb")):
-                shutil.copy2(fp, flat_dir / fp.name)
-            pdbs = sorted(flat_dir.glob("*.pdb"))
-            input_path = flat_dir
+        pdbs = collect_pdbs(input_path)
 
         if not pdbs:
             raise StepError("No PDBs found for rosetta_interface")
+        run_stems = compute_run_stems(pdbs, input_path)
 
         out_dir = self.output_dir(ctx)
         rosetta_root = out_dir / "rosetta_jobs"
@@ -158,7 +313,7 @@ class RosettaInterfaceStep(Step):
 
         jobs: list[tuple[list[str], Path, Path]] = []
         for pdb_path in pdbs:
-            name = pdb_path.stem
+            name = run_stems[pdb_path]
             job_dir = rosetta_root / name
             out_dir_job = job_dir / "out"
             out_dir_job.mkdir(parents=True, exist_ok=True)
@@ -289,6 +444,39 @@ class RosettaInterfaceStep(Step):
 
     def write_manifest(self, ctx: StepContext) -> None:
         out_dir = self.output_dir(ctx)
+        residue_items = out_dir / "residue_energy_items"
+        if residue_items.exists():
+            residue_rows = []
+            for src_csv in sorted(residue_items.glob("*.csv")):
+                try:
+                    import pandas as pd
+
+                    df_item = pd.read_csv(src_csv)
+                    residue_rows.append(df_item)
+                except Exception:
+                    pass
+            if residue_rows:
+                try:
+                    import pandas as pd
+
+                    df_all = pd.concat(residue_rows, ignore_index=True)
+                    df_all.to_csv(out_dir / "residue_energy.csv", index=False)
+                    # Optional interface score summary for ranking
+                    rows = []
+                    for _, row in df_all.iterrows():
+                        name = str(row.get("pdbname") or Path(str(row.get("pdbpath", ""))).stem)
+                        try:
+                            import ast
+
+                            energy_dict = ast.literal_eval(row.get("binder_energy") or "{}")
+                        except Exception:
+                            energy_dict = {}
+                        interface_score = sum(float(v) for v in (energy_dict or {}).values())
+                        rows.append({"pdb_name": name, "interface_score": interface_score})
+                    if rows:
+                        write_csv(out_dir / "interface_scores.csv", rows, ["pdb_name", "interface_score"])
+                except Exception:
+                    pass
         residue_csv = out_dir / "residue_energy.csv"
         if not residue_csv.exists():
             return
@@ -314,15 +502,125 @@ class RosettaRelaxStep(Step):
     name = "relax"
     stage = "rosetta"
     supports_indices = False
+    supports_work_queue = True
+    work_queue_mode = "items"
 
     def expected_total(self, ctx: StepContext) -> int:
         return 1
 
     def scan_done(self, ctx: StepContext) -> set[int]:
         out_dir = self.output_dir(ctx)
-        if list(out_dir.rglob("*.pdb")):
+        for fp in out_dir.rglob("*.pdb"):
+            if is_ignored_path(fp):
+                continue
             return {0}
         return set()
+
+    def _collect_input_pdbs(self, ctx: StepContext) -> list[Path]:
+        input_dir = self.cfg.get("input_dir")
+        if not input_dir:
+            raise StepError("relax missing input_dir")
+        input_path = Path(input_dir)
+        if not input_path.is_absolute():
+            input_path = ctx.out_dir / input_path
+        if not input_path.exists():
+            raise StepError(f"relax input_dir not found: {input_path}")
+        pdbs = collect_pdbs(input_path)
+        if not pdbs:
+            raise StepError("No PDBs found for relax")
+        return pdbs
+
+    def build_items(self, ctx: StepContext) -> list[WorkItem]:
+        pdbs = self._collect_input_pdbs(ctx)
+        items: list[WorkItem] = []
+        input_root = Path(self.cfg.get("input_dir") or "")
+        if not input_root.is_absolute():
+            input_root = ctx.out_dir / input_root
+        run_stems = compute_run_stems(pdbs, input_root)
+        for pdb_path in pdbs:
+            run_stem = run_stems[pdb_path]
+            items.append(
+                WorkItem(
+                    id=run_stem,
+                    payload={
+                        "pdb_path": str(pdb_path),
+                        "pdb_name": pdb_path.stem,
+                        "run_stem": run_stem,
+                    },
+                )
+            )
+        return items
+
+    def item_done(self, ctx: StepContext, item: WorkItem) -> bool:
+        out_dir = self.output_dir(ctx)
+        stem = str((item.payload or {}).get("run_stem") or (item.payload or {}).get("pdb_name") or item.id)
+        return (out_dir / f"{stem}.pdb").exists()
+
+    def run_item(self, ctx: StepContext, item: WorkItem) -> None:
+        pdb_path = Path(str((item.payload or {}).get("pdb_path") or ""))
+        if not pdb_path.exists():
+            raise FileNotFoundError(f"PDB not found: {pdb_path}")
+
+        tools = ctx.input_data.get("tools") or {}
+        rosetta_bin = tools.get("rosetta_bin") or os.environ.get("ROSETTA_BIN")
+        if not rosetta_bin:
+            raise StepError("rosetta_bin is required for relax")
+        rosetta_db = tools.get("rosetta_db") or os.environ.get("ROSETTA_DB")
+
+        template_path = _find_rosetta_resource("native.xml")
+        template_text = template_path.read_text()
+
+        out_dir = self.output_dir(ctx)
+        item_dir = out_dir / ".tmp" / item.id
+        item_dir.mkdir(parents=True, exist_ok=True)
+        item_out = item_dir
+
+        input_dir = item_dir / "input"
+        input_dir.mkdir(parents=True, exist_ok=True)
+        run_stem = str((item.payload or {}).get("run_stem") or pdb_path.stem)
+        input_pdb = input_dir / f"{run_stem}.pdb"
+        if not input_pdb.exists():
+            shutil.copy2(pdb_path, input_pdb)
+
+        job_root = item_out / "rosetta_jobs"
+        job_root.mkdir(parents=True, exist_ok=True)
+        name = run_stem
+        job_dir = job_root / name
+        out_dir_job = job_dir / "out"
+        out_dir_job.mkdir(parents=True, exist_ok=True)
+        job_pdb = job_dir / f"{name}.pdb"
+        if not job_pdb.exists():
+            shutil.copy2(input_pdb, job_pdb)
+        xml_path = job_dir / "update.xml"
+        _write_update_xml(template_text, job_pdb, xml_path)
+        log_path = out_dir_job / f"{name}.out"
+        if not log_path.exists():
+            cmd = _resolve_rosetta_cmd(str(rosetta_bin)) + [
+                "-parser:protocol",
+                str(xml_path),
+                "-s",
+                str(job_pdb),
+                "-overwrite",
+                "-ignore_zero_occupancy",
+                "false",
+            ]
+            if rosetta_db:
+                cmd.extend(["-database", str(rosetta_db)])
+            _run(cmd, job_dir, log_path, os.environ.copy(), bool(self.cfg.get("_verbose")))
+
+        # Collect relaxed PDB (rosetta_scripts writes *_0001.pdb by default)
+        relaxed = None
+        for pdb in sorted(job_dir.glob("*.pdb")):
+            if pdb.name.endswith("_0001.pdb") or pdb.name.endswith("_0001.pdb.gz"):
+                relaxed = pdb
+                break
+        if relaxed is None:
+            raise StepError(f"Relax output missing for {name}")
+        target = out_dir / f"{name}.pdb"
+        allow_reuse = bool((ctx.work_queue or {}).get("allow_reuse", True))
+        promote_file(relaxed, target, allow_reuse=allow_reuse)
+        promote_tree(job_root, out_dir / "rosetta_jobs", allow_reuse=allow_reuse)
+        shutil.rmtree(item_dir, ignore_errors=True)
 
     def run_full(self, ctx: StepContext) -> None:
         input_dir = self.cfg.get("input_dir")
@@ -343,17 +641,11 @@ class RosettaRelaxStep(Step):
         template_path = _find_rosetta_resource("native.xml")
         template_text = template_path.read_text()
 
-        pdbs = sorted(input_path.glob("*.pdb"))
-        if not pdbs:
-            flat_dir = self.output_dir(ctx) / "pdbs_flat"
-            flat_dir.mkdir(parents=True, exist_ok=True)
-            for fp in sorted(input_path.rglob("*.pdb")):
-                shutil.copy2(fp, flat_dir / fp.name)
-            pdbs = sorted(flat_dir.glob("*.pdb"))
-            input_path = flat_dir
+        pdbs = collect_pdbs(input_path)
 
         if not pdbs:
             raise StepError("No PDBs found for relax")
+        run_stems = compute_run_stems(pdbs, input_path)
 
         out_dir = self.output_dir(ctx)
         rosetta_root = out_dir / "rosetta_jobs"
@@ -361,7 +653,7 @@ class RosettaRelaxStep(Step):
 
         jobs: list[tuple[list[str], Path, Path, Path]] = []
         for pdb_path in pdbs:
-            name = pdb_path.stem
+            name = run_stems[pdb_path]
             job_dir = rosetta_root / name
             out_dir_job = job_dir / "out"
             out_dir_job.mkdir(parents=True, exist_ok=True)
@@ -437,6 +729,8 @@ class RosettaRelaxStep(Step):
         out_dir = self.output_dir(ctx)
         rows = []
         for fp in sorted(out_dir.rglob("*.pdb")):
+            if is_ignored_path(fp):
+                continue
             rows.append({
                 "design_id": extract_design_id(fp.stem),
                 "structure_id": structure_id_from_name(fp.stem),

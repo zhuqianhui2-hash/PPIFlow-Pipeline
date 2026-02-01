@@ -12,7 +12,7 @@ from typing import Iterable
 from .heartbeat import HeartbeatReporter
 from .io import read_yaml
 from .state import collect_tool_versions, init_or_update_state, load_state, sha256_json
-from .steps import STEP_GROUPS, STEP_ORDER, STEP_REGISTRY
+from .steps import STEP_ORDER, STEP_REGISTRY
 from .steps.base import StepContext, StepError
 
 
@@ -22,15 +22,11 @@ def _resolve_steps(steps_arg: str | None) -> list[str]:
     tokens = [s.strip() for s in steps_arg.split(",") if s.strip()]
     resolved: list[str] = []
     for tok in tokens:
-        if tok in STEP_GROUPS:
-            for s in STEP_GROUPS[tok]:
-                if s not in resolved:
-                    resolved.append(s)
-        elif tok in STEP_ORDER:
+        if tok in STEP_ORDER:
             if tok not in resolved:
                 resolved.append(tok)
         else:
-            raise StepError(f"Unknown step group or step: {tok}")
+            raise StepError(f"Unknown step: {tok}")
     return resolved
 
 
@@ -146,7 +142,7 @@ def _step_params(step_name: str, input_data: dict) -> list[str]:
         dockq = (input_data.get("filters") or {}).get("dockq") or {}
         if dockq.get("min") is not None:
             params.append(f"dockq_min={dockq.get('min')}")
-    if step_name == "rank":
+    if step_name in {"rank", "rank_finalize"}:
         ranking = input_data.get("ranking") or {}
         if ranking.get("top_k") is not None:
             params.append(f"top_k={ranking.get('top_k')}")
@@ -198,6 +194,47 @@ def execute_pipeline(args) -> None:
     world_size = int(os.environ.get("WORLD_SIZE", "1"))
     local_rank = int(os.environ.get("LOCAL_RANK", "0"))
 
+    def _resolve_work_queue_cfg() -> dict:
+        cfg = dict(input_data.get("work_queue") or {})
+        cfg.setdefault("enabled", True)
+        cfg.setdefault("lease_seconds", 1800)
+        cfg.setdefault("max_attempts", 1)
+        cfg.setdefault("retry_failed", False)
+        cfg.setdefault("batch_size", 1)
+        cfg.setdefault("leader_timeout", 600)
+        cfg.setdefault("wait_timeout", None)
+        cfg.setdefault("allow_reuse", True)
+        cfg.setdefault("rebuild_from_outputs", False)
+        if getattr(args, "work_queue", False):
+            cfg["enabled"] = True
+        if getattr(args, "work_queue_lease_seconds", None) is not None:
+            cfg["lease_seconds"] = int(args.work_queue_lease_seconds)
+        if getattr(args, "work_queue_max_attempts", None) is not None:
+            cfg["max_attempts"] = int(args.work_queue_max_attempts)
+        if getattr(args, "work_queue_batch_size", None) is not None:
+            cfg["batch_size"] = int(args.work_queue_batch_size)
+        if getattr(args, "work_queue_leader_timeout", None) is not None:
+            cfg["leader_timeout"] = int(args.work_queue_leader_timeout)
+        if getattr(args, "work_queue_wait_timeout", None) is not None:
+            cfg["wait_timeout"] = int(args.work_queue_wait_timeout)
+        if getattr(args, "retry_failed", False):
+            cfg["retry_failed"] = True
+        if getattr(args, "work_queue_reuse", False):
+            cfg["allow_reuse"] = True
+        if getattr(args, "work_queue_strict", False):
+            cfg["allow_reuse"] = False
+        if getattr(args, "work_queue_rebuild", False):
+            cfg["rebuild_from_outputs"] = True
+        env_retry = os.environ.get("PPIFLOW_WORK_QUEUE_RETRY_FAILED")
+        if env_retry is not None:
+            if str(env_retry).strip().lower() in {"1", "true", "yes"}:
+                cfg["retry_failed"] = True
+            elif str(env_retry).strip().lower() in {"0", "false", "no"}:
+                cfg["retry_failed"] = False
+        return cfg
+
+    work_queue_cfg = _resolve_work_queue_cfg()
+
     ctx = StepContext(
         out_dir=out_dir,
         input_data=input_data,
@@ -208,6 +245,7 @@ def execute_pipeline(args) -> None:
         local_rank=local_rank,
         reuse=bool(args.reuse),
         heartbeat=hb,
+        work_queue=work_queue_cfg,
     )
 
     selected_steps = set(_resolve_steps(args.steps))
@@ -244,7 +282,8 @@ def execute_pipeline(args) -> None:
             raise StepError(f"Unknown step: {step_name}")
         step = StepCls(cfg)
 
-        log_file = log_dir / f"{idx:02d}_{step.name}.log"
+        log_suffix = f"_rank{ctx.rank}" if work_queue_cfg.get("enabled") else ""
+        log_file = log_dir / f"{idx:02d}_{step.name}{log_suffix}.log"
         cfg["_log_file"] = str(log_file)
         cfg["_verbose"] = bool(getattr(args, "verbose", False))
 

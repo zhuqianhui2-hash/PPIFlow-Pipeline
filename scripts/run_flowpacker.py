@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import json
 import math
 import os
 import shutil
@@ -129,34 +130,102 @@ def _progress(idx: int, total: int, item: str, status: str, elapsed: float) -> N
     )
 
 
+def _write_progress(output_dir: Path, produced: int, expected: int, *, item: str | None = None, status: str = "running") -> None:
+    payload = {
+        "expected_total": max(int(expected), 0),
+        "produced_total": max(int(produced), 0),
+        "status": status,
+        "item": item,
+        "updated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+    }
+    try:
+        path = output_dir / "progress.json"
+        tmp = path.with_suffix(".json.tmp")
+        tmp.write_text(json.dumps(payload, separators=(",", ":")))
+        tmp.replace(path)
+    except Exception:
+        pass
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--input_pdb_dir", required=True)
-    parser.add_argument("--seq_fasta_dir", required=True)
+    parser.add_argument("--input_pdb_dir", default=None)
+    parser.add_argument("--seq_fasta_dir", default=None)
     parser.add_argument("--output_dir", required=True)
     parser.add_argument("--flowpacker_repo", required=True)
     parser.add_argument("--base_yaml", default=None)
     parser.add_argument("--num_jobs", type=int, default=1)
     parser.add_argument("--binder_chain", default="A")
     parser.add_argument("--link_suffix", default=".pdb")
+    parser.add_argument("--batch_yaml", default=None, help="Run a single batch yaml (per-item mode)")
+    parser.add_argument("--csv_file", default=None, help="Precomputed sequence CSV (link_name,seq,seq_idx)")
     args = parser.parse_args()
 
-    input_pdb_dir = Path(args.input_pdb_dir).resolve()
-    seq_fasta_dir = Path(args.seq_fasta_dir).resolve()
     output_dir = Path(args.output_dir).resolve()
     flowpacker_repo = Path(args.flowpacker_repo).resolve()
 
+    if not flowpacker_repo.exists():
+        raise FileNotFoundError(f"flowpacker_repo not found: {flowpacker_repo}")
+
+    # Single-item mode: run a provided batch yaml and optional precomputed CSV.
+    if args.batch_yaml:
+        batch_yaml = Path(args.batch_yaml).resolve()
+        if not batch_yaml.exists():
+            raise FileNotFoundError(f"batch_yaml not found: {batch_yaml}")
+        if args.csv_file:
+            csv_path = Path(args.csv_file).resolve()
+        else:
+            if not args.seq_fasta_dir:
+                raise RuntimeError("--seq_fasta_dir is required when --csv_file is not provided")
+            seq_fasta_dir = Path(args.seq_fasta_dir).resolve()
+            if not seq_fasta_dir.exists():
+                raise FileNotFoundError(f"seq_fasta_dir not found: {seq_fasta_dir}")
+            csv_path = output_dir / "flowpacker_input.csv"
+            seq_count = build_seq_csv(seq_fasta_dir, csv_path, args.link_suffix)
+            if seq_count == 0:
+                raise RuntimeError(f"No sequences written to {csv_path}")
+
+        flowpacker_out = output_dir / "flowpacker_outputs"
+        flowpacker_out.mkdir(parents=True, exist_ok=True)
+        sampler_script = Path(__file__).resolve().parent / "flowpacker_sampler_pipe.py"
+        if not sampler_script.exists():
+            raise FileNotFoundError(f"Missing sampler script: {sampler_script}")
+        env = os.environ.copy()
+        env["FLOWPACKER_REPO"] = str(flowpacker_repo)
+        env["FLOWPACKER_BINDER_CHAIN"] = args.binder_chain
+        cmd = [
+            "python",
+            str(sampler_script),
+            str(batch_yaml),
+            "--save_dir",
+            str(flowpacker_out),
+            "--csv_file",
+            str(csv_path),
+            "--binder_chain",
+            args.binder_chain,
+        ]
+        subprocess.check_call(cmd, env=env)
+        return
+
+    if not args.input_pdb_dir:
+        raise RuntimeError("--input_pdb_dir is required when --batch_yaml is not provided")
+    if not args.seq_fasta_dir:
+        raise RuntimeError("--seq_fasta_dir is required when --batch_yaml is not provided")
+
+    input_pdb_dir = Path(args.input_pdb_dir).resolve()
+    seq_fasta_dir = Path(args.seq_fasta_dir).resolve()
     if not input_pdb_dir.exists():
         raise FileNotFoundError(f"input_pdb_dir not found: {input_pdb_dir}")
     if not seq_fasta_dir.exists():
         raise FileNotFoundError(f"seq_fasta_dir not found: {seq_fasta_dir}")
-    if not flowpacker_repo.exists():
-        raise FileNotFoundError(f"flowpacker_repo not found: {flowpacker_repo}")
 
-    csv_path = output_dir / "flowpacker_input.csv"
-    seq_count = build_seq_csv(seq_fasta_dir, csv_path, args.link_suffix)
-    if seq_count == 0:
-        raise RuntimeError(f"No sequences written to {csv_path}")
+    if args.csv_file:
+        csv_path = Path(args.csv_file).resolve()
+    else:
+        csv_path = output_dir / "flowpacker_input.csv"
+        seq_count = build_seq_csv(seq_fasta_dir, csv_path, args.link_suffix)
+        if seq_count == 0:
+            raise RuntimeError(f"No sequences written to {csv_path}")
 
     pdbs = sorted(input_pdb_dir.glob("*.pdb"))
     if not pdbs:
@@ -183,6 +252,7 @@ def main() -> None:
     env["FLOWPACKER_BINDER_CHAIN"] = args.binder_chain
 
     total = len(yaml_paths)
+    _write_progress(output_dir, 0, total, status="running")
     for idx, yaml_path in enumerate(yaml_paths, start=1):
         cmd = [
             "python",
@@ -204,6 +274,11 @@ def main() -> None:
             raise
         finally:
             _progress(idx, total, yaml_path.stem, status, time.time() - start)
+            if status == "OK":
+                phase_status = "completed" if idx == total else "running"
+            else:
+                phase_status = "failed"
+            _write_progress(output_dir, idx, total, item=yaml_path.stem, status=phase_status)
 
 
 if __name__ == "__main__":

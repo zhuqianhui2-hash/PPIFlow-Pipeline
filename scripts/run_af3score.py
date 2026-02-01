@@ -32,6 +32,46 @@ def _progress(idx: int, total: int, phase: str, item: str, status: str, elapsed:
     )
 
 
+def _quiet_enabled() -> bool:
+    value = os.environ.get("PPIFLOW_AF3SCORE_QUIET", "")
+    return value.strip().lower() in {"1", "true", "yes"}
+
+
+def _run_cmd(cmd: list[str], *, env: dict, log_path: Path | None = None) -> None:
+    if log_path is None:
+        subprocess.check_call(cmd, env=env)
+        return
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    with log_path.open("w") as handle:
+        subprocess.check_call(cmd, env=env, stdout=handle, stderr=subprocess.STDOUT)
+
+
+def _write_progress(
+    output_dir: Path,
+    produced: int,
+    expected: int,
+    *,
+    phase: str,
+    item: str | None = None,
+    status: str = "running",
+) -> None:
+    payload = {
+        "expected_total": max(int(expected), 0),
+        "produced_total": max(int(produced), 0),
+        "status": status,
+        "phase": phase,
+        "item": item,
+        "updated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+    }
+    try:
+        path = output_dir / "progress.json"
+        tmp = path.with_suffix(".json.tmp")
+        tmp.write_text(json.dumps(payload, separators=(",", ":")))
+        tmp.replace(path)
+    except Exception:
+        pass
+
+
 def _resolve_python_cmd() -> list[str]:
     override = os.environ.get("AF3SCORE_PYTHON")
     if override:
@@ -199,7 +239,9 @@ def _ensure_seed10_alias(output_dir_af3score: Path) -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--input_pdb_dir", required=True)
+    parser.add_argument("--input_pdb_dir", default=None)
+    parser.add_argument("--input_pdb", default=None, help="Single PDB input (per-item mode)")
+    parser.add_argument("--batch_yaml", default=None, help="YAML with input_pdb or input_pdb_dir")
     parser.add_argument("--output_dir", required=True)
     parser.add_argument("--af3score_repo", required=True)
     parser.add_argument("--model_dir", required=True)
@@ -218,8 +260,42 @@ def main() -> None:
     parser.add_argument("--target_chain", type=str, default="B")
     args = parser.parse_args()
 
-    input_pdb_dir = _resolve_input_dir(Path(args.input_pdb_dir).resolve())
+    if args.batch_yaml:
+        try:
+            import yaml
+
+            payload = yaml.safe_load(Path(args.batch_yaml).read_text()) or {}
+            if isinstance(payload, dict):
+                if payload.get("input_pdb") and not args.input_pdb:
+                    args.input_pdb = payload.get("input_pdb")
+                if payload.get("input_pdb_dir") and not args.input_pdb_dir:
+                    args.input_pdb_dir = payload.get("input_pdb_dir")
+        except Exception:
+            pass
+
     output_dir = Path(args.output_dir).resolve()
+
+    input_pdb_dir: Path | None = None
+    if args.input_pdb:
+        input_pdb = Path(args.input_pdb).resolve()
+        if not input_pdb.exists():
+            raise FileNotFoundError(f"input_pdb not found: {input_pdb}")
+        single_dir = output_dir / "input_pdbs"
+        single_dir.mkdir(parents=True, exist_ok=True)
+        dst = single_dir / input_pdb.name
+        if not dst.exists():
+            try:
+                os.link(input_pdb, dst)
+            except Exception:
+                shutil.copy2(input_pdb, dst)
+        input_pdb_dir = single_dir
+        args.num_jobs = 1
+    else:
+        if not args.input_pdb_dir:
+            raise RuntimeError("--input_pdb_dir is required when --input_pdb is not provided")
+        input_pdb_dir = Path(args.input_pdb_dir).resolve()
+
+    input_pdb_dir = _resolve_input_dir(input_pdb_dir)
     af3_repo = Path(args.af3score_repo).resolve()
     model_dir = Path(args.model_dir).resolve()
 
@@ -243,9 +319,15 @@ def main() -> None:
     output_dir_json.mkdir(parents=True, exist_ok=True)
     output_dir_jax.mkdir(parents=True, exist_ok=True)
     output_dir_af3score.mkdir(parents=True, exist_ok=True)
+    quiet = _quiet_enabled()
+    subproc_log_dir = output_dir / "af3score_subprocess_logs" if quiet else None
 
     python_cmd = _resolve_python_cmd()
     env = os.environ.copy()
+    # Force quiet featurisation logging in AF3Score via sitecustomize.
+    patch_dir = (Path(__file__).resolve().parent / "af3score_sitecustomize")
+    if patch_dir.exists():
+        env["PYTHONPATH"] = str(patch_dir) + os.pathsep + env.get("PYTHONPATH", "")
     # Prefer AF3Score env binaries (ptxas, nvcc) over ppiflow env.
     if len(python_cmd) == 1:
         try:
@@ -284,7 +366,8 @@ def main() -> None:
     start = time.time()
     status = "OK"
     try:
-        subprocess.check_call(
+        _write_progress(output_dir, 0, 1, phase="prep_json", status="running")
+        _run_cmd(
             python_cmd
             + [
                 str(prep_json),
@@ -302,12 +385,16 @@ def main() -> None:
                 str(args.num_jobs),
             ],
             env=env,
+            log_path=(subproc_log_dir / "prep_json.log") if subproc_log_dir else None,
         )
     except Exception:
         status = "FAILED"
+        _write_progress(output_dir, 0, 1, phase="prep_json", status="failed")
         raise
     finally:
         _progress(1, 1, "prep_json", "all", status, time.time() - start)
+        if status == "OK":
+            _write_progress(output_dir, 1, 1, phase="prep_json", status="completed")
 
     model_seeds = _parse_seed_list(args.model_seeds)
     if args.no_templates or model_seeds:
@@ -329,7 +416,9 @@ def main() -> None:
         start = time.time()
         status = "OK"
         try:
-            subprocess.check_call(
+            if idx == 1:
+                _write_progress(output_dir, 0, total_pdb, phase="prep_jax", status="running")
+            _run_cmd(
                 python_cmd
                 + [
                     str(prep_jax),
@@ -341,12 +430,17 @@ def main() -> None:
                     str(args.num_workers),
                 ],
                 env=env,
+                log_path=(subproc_log_dir / f"prep_jax_{folder_name}.log") if subproc_log_dir else None,
             )
         except Exception:
             status = "FAILED"
+            _write_progress(output_dir, idx - 1, total_pdb, phase="prep_jax", item=folder_name, status="failed")
             raise
         finally:
             _progress(idx, total_pdb, "prep_jax", folder_name, status, time.time() - start)
+            if status == "OK":
+                phase_status = "completed" if idx == total_pdb else "running"
+                _write_progress(output_dir, idx, total_pdb, phase="prep_jax", item=folder_name, status=phase_status)
 
     json_batches = sorted((af3_input_batch / "json").glob("*"))
     total_json = len(json_batches)
@@ -398,19 +492,30 @@ def main() -> None:
         start = time.time()
         status = "OK"
         try:
-            subprocess.check_call(cmd, env=env)
+            if idx == 1:
+                _write_progress(output_dir, 0, total_json, phase="run_af3", status="running")
+            _run_cmd(
+                cmd,
+                env=env,
+                log_path=(subproc_log_dir / f"run_af3_{folder_name}.log") if subproc_log_dir else None,
+            )
         except Exception:
             status = "FAILED"
+            _write_progress(output_dir, idx - 1, total_json, phase="run_af3", item=folder_name, status="failed")
             raise
         finally:
             _progress(idx, total_json, "run_af3", folder_name, status, time.time() - start)
+            if status == "OK":
+                phase_status = "completed" if idx == total_json else "running"
+                _write_progress(output_dir, idx, total_json, phase="run_af3", item=folder_name, status=phase_status)
 
     metrics_input_dir = _prepare_metrics_pdb_dir(input_pdb_dir, output_dir_af3score, output_dir)
     _ensure_seed10_alias(output_dir_af3score)
     start = time.time()
     status = "OK"
     try:
-        subprocess.check_call(
+        _write_progress(output_dir, 0, 1, phase="metrics", status="running")
+        _run_cmd(
             python_cmd
             + [
                 str(get_metrics),
@@ -422,12 +527,16 @@ def main() -> None:
                 str(metrics_csv),
             ],
             env=env,
+            log_path=(subproc_log_dir / "metrics.log") if subproc_log_dir else None,
         )
     except Exception:
         status = "FAILED"
+        _write_progress(output_dir, 0, 1, phase="metrics", status="failed")
         raise
     finally:
         _progress(1, 1, "metrics", "all", status, time.time() - start)
+        if status == "OK":
+            _write_progress(output_dir, 1, 1, phase="metrics", status="completed")
 
     offset_map = None
     if args.target_offsets_json:

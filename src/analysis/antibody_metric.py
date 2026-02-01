@@ -1,5 +1,6 @@
 import os
 import re
+import contextlib
 from Bio.PDB import PDBParser, PDBIO, Select
 from Bio.PDB import Superimposer
 import numpy as np
@@ -11,6 +12,18 @@ from typing import Tuple, Optional, Set
 from Bio.PDB import NeighborSearch
 from Bio.PDB.Structure import Structure
 from Bio.PDB.Atom import Atom
+
+
+@contextlib.contextmanager
+def suppress_stderr():
+    devnull = os.open(os.devnull, os.O_WRONLY)
+    old_stderr = os.dup(2)
+    os.dup2(devnull, 2)
+    try:
+        yield
+    finally:
+        os.dup2(old_stderr, 2)
+        os.close(devnull)
 
 
 def _group_consecutive_numbers(numbers):
@@ -198,21 +211,24 @@ def get_chain_sasa(pdb_path, antigen_chain, heavy_chain, light_chain):
         if not antigen_chains or not binder_chains:
             raise ValueError("Missing antigen or binder chains for SASA calculation")
 
-        sasa_complex = freesasa.calc(
-            freesasa.Structure(pdb_path), params
-        ).totalArea()
+        with suppress_stderr():
+            sasa_complex = freesasa.calc(
+                freesasa.Structure(pdb_path), params
+            ).totalArea()
 
         ag_tmp = os.path.join(os.path.dirname(pdb_path), f"AG_tmp_{os.getpid()}.pdb")
         extract_chains(pdb_path, ag_tmp, antigen_chains)
-        sasa_antigen = freesasa.calc(
-            freesasa.Structure(ag_tmp), params
-        ).totalArea()
+        with suppress_stderr():
+            sasa_antigen = freesasa.calc(
+                freesasa.Structure(ag_tmp), params
+            ).totalArea()
 
         ab_tmp = os.path.join(os.path.dirname(pdb_path), f"AB_tmp_{os.getpid()}.pdb")
         extract_chains(pdb_path, ab_tmp, binder_chains)
-        sasa_binder = freesasa.calc(
-            freesasa.Structure(ab_tmp), params
-        ).totalArea()
+        with suppress_stderr():
+            sasa_binder = freesasa.calc(
+                freesasa.Structure(ab_tmp), params
+            ).totalArea()
 
         result = (sasa_antigen + sasa_binder - sasa_complex) / 2.0
 
