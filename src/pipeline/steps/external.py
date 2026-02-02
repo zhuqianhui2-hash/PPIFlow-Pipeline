@@ -92,6 +92,10 @@ class SeqDesignStep(ExternalCommandStep):
     stage = "seq"
     supports_work_queue = True
     work_queue_mode = "items"
+    # Drain per-worker batches to avoid repeated model reloads.
+    per_worker_batch = True
+    # 0 means "claim all available items for this worker".
+    batch_size = 0
 
     def _default_chain_list(self, ctx: StepContext) -> str:
         protocol = ctx.input_data.get("protocol")
@@ -330,6 +334,11 @@ class SeqDesignStep(ExternalCommandStep):
     def item_done(self, ctx: StepContext, item: WorkItem) -> bool:
         out_dir = self.output_dir(ctx)
         stem = str((item.payload or {}).get("run_stem") or (item.payload or {}).get("pdb_name") or item.id)
+        step_name = str(self.cfg.get("name") or self.name)
+        if step_name == "seq2":
+            pdb_path = out_dir / "pdbs" / f"{stem}.pdb"
+            if not pdb_path.exists():
+                return False
         return self._find_fasta(out_dir, stem) is not None
 
     def run_item(self, ctx: StepContext, item: WorkItem) -> None:
@@ -376,7 +385,7 @@ class SeqDesignStep(ExternalCommandStep):
 
         def build_base_cmd(out_folder: Path, num_seq_target: int, temp: float, use_soluble_model: bool) -> list[str]:
             cmd = [
-                "python",
+                sys.executable,
                 str(mpnn_run),
                 "--out_folder",
                 str(out_folder),
@@ -406,6 +415,15 @@ class SeqDesignStep(ExternalCommandStep):
             raise FileNotFoundError(f"PDB not found: {pdb_path}")
         if not run_stem:
             run_stem = pdb_path.stem
+        # Materialize legacy pdbs/ for downstream flowpacker (seq2).
+        pdbs_dir = out_dir / "pdbs"
+        pdbs_dir.mkdir(parents=True, exist_ok=True)
+        legacy_pdb = pdbs_dir / f"{run_stem}.pdb"
+        if not legacy_pdb.exists():
+            try:
+                os.link(pdb_path, legacy_pdb)
+            except OSError:
+                shutil.copy2(pdb_path, legacy_pdb)
         tmp_pdb = item_tmp / f"{run_stem}.pdb"
         if not tmp_pdb.exists():
             try:
@@ -482,6 +500,235 @@ class SeqDesignStep(ExternalCommandStep):
                     promote_file(fp, seq_dst / fp.name, allow_reuse=bool((ctx.work_queue or {}).get("allow_reuse", True)))
         shutil.rmtree(item_tmp, ignore_errors=True)
 
+    def run_batch(self, ctx: StepContext, items: list[WorkItem]) -> dict[str, tuple[str, str | None]]:
+        tools = ctx.input_data.get("tools") or {}
+        out_dir = self.output_dir(ctx)
+        batch_id = items[0].id if items else "batch"
+        batch_dir = out_dir / ".tmp" / f"batch_{batch_id}"
+        batch_dir.mkdir(parents=True, exist_ok=True)
+        pdb_dir = batch_dir / "pdbs"
+        pdb_dir.mkdir(parents=True, exist_ok=True)
+
+        mpnn_run = self._default_mpnn_run(ctx)
+        if not mpnn_run or not mpnn_run.exists():
+            raise StepError(
+                f"MPNN runner not found. Set tools.mpnn_run/abmpnn_run or provide command in {self.cfg.get('config_path')}"
+            )
+        ckpt = tools.get("mpnn_ckpt") if ctx.input_data.get("protocol") == "binder" else tools.get("abmpnn_ckpt")
+
+        seq_cfg = (ctx.input_data.get("sequence_design") or {}).get(
+            "round1" if self.cfg.get("name") == "seq1" else "round2"
+        ) or {}
+        num_seq = int(seq_cfg.get("num_seq_per_backbone") or 0)
+        sampling_temp = float(seq_cfg.get("sampling_temp") or 0.1)
+        if num_seq <= 0:
+            raise StepError("sequence_design.num_seq_per_backbone must be > 0")
+        chain_list = self._default_chain_list(ctx)
+        chain_arg = " ".join(str(chain_list).replace(",", " ").split())
+        protocol = ctx.input_data.get("protocol")
+        use_soluble = bool(seq_cfg.get("use_soluble_ckpt"))
+        if protocol == "binder" and use_soluble and self.cfg.get("name") == "seq2":
+            ckpt = tools.get("mpnn_ckpt_soluble") or ckpt
+
+        weight_dir, model_name = self._resolve_weights(ckpt)
+        seed = str(int((ctx.state.get("runs") or [{}])[0].get("run_seed", 0) or 0))
+        fixed_positions_csv = (items[0].payload or {}).get("fixed_positions_csv") if items else None
+        default_chain = str((items[0].payload or {}).get("default_chain") or "A") if items else "A"
+
+        results: dict[str, tuple[str, str | None]] = {}
+        valid_items: list[WorkItem] = []
+        staged_pdbs: list[Path] = []
+        for item in items:
+            pdb_path = Path(str((item.payload or {}).get("pdb_path") or ""))
+            if not pdb_path.exists():
+                if self.item_done(ctx, item):
+                    results[item.id] = ("done", None)
+                else:
+                    results[item.id] = ("blocked", f"PDB not found: {pdb_path}")
+                continue
+            run_stem = str((item.payload or {}).get("run_stem") or pdb_path.stem)
+            # Materialize legacy pdbs/ for downstream flowpacker (seq2).
+            pdbs_dir = out_dir / "pdbs"
+            pdbs_dir.mkdir(parents=True, exist_ok=True)
+            legacy_pdb = pdbs_dir / f"{run_stem}.pdb"
+            if not legacy_pdb.exists():
+                try:
+                    os.link(pdb_path, legacy_pdb)
+                except OSError:
+                    shutil.copy2(pdb_path, legacy_pdb)
+            tmp_pdb = pdb_dir / f"{run_stem}.pdb"
+            if not tmp_pdb.exists():
+                try:
+                    os.link(pdb_path, tmp_pdb)
+                except OSError:
+                    shutil.copy2(pdb_path, tmp_pdb)
+            staged_pdbs.append(tmp_pdb)
+            valid_items.append(item)
+
+        if not valid_items:
+            shutil.rmtree(batch_dir, ignore_errors=True)
+            return results
+
+        helper_dir = mpnn_run.parent / "helper_scripts"
+        parse_script = helper_dir / "parse_multiple_chains.py"
+        chain_script = helper_dir / "assign_fixed_chains.py"
+        if not parse_script.exists() or not chain_script.exists():
+            err = "ProteinMPNN helper_scripts missing (parse_multiple_chains.py/assign_fixed_chains.py)"
+            for item in valid_items:
+                if self.item_done(ctx, item):
+                    results[item.id] = ("done", None)
+                else:
+                    results[item.id] = ("failed", err)
+            shutil.rmtree(batch_dir, ignore_errors=True)
+            return results
+
+        parsed_jsonl = batch_dir / "parsed.jsonl"
+        chain_jsonl = batch_dir / "chain_id.jsonl"
+        fixed_positions_jsonl = None
+        if fixed_positions_csv:
+            fixed_positions_jsonl = self._write_fixed_positions_jsonl(
+                batch_dir,
+                staged_pdbs,
+                str(fixed_positions_csv),
+                default_chain,
+            )
+
+        def build_base_cmd(out_folder: Path, num_seq_target: int, temp: float, use_soluble_model: bool) -> list[str]:
+            cmd = [
+                sys.executable,
+                str(mpnn_run),
+                "--out_folder",
+                str(out_folder),
+                "--num_seq_per_target",
+                str(num_seq_target),
+                "--sampling_temp",
+                str(temp),
+                "--batch_size",
+                str(num_seq_target),
+                "--seed",
+                seed,
+                "--jsonl_path",
+                str(parsed_jsonl),
+                "--chain_id_jsonl",
+                str(chain_jsonl),
+            ]
+            if fixed_positions_jsonl:
+                cmd.extend(["--fixed_positions_jsonl", str(fixed_positions_jsonl)])
+            if weight_dir is not None:
+                cmd.extend(["--path_to_model_weights", str(weight_dir)])
+            elif use_soluble_model:
+                cmd.append("--use_soluble_model")
+            else:
+                raise StepError("Missing tools.mpnn_ckpt/abmpnn_ckpt for sequence design")
+            if model_name:
+                cmd.extend(["--model_name", model_name])
+            elif protocol != "binder":
+                cmd.extend(["--model_name", "abmpnn"])
+            return cmd
+
+        env = os.environ.copy()
+        bias_enabled = bool(protocol == "binder" and self.cfg.get("name") == "seq1" and seq_cfg.get("bias_large_residues"))
+        bias_num = int(seq_cfg.get("bias_num") or 0)
+        err: str | None = None
+        try:
+            # Build parsed jsonl for batch inputs.
+            run_command(
+                [
+                    sys.executable,
+                    str(parse_script),
+                    "--input_path",
+                    str(pdb_dir),
+                    "--output_path",
+                    str(parsed_jsonl),
+                ],
+                env=os.environ.copy(),
+                cwd=str(batch_dir),
+                log_file=self.cfg.get("_log_file"),
+                verbose=bool(self.cfg.get("_verbose")),
+            )
+            # Build chain assignment jsonl.
+            run_command(
+                [
+                    sys.executable,
+                    str(chain_script),
+                    "--input_path",
+                    str(parsed_jsonl),
+                    "--output_path",
+                    str(chain_jsonl),
+                    "--chain_list",
+                    chain_arg,
+                ],
+                env=os.environ.copy(),
+                cwd=str(batch_dir),
+                log_file=self.cfg.get("_log_file"),
+                verbose=bool(self.cfg.get("_verbose")),
+            )
+
+            if bias_enabled and bias_num > 0:
+                vanilla_num = max(int(num_seq) - bias_num, 0)
+                bias_residues = seq_cfg.get("bias_residues") or ["F", "M", "W"]
+                if isinstance(bias_residues, str):
+                    bias_residues = [r.strip() for r in bias_residues.split(",") if r.strip()]
+                bias_weight = float(seq_cfg.get("bias_weight") or 0.7)
+                tmp_base = batch_dir / "_tmp_seq1"
+                vanilla_dir = tmp_base / "vanilla"
+                bias_dir = tmp_base / "bias"
+
+                if vanilla_num > 0:
+                    base_cmd = build_base_cmd(vanilla_dir, vanilla_num, sampling_temp, use_soluble)
+                    run_command(
+                        base_cmd,
+                        env=env,
+                        cwd=str(batch_dir),
+                        log_file=self.cfg.get("_log_file"),
+                        verbose=bool(self.cfg.get("_verbose")),
+                    )
+
+                bias_jsonl = self._write_bias_jsonl(bias_dir, bias_residues, bias_weight)
+                base_cmd = build_base_cmd(bias_dir, bias_num, sampling_temp, use_soluble)
+                base_cmd.extend(["--bias_AA_jsonl", str(bias_jsonl)])
+                run_command(
+                    base_cmd,
+                    env=env,
+                    cwd=str(batch_dir),
+                    log_file=self.cfg.get("_log_file"),
+                    verbose=bool(self.cfg.get("_verbose")),
+                )
+
+                self._merge_fastas(vanilla_dir, bias_dir, out_dir)
+                shutil.rmtree(tmp_base, ignore_errors=True)
+            else:
+                base_cmd = build_base_cmd(batch_dir, num_seq, sampling_temp, use_soluble)
+                run_command(
+                    base_cmd,
+                    env=env,
+                    cwd=str(batch_dir),
+                    log_file=self.cfg.get("_log_file"),
+                    verbose=bool(self.cfg.get("_verbose")),
+                )
+
+                seq_src = batch_dir / "seqs"
+                if seq_src.exists():
+                    seq_dst = out_dir / "seqs"
+                    seq_dst.mkdir(parents=True, exist_ok=True)
+                    for fp in seq_src.glob("*.fa*"):
+                        promote_file(
+                            fp,
+                            seq_dst / fp.name,
+                            allow_reuse=bool((ctx.work_queue or {}).get("allow_reuse", True)),
+                        )
+        except Exception as exc:
+            err = str(exc)
+        finally:
+            shutil.rmtree(batch_dir, ignore_errors=True)
+
+        for item in valid_items:
+            if self.item_done(ctx, item):
+                results[item.id] = ("done", None)
+            else:
+                results[item.id] = ("failed", err or "missing output")
+        return results
+
     def run_full(self, ctx: StepContext) -> None:
         if self.cfg.get("command"):
             return super().run_full(ctx)
@@ -520,7 +767,7 @@ class SeqDesignStep(ExternalCommandStep):
 
         def build_base_cmd(out_folder: Path, num_seq_target: int, temp: float, use_soluble_model: bool) -> list[str]:
             cmd = [
-                "python",
+                sys.executable,
                 str(mpnn_run),
                 "--out_folder",
                 str(out_folder),
@@ -717,6 +964,11 @@ class SeqDesignStep(ExternalCommandStep):
         if done:
             return done
         out_dir = self.output_dir(ctx)
+        step_name = str(self.cfg.get("name") or self.name)
+        if step_name == "seq2":
+            pdb_dir = out_dir / "pdbs"
+            if not pdb_dir.exists() or not list(pdb_dir.glob("*.pdb")):
+                return set()
         seq_dir = out_dir / "seqs"
         fasta_files = list(seq_dir.glob("*.fa*")) if seq_dir.exists() else []
         if not fasta_files:
@@ -731,6 +983,10 @@ class FlowPackerStep(ExternalCommandStep):
     stage = "score"
     supports_work_queue = True
     work_queue_mode = "items"
+    # Drain per-worker batches to avoid repeated model reloads.
+    per_worker_batch = True
+    # 0 means "claim all available items for this worker".
+    batch_size = 0
 
     def _flowpacker_config(self) -> dict:
         cfg = dict(self.cfg.get("flowpacker") or {})
@@ -846,7 +1102,26 @@ class FlowPackerStep(ExternalCommandStep):
         input_pdb_dir = self._resolve_path(ctx, cfg.get("input_pdb_dir")) if cfg else None
         seq_fasta_dir = self._resolve_path(ctx, cfg.get("seq_fasta_dir")) if cfg else None
         if not input_pdb_dir or not input_pdb_dir.exists():
-            raise StepError("flowpacker input_pdb_dir missing or invalid")
+            step_name = str(self.cfg.get("name") or self.name)
+            if step_name == "flowpacker2":
+                alt_root = ctx.out_dir / "output" / "partial_flow"
+                if alt_root.exists():
+                    alt_pdbs = collect_pdbs(alt_root)
+                    if alt_pdbs:
+                        stage_dir = ctx.out_dir / "output" / "seqs_round2" / "pdbs"
+                        stage_dir.mkdir(parents=True, exist_ok=True)
+                        run_stems = compute_run_stems(alt_pdbs, alt_root)
+                        for pdb_path in alt_pdbs:
+                            run_stem = run_stems[pdb_path]
+                            dst = stage_dir / f"{run_stem}.pdb"
+                            if not dst.exists():
+                                try:
+                                    os.link(pdb_path, dst)
+                                except OSError:
+                                    shutil.copy2(pdb_path, dst)
+                        input_pdb_dir = stage_dir
+            if not input_pdb_dir or not input_pdb_dir.exists():
+                raise StepError("flowpacker input_pdb_dir missing or invalid")
         if not seq_fasta_dir or not seq_fasta_dir.exists():
             raise StepError("flowpacker seq_fasta_dir missing or invalid")
 
@@ -938,7 +1213,7 @@ class FlowPackerStep(ExternalCommandStep):
         item_out = item_dir
         script = Path(__file__).resolve().parents[3] / "scripts" / "run_flowpacker.py"
         cmd = [
-            "python",
+            sys.executable,
             str(script),
             "--batch_yaml",
             str(yaml_path),
@@ -965,6 +1240,146 @@ class FlowPackerStep(ExternalCommandStep):
         promote_tree(item_out / "flowpacker_outputs" / "run_1", flowpacker_out, allow_reuse=allow_reuse)
         promote_tree(item_out / "after_pdbs", after_pdbs, allow_reuse=allow_reuse)
         shutil.rmtree(item_dir, ignore_errors=True)
+
+    def run_batch(self, ctx: StepContext, items: list[WorkItem]) -> dict[str, tuple[str, str | None]]:
+        cfg = self._flowpacker_config()
+        flowpacker_repo = self._resolve_path(ctx, cfg.get("flowpacker_repo")) if cfg else None
+        if not flowpacker_repo or not flowpacker_repo.exists():
+            raise StepError("flowpacker_repo missing or invalid")
+
+        binder_chain = str(cfg.get("binder_chain") or (ctx.input_data.get("binder_chain") or "A"))
+        link_suffix = str(cfg.get("link_suffix") or ".pdb")
+        base_yaml = cfg.get("base_yaml")
+
+        out_dir = self.output_dir(ctx)
+        batch_id = items[0].id if items else "batch"
+        batch_dir = out_dir / ".tmp" / f"batch_{batch_id}"
+        batch_dir.mkdir(parents=True, exist_ok=True)
+        pdb_dir = batch_dir / "input_pdb"
+        pdb_dir.mkdir(parents=True, exist_ok=True)
+
+        csv_path = batch_dir / "flowpacker_input.csv"
+        results: dict[str, tuple[str, str | None]] = {}
+        seq_count = 0
+        seen: dict[str, set[str]] = {}
+        valid_items: list[WorkItem] = []
+        with csv_path.open("w", newline="") as handle:
+            writer = csv.writer(handle)
+            writer.writerow(["link_name", "seq", "seq_idx"])
+            for item in items:
+                pdb_path = Path(str((item.payload or {}).get("pdb_path") or ""))
+                if not pdb_path.exists():
+                    if self.item_done(ctx, item):
+                        results[item.id] = ("done", None)
+                    else:
+                        results[item.id] = ("blocked", f"PDB not found: {pdb_path}")
+                    continue
+                fasta_path = (item.payload or {}).get("fasta_path")
+                if not fasta_path:
+                    if self.item_done(ctx, item):
+                        results[item.id] = ("done", None)
+                    else:
+                        results[item.id] = ("blocked", f"Missing fasta for {pdb_path.stem}")
+                    continue
+                fasta_path = Path(str(fasta_path))
+                if not fasta_path.exists():
+                    if self.item_done(ctx, item):
+                        results[item.id] = ("done", None)
+                    else:
+                        results[item.id] = ("blocked", f"Fasta not found: {fasta_path}")
+                    continue
+                run_stem = str((item.payload or {}).get("run_stem") or pdb_path.stem)
+                dst = pdb_dir / f"{run_stem}.pdb"
+                if not dst.exists():
+                    try:
+                        os.link(pdb_path, dst)
+                    except OSError:
+                        shutil.copy2(pdb_path, dst)
+                link_name = f"{run_stem}{link_suffix}"
+                seen_for_link = seen.setdefault(link_name, set())
+                seqs = self._read_fasta(fasta_path)
+                for i, seq in enumerate(seqs):
+                    if i == 0 or not seq or seq in seen_for_link:
+                        continue
+                    seen_for_link.add(seq)
+                    writer.writerow([link_name, seq, str(i)])
+                    seq_count += 1
+                valid_items.append(item)
+        if not valid_items:
+            shutil.rmtree(batch_dir, ignore_errors=True)
+            return results
+        if seq_count == 0:
+            err = "No sequences written for flowpacker batch"
+            for item in valid_items:
+                results[item.id] = ("failed", err)
+            shutil.rmtree(batch_dir, ignore_errors=True)
+            return results
+
+        yaml_path = batch_dir / "input.yaml"
+        base_yaml_path = self._resolve_base_yaml(flowpacker_repo, base_yaml)
+        try:
+            import yaml
+        except Exception as exc:
+            raise StepError(f"Missing yaml dependency: {exc}") from exc
+        base_cfg = yaml.safe_load(base_yaml_path.read_text())
+        if isinstance(base_cfg, dict):
+            base_cfg["ckpt"] = self._abspath_if_relative(base_cfg.get("ckpt"), flowpacker_repo)
+            base_cfg["conf_ckpt"] = self._abspath_if_relative(base_cfg.get("conf_ckpt"), flowpacker_repo)
+        cfg_payload = dict(base_cfg or {})
+        cfg_payload.setdefault("data", {})
+        cfg_payload["data"]["test_path"] = str(pdb_dir)
+        yaml_path.write_text(yaml.safe_dump(cfg_payload, sort_keys=False))
+
+        script = Path(__file__).resolve().parents[3] / "scripts" / "run_flowpacker.py"
+        cmd = [
+            sys.executable,
+            str(script),
+            "--batch_yaml",
+            str(yaml_path),
+            "--csv_file",
+            str(csv_path),
+            "--output_dir",
+            str(batch_dir),
+            "--flowpacker_repo",
+            str(flowpacker_repo),
+            "--binder_chain",
+            str(binder_chain),
+        ]
+        err: str | None = None
+        if valid_items:
+            try:
+                run_command(
+                    cmd,
+                    env=os.environ.copy(),
+                    cwd=str(batch_dir),
+                    log_file=self.cfg.get("_log_file"),
+                    verbose=bool(self.cfg.get("_verbose")),
+                )
+            except Exception as exc:
+                err = str(exc)
+
+        allow_reuse = bool((ctx.work_queue or {}).get("allow_reuse", True))
+        strict_collision = False
+        flowpacker_out = out_dir / "flowpacker_outputs" / "run_1"
+        after_pdbs = out_dir / "after_pdbs"
+        try:
+            promote_tree(batch_dir / "flowpacker_outputs" / "run_1", flowpacker_out, allow_reuse=allow_reuse)
+            promote_tree(batch_dir / "after_pdbs", after_pdbs, allow_reuse=allow_reuse)
+        except Exception as exc:
+            if err is None:
+                err = str(exc)
+            if not allow_reuse:
+                strict_collision = True
+        shutil.rmtree(batch_dir, ignore_errors=True)
+
+        for item in valid_items:
+            if strict_collision:
+                results[item.id] = ("failed", err or "collision")
+            elif self.item_done(ctx, item):
+                results[item.id] = ("done", None)
+            else:
+                results[item.id] = ("failed", err or "missing output")
+        return results
 
     def write_manifest(self, ctx: StepContext) -> None:
         out_dir = self.output_dir(ctx)
@@ -1031,6 +1446,10 @@ class AF3ScoreStep(ExternalCommandStep):
     stage = "score"
     supports_work_queue = True
     work_queue_mode = "items"
+    # Drain per-worker batches to avoid repeated model reloads.
+    per_worker_batch = True
+    # 0 means "claim all available items for this worker".
+    batch_size = 0
 
     def _af3score_config(self) -> dict:
         cfg = dict(self.cfg.get("af3score") or {})
@@ -1197,7 +1616,7 @@ class AF3ScoreStep(ExternalCommandStep):
             script = Path(__file__).resolve().parents[3] / "scripts" / "run_af3score.py"
 
         cmd = [
-            "python",
+            sys.executable,
             str(script),
             "--input_pdb",
             str(tmp_pdb),
@@ -1264,6 +1683,170 @@ class AF3ScoreStep(ExternalCommandStep):
         if metrics_src.exists():
             promote_file(metrics_src, metrics_items / f"{item.id}.csv", allow_reuse=allow_reuse)
         shutil.rmtree(item_dir, ignore_errors=True)
+
+    def run_batch(self, ctx: StepContext, items: list[WorkItem]) -> dict[str, tuple[str, str | None]]:
+        cfg = self._af3score_config()
+        af3_repo = self._resolve_path(ctx, cfg.get("af3score_repo")) if cfg else None
+        model_dir = self._resolve_path(ctx, cfg.get("model_dir")) if cfg else None
+        if not af3_repo or not af3_repo.exists():
+            raise StepError("af3score_repo missing or invalid")
+        if not model_dir or not model_dir.exists():
+            raise StepError("model_dir missing or invalid")
+
+        out_dir = self.output_dir(ctx)
+        batch_id = items[0].id if items else "batch"
+        batch_dir = out_dir / ".tmp" / f"batch_{batch_id}"
+        batch_dir.mkdir(parents=True, exist_ok=True)
+        input_dir = batch_dir / "input_pdbs"
+        input_dir.mkdir(parents=True, exist_ok=True)
+
+        results: dict[str, tuple[str, str | None]] = {}
+        valid_items: list[WorkItem] = []
+        for item in items:
+            pdb_path = Path(str((item.payload or {}).get("pdb_path") or ""))
+            if not pdb_path.exists():
+                if self.item_done(ctx, item):
+                    results[item.id] = ("done", None)
+                else:
+                    results[item.id] = ("blocked", f"PDB not found: {pdb_path}")
+                continue
+            run_stem = str((item.payload or {}).get("run_stem") or pdb_path.stem)
+            dst = input_dir / f"{run_stem}.pdb"
+            if not dst.exists():
+                try:
+                    os.link(pdb_path, dst)
+                except OSError:
+                    shutil.copy2(pdb_path, dst)
+            valid_items.append(item)
+        if not valid_items:
+            shutil.rmtree(batch_dir, ignore_errors=True)
+            return results
+
+        script = None
+        cmd_cfg = self.cfg.get("command") or []
+        if isinstance(cmd_cfg, str):
+            cmd_cfg = [cmd_cfg]
+        for tok in cmd_cfg:
+            if str(tok).endswith("run_af3score.py") and Path(str(tok)).exists():
+                script = Path(str(tok))
+                break
+        if script is None:
+            script = Path(__file__).resolve().parents[3] / "scripts" / "run_af3score.py"
+
+        cmd = [
+            sys.executable,
+            str(script),
+            "--input_pdb_dir",
+            str(input_dir),
+            "--output_dir",
+            str(batch_dir),
+            "--af3score_repo",
+            str(af3_repo),
+            "--model_dir",
+            str(model_dir),
+        ]
+        db_dir = cfg.get("db_dir")
+        if db_dir:
+            db_path = self._resolve_path(ctx, db_dir)
+            if db_path:
+                cmd.extend(["--db_dir", str(db_path)])
+        num_jobs = int(cfg.get("num_jobs") or 1)
+        cmd.extend(["--num_jobs", str(num_jobs)])
+        if cfg.get("num_workers") is not None:
+            cmd.extend(["--num_workers", str(cfg.get("num_workers"))])
+        if cfg.get("bucket_default") is not None:
+            cmd.extend(["--bucket_default", str(cfg.get("bucket_default"))])
+        if cfg.get("num_samples") is not None:
+            cmd.extend(["--num_samples", str(cfg.get("num_samples"))])
+        if cfg.get("model_seeds") is not None:
+            cmd.extend(["--model_seeds", str(cfg.get("model_seeds"))])
+        if cfg.get("no_templates"):
+            cmd.append("--no_templates")
+        if cfg.get("write_cif_model") is not None:
+            cmd.extend(["--write_cif_model", str(cfg.get("write_cif_model"))])
+        if cfg.get("write_best_model_root"):
+            cmd.append("--write_best_model_root")
+        if cfg.get("write_ranking_scores_csv"):
+            cmd.append("--write_ranking_scores_csv")
+        if cfg.get("export_pdb_dir") is not None:
+            cmd.extend(["--export_pdb_dir", str(batch_dir / "pdbs")])
+        if cfg.get("target_offsets_json"):
+            offsets_path = self._resolve_path(ctx, cfg.get("target_offsets_json"))
+            if offsets_path:
+                cmd.extend(["--target_offsets_json", str(offsets_path)])
+        if cfg.get("target_chain"):
+            cmd.extend(["--target_chain", str(cfg.get("target_chain"))])
+
+        err: str | None = None
+        if valid_items:
+            try:
+                run_command(
+                    cmd,
+                    env=os.environ.copy(),
+                    cwd=str(batch_dir),
+                    log_file=self.cfg.get("_log_file"),
+                    verbose=bool(self.cfg.get("_verbose")),
+                )
+            except Exception as exc:
+                err = str(exc)
+
+        allow_reuse = bool((ctx.work_queue or {}).get("allow_reuse", True))
+        strict_collision = False
+        for sub in [
+            "af3score_outputs",
+            "single_chain_cif",
+            "json",
+            "af3_input_batch",
+            "pdbs",
+            "af3score_subprocess_logs",
+        ]:
+            try:
+                promote_tree(batch_dir / sub, out_dir / sub, allow_reuse=allow_reuse)
+            except Exception as exc:
+                if err is None:
+                    err = str(exc)
+                if not allow_reuse:
+                    strict_collision = True
+
+        metrics_items = out_dir / "metrics_items"
+        metrics_items.mkdir(parents=True, exist_ok=True)
+        metrics_src = batch_dir / "metrics.csv"
+        if metrics_src.exists():
+            try:
+                import pandas as pd
+
+                df = pd.read_csv(metrics_src)
+                for item in valid_items:
+                    run_stem = str((item.payload or {}).get("run_stem") or item.id)
+                    mask = None
+                    for col in ("description", "name", "model", "pdb_name"):
+                        if col in df.columns:
+                            mask = df[col].astype(str) == run_stem
+                            if mask.any():
+                                break
+                    if mask is None or not mask.any():
+                        for col in df.columns:
+                            if df[col].dtype == object:
+                                mask = df[col].astype(str) == run_stem
+                                if mask.any():
+                                    break
+                    if mask is not None and mask.any():
+                        df.loc[mask].to_csv(metrics_items / f"{item.id}.csv", index=False)
+                    elif len(valid_items) == 1:
+                        df.to_csv(metrics_items / f"{item.id}.csv", index=False)
+            except Exception:
+                pass
+
+        shutil.rmtree(batch_dir, ignore_errors=True)
+
+        for item in valid_items:
+            if strict_collision:
+                results[item.id] = ("failed", err or "collision")
+            elif self.item_done(ctx, item):
+                results[item.id] = ("done", None)
+            else:
+                results[item.id] = ("failed", err or "missing metrics output")
+        return results
 
     def write_manifest(self, ctx: StepContext) -> None:
         out_dir = self.output_dir(ctx)

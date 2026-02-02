@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import sys
 from pathlib import Path
 
 from .base import Step, StepContext
@@ -124,7 +125,7 @@ class DockQStep(Step):
         if not out_path.is_absolute():
             out_path = ctx.out_dir / out_path
         cmd = [
-            "python",
+            sys.executable,
             str(script),
             "--dockq_bin",
             str(dockq_bin),

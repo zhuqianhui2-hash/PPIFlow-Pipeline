@@ -81,7 +81,8 @@ class WorkQueue:
         self.lease_seconds = int(self.cfg.get("lease_seconds") or 1800)
         self.max_attempts = int(self.cfg.get("max_attempts") or 1)
         self.retry_failed = bool(self.cfg.get("retry_failed"))
-        self.batch_size = int(self.cfg.get("batch_size") or 1)
+        batch_val = self.cfg.get("batch_size")
+        self.batch_size = 1 if batch_val is None else int(batch_val)
         self.leader_timeout = int(self.cfg.get("leader_timeout") or 600)
         allow_reuse = self.cfg.get("allow_reuse")
         if allow_reuse is None:
@@ -567,6 +568,25 @@ class WorkQueue:
                 "UPDATE claims SET heartbeat_ts=? WHERE id=?",
                 (time.time(), str(item_id)),
             )
+        finally:
+            conn.close()
+
+    def touch_items(self, item_ids: Iterable[str]) -> None:
+        if not self.db_path.exists():
+            return
+        ids = [str(i) for i in item_ids if i]
+        if not ids:
+            return
+        conn = self._connect()
+        now = time.time()
+        try:
+            for idx in range(0, len(ids), 200):
+                chunk = ids[idx : idx + 200]
+                placeholders = ",".join("?" for _ in chunk)
+                conn.execute(
+                    f"UPDATE claims SET heartbeat_ts=? WHERE worker_id=? AND id IN ({placeholders})",
+                    (now, self.worker_id, *chunk),
+                )
         finally:
             conn.close()
 

@@ -8,6 +8,27 @@ from pathlib import Path
 from typing import Iterable
 
 
+def _append_progress_log(line: str) -> None:
+    path = os.environ.get("PPIFLOW_PROGRESS_LOG_PATH")
+    if not path:
+        return
+    try:
+        from fcntl import LOCK_EX, LOCK_UN, flock  # type: ignore
+    except Exception:
+        LOCK_EX = LOCK_UN = None  # type: ignore
+        flock = None  # type: ignore
+    try:
+        with open(path, "a") as handle:
+            if flock and LOCK_EX is not None:
+                flock(handle, LOCK_EX)
+            handle.write(line + "\n")
+            handle.flush()
+            if flock and LOCK_UN is not None:
+                flock(handle, LOCK_UN)
+    except Exception:
+        pass
+
+
 def run_command(
     cmd: Iterable[str],
     *,
@@ -96,4 +117,6 @@ def log_command_progress(
         parts.append(extra)
     if status != "OK" and log_file:
         parts.append(f"log={log_file}")
-    print(" ".join(parts), file=sys.__stdout__, flush=True)
+    line = " ".join(parts)
+    print(line, file=sys.__stdout__, flush=True)
+    _append_progress_log(line)

@@ -41,9 +41,14 @@ Optional flags:
 
 Note: the full pipeline cannot be run without installing all tools.
 
-After install, load tool paths:
+After install, load tool paths and activate the main environment:
 ```bash
 source ./env.sh
+conda activate ppiflow
+```
+If you don’t want to activate the env, use the full path:
+```bash
+/path/to/PPIFlow-Pipeline/.miniforge3/envs/ppiflow/bin/python ppiflow.py ...
 ```
 
 Manual option (if you want to manage tools yourself):
@@ -67,6 +72,12 @@ python ppiflow.py pipeline \
   --preset fast \
   --input /path/to/design.yaml \
   --output /path/to/out_dir
+```
+
+### 2b) Run with the interactive wizard
+
+```bash
+python ppiflow.py wizard
 ```
 
 ### 3) Run with CLI-only inputs (no YAML)
@@ -96,6 +107,7 @@ The unified CLI lives in `ppiflow.py` and exposes these commands:
 - `execute`: run from `steps.yaml`
 - `rank`: run the rank step only
 - `orchestrate`: run per-step pools (advanced)
+- `wizard`: interactive setup (guided prompts)
 
 Common flags:
 

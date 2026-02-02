@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import sys
 import csv
 import json
 import math
@@ -194,7 +195,7 @@ def main() -> None:
         env["FLOWPACKER_REPO"] = str(flowpacker_repo)
         env["FLOWPACKER_BINDER_CHAIN"] = args.binder_chain
         cmd = [
-            "python",
+            sys.executable,
             str(sampler_script),
             str(batch_yaml),
             "--save_dir",
@@ -255,7 +256,7 @@ def main() -> None:
     _write_progress(output_dir, 0, total, status="running")
     for idx, yaml_path in enumerate(yaml_paths, start=1):
         cmd = [
-            "python",
+            sys.executable,
             str(sampler_script),
             str(yaml_path),
             "--save_dir",

@@ -279,6 +279,16 @@ class RosettaInterfaceStep(Step):
         residue_items.mkdir(parents=True, exist_ok=True)
         residue_src = item_out / "residue_energy.csv"
         if residue_src.exists():
+            # Rewrite pdbpath to point at the original input PDB (not .tmp) for downstream steps.
+            try:
+                import pandas as pd
+
+                df = pd.read_csv(residue_src)
+                if "pdbpath" in df.columns:
+                    df["pdbpath"] = str(pdb_path)
+                df.to_csv(residue_src, index=False)
+            except Exception:
+                pass
             promote_file(residue_src, residue_items / f"{item.id}.csv", allow_reuse=allow_reuse)
         shutil.rmtree(item_dir, ignore_errors=True)
 

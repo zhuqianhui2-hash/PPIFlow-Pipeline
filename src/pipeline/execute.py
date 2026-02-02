@@ -11,7 +11,7 @@ from typing import Iterable
 
 from .heartbeat import HeartbeatReporter
 from .io import read_yaml
-from .state import collect_tool_versions, init_or_update_state, load_state, sha256_json
+from .state import collect_tool_versions, init_or_update_state, load_state, sha256_json, validate_state
 from .steps import STEP_ORDER, STEP_REGISTRY
 from .steps.base import StepContext, StepError
 
@@ -167,16 +167,39 @@ def execute_pipeline(args) -> None:
     from .io import read_json
 
     input_data = read_json(input_json)
+
+    rank = int(os.environ.get("RANK", "0"))
+    world_size = int(os.environ.get("WORLD_SIZE", "1"))
+    local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+
     tool_versions = collect_tool_versions(input_data.get("tools") or {})
+    input_sha = sha256_json(input_data)
     sampling = input_data.get("sampling") or {}
     target_n = int(sampling.get("samples_per_target", 0) or 0)
-    state = init_or_update_state(
-        out_dir=out_dir,
-        input_sha256=sha256_json(input_data),
-        tool_versions=tool_versions,
-        target_n=target_n,
-        seeds=(sampling.get("seeds") or None),
-    )
+
+    state = None
+    state_path = out_dir / "pipeline_state.json"
+    if rank == 0:
+        state = init_or_update_state(
+            out_dir=out_dir,
+            input_sha256=input_sha,
+            tool_versions=tool_versions,
+            target_n=target_n,
+            seeds=(sampling.get("seeds") or None),
+        )
+    else:
+        # Avoid concurrent writes to pipeline_state.json from multiple ranks.
+        state = load_state(state_path)
+        if not state:
+            start = time.time()
+            timeout = 300.0
+            while (time.time() - start) < timeout and not state:
+                time.sleep(0.5)
+                state = load_state(state_path)
+        if state:
+            validate_state(state, input_sha, tool_versions)
+        else:
+            raise StepError("pipeline_state.json missing; rank 0 must initialize state.")
 
     run_id = int((state.get("runs") or [{"run_id": 0}])[0].get("run_id", 0))
     run_seed = int((state.get("runs") or [{"run_seed": 0}])[0].get("run_seed", 0) or 0)
@@ -189,10 +212,6 @@ def execute_pipeline(args) -> None:
         options.setdefault("continue_on_item_error", True)
 
     hb = HeartbeatReporter.from_env(out_dir)
-
-    rank = int(os.environ.get("RANK", "0"))
-    world_size = int(os.environ.get("WORLD_SIZE", "1"))
-    local_rank = int(os.environ.get("LOCAL_RANK", "0"))
 
     def _resolve_work_queue_cfg() -> dict:
         cfg = dict(input_data.get("work_queue") or {})

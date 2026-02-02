@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import sys
 import os
 from pathlib import Path
 from typing import Any
@@ -49,7 +50,8 @@ def _step_config(name: str, run_id: int, input_data: dict) -> dict:
             "stage": "score",
             "output_dir": f"{run_dir}/af3score_round1",
             "manifest": f"{manifests_dir}/af3score_round1.csv",
-            "input_dir": f"{run_dir}/flowpacker_round1",
+            # FlowPacker itemization writes legacy PDBs into after_pdbs/.
+            "input_dir": f"{run_dir}/flowpacker_round1/after_pdbs",
         })
     elif name == "rosetta_interface":
         af3_r1 = ((input_data.get("filters") or {}).get("af3score") or {}).get("round1") or {}
@@ -94,7 +96,8 @@ def _step_config(name: str, run_id: int, input_data: dict) -> dict:
             "stage": "score",
             "output_dir": f"{run_dir}/af3score_round2",
             "manifest": f"{manifests_dir}/af3score_round2.csv",
-            "input_dir": f"{run_dir}/flowpacker_round2",
+            # FlowPacker itemization writes legacy PDBs into after_pdbs/.
+            "input_dir": f"{run_dir}/flowpacker_round2/after_pdbs",
         })
     elif name == "relax":
         af3_r2 = ((input_data.get("filters") or {}).get("af3score") or {}).get("round2") or {}
@@ -271,7 +274,7 @@ def _apply_default_command(
             seq_fasta_dir = run_dir / "seqs_round2" / "seqs"
             output_dir = run_dir / "flowpacker_round2"
         cfg["command"] = [
-            "python",
+            sys.executable,
             str(script),
             "--input_pdb_dir",
             str(input_pdb_dir),
@@ -299,13 +302,15 @@ def _apply_default_command(
         run_dir = out_dir / "output"
         num_jobs = int(os.environ.get("PPIFLOW_AF3_JOBS", "1"))
         if step_name == "af3score1":
-            input_pdb_dir = run_dir / "flowpacker_round1" / "flowpacker_outputs"
+            # FlowPacker itemization writes legacy PDBs into after_pdbs/.
+            input_pdb_dir = run_dir / "flowpacker_round1" / "after_pdbs"
             output_dir = run_dir / "af3score_round1"
         else:
-            input_pdb_dir = run_dir / "flowpacker_round2" / "flowpacker_outputs"
+            # FlowPacker itemization writes legacy PDBs into after_pdbs/.
+            input_pdb_dir = run_dir / "flowpacker_round2" / "after_pdbs"
             output_dir = run_dir / "af3score_round2"
         cfg["command"] = [
-            "python",
+            sys.executable,
             str(script),
             "--input_pdb_dir",
             str(input_pdb_dir),
@@ -348,7 +353,7 @@ def _apply_default_command(
         model_seeds = refold_cfg.get("model_seeds")
         no_templates = refold_cfg.get("no_templates", True)
         cfg["command"] = [
-            "python",
+            sys.executable,
             str(script),
             "--input_pdb_dir",
             str(input_pdb_dir),
@@ -399,7 +404,7 @@ def _apply_default_command(
         reference_pdb_dir = run_dir / "af3score_round2" / "filtered_pdbs"
         output_dir = run_dir / "dockq"
         cfg["command"] = [
-            "python",
+            sys.executable,
             str(script),
             "--dockq_bin",
             str(dockq_bin),

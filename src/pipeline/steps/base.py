@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import csv
+import math
 import os
 import sys
 import threading
@@ -70,6 +71,82 @@ class Step:
 
     def run_item(self, ctx: StepContext, item: Any) -> None:
         raise NotImplementedError
+
+    def _output_wait_params(self, ctx: StepContext) -> tuple[int, float]:
+        cfg = ctx.work_queue or {}
+        try:
+            retries = int(cfg.get("output_wait_retries", 3))
+        except Exception:
+            retries = 3
+        try:
+            delay = float(cfg.get("output_wait_sleep", 1.0))
+        except Exception:
+            delay = 1.0
+        return max(retries, 0), max(delay, 0.0)
+
+    def _ensure_item_done(self, ctx: StepContext, item: Any) -> bool:
+        if self.item_done(ctx, item):
+            return True
+        retries, delay = self._output_wait_params(ctx)
+        for _ in range(retries):
+            time.sleep(delay)
+            if self.item_done(ctx, item):
+                return True
+        return False
+
+    def _manifest_has_rows(self, ctx: StepContext) -> bool:
+        manifest = self.cfg.get("manifest")
+        if not manifest:
+            return False
+        p = Path(manifest)
+        if not p.is_absolute():
+            p = ctx.out_dir / p
+        if not p.exists():
+            return False
+        try:
+            with p.open("r", newline="") as handle:
+                rows = list(csv.reader(handle))
+            return len(rows) > 1
+        except Exception:
+            return False
+
+    def ready_outputs(self, ctx: StepContext) -> bool:
+        # Prefer verifying item outputs for work-queue items.
+        try:
+            if str(getattr(self, "work_queue_mode", "items") or "items") == "items":
+                step_dir = ctx.out_dir / ".work" / str(self.name)
+                if (step_dir / "queue.db").exists():
+                    from ..work_queue import WorkQueue
+
+                    wq = WorkQueue.from_step_dir(step_dir)
+                    counts = wq.counts()
+                    if counts.get("pending", 0) == 0 and counts.get("running", 0) == 0:
+                        done_found = False
+                        for work_item, status in wq.iter_items():
+                            if status == "done":
+                                done_found = True
+                                if not self.item_done(ctx, work_item):
+                                    return False
+                        if done_found:
+                            return True
+                        # If nothing is done (all failed/blocked), don't block readiness.
+                        return True
+        except Exception:
+            pass
+
+        if self._manifest_has_rows(ctx):
+            return True
+        try:
+            expected = int(self.expected_total(ctx))
+        except Exception:
+            expected = 0
+        if expected <= 0:
+            return True
+        try:
+            done = self.scan_done(ctx)
+        except Exception:
+            return False
+        return len(done) > 0
 
     def run(self, ctx: StepContext) -> None:
         wq_cfg = ctx.work_queue or {}
@@ -212,6 +289,14 @@ class Step:
         except WorkQueueError as exc:
             raise StepError(str(exc)) from exc
 
+        # If item-level retries are enabled, reset failed/blocked/running items
+        # back to pending so they will be re-claimed in this run.
+        if getattr(wq, "retry_failed", False):
+            try:
+                wq.reset_items_for_retry()
+            except Exception:
+                pass
+
         counts = wq.counts()
         expected_total = sum(counts.values())
         done_count = counts.get("done", 0)
@@ -290,11 +375,55 @@ class Step:
         try:
             while True:
                 batch: list[Any] = []
-                for _ in range(max(int(wq.batch_size), 1)):
-                    claimed = wq.claim_next()
-                    if not claimed:
-                        break
-                    batch.append(claimed)
+                raw_batch = getattr(self, "batch_size", None)
+                if raw_batch is None:
+                    raw_batch = wq.batch_size
+                batch_size = int(raw_batch) if raw_batch is not None else 1
+                drain_batch = bool(getattr(self, "per_worker_batch", False))
+                if drain_batch:
+                    max_batch = batch_size if batch_size > 0 else None
+                    if max_batch is None:
+                        try:
+                            counts = wq.counts()
+                            pending = int(counts.get("pending", 0))
+                            retryable = 0
+                            if wq.retry_failed:
+                                retryable += int(counts.get("failed", 0))
+                                retryable += int(counts.get("blocked", 0))
+                            running = int(counts.get("running", 0))
+                        except Exception:
+                            pending = 0
+                            retryable = 0
+                            running = 0
+                        total = pending + retryable + running
+                        if total > 0 and ctx.world_size > 0:
+                            max_batch = max(1, int(math.ceil(total / float(ctx.world_size))))
+                    recent_claims: list[str] = []
+                    while True:
+                        claimed = wq.claim_next()
+                        if not claimed:
+                            break
+                        batch.append(claimed)
+                        recent_claims.append(claimed.item.id)
+                        if len(recent_claims) >= 50:
+                            try:
+                                wq.touch_items(recent_claims)
+                            except Exception:
+                                pass
+                            recent_claims = []
+                        if max_batch and len(batch) >= max_batch:
+                            break
+                    if recent_claims:
+                        try:
+                            wq.touch_items(recent_claims)
+                        except Exception:
+                            pass
+                else:
+                    for _ in range(max(batch_size, 1)):
+                        claimed = wq.claim_next()
+                        if not claimed:
+                            break
+                        batch.append(claimed)
                 if not batch:
                     counts = wq.counts()
                     if counts.get("pending", 0) == 0 and counts.get("running", 0) == 0:
@@ -314,6 +443,89 @@ class Step:
                     time.sleep(max(min(int(wq.lease_seconds) // 6, 10), 2))
                     continue
                 wait_started = None
+                # Batch-capable steps can process multiple items at once.
+                if hasattr(self, "run_batch") and len(batch) > 1:
+                    attempt_log = wq.attempt_log_path(batch[0].item.id, batch[0].attempt)
+                    prev_log = self.cfg.get("_log_file")
+                    prev_prefix = os.environ.get("PPIFLOW_LOG_PREFIX")
+                    prev_log_path = os.environ.get("PPIFLOW_LOG_PATH")
+                    self.cfg["_log_file"] = str(attempt_log)
+                    batch_ids = ",".join(c.item.id for c in batch)
+                    os.environ["PPIFLOW_LOG_PREFIX"] = f"batch:{batch_ids}"[:128]
+                    os.environ["PPIFLOW_LOG_PATH"] = str(attempt_log)
+                    stop_evt = threading.Event()
+                    claim_thread = None
+                    interval = max(min(int(wq.lease_seconds) // 3, 30), 5)
+
+                    def _claim_loop() -> None:
+                        item_ids = [c.item.id for c in batch]
+                        while not stop_evt.wait(interval):
+                            try:
+                                wq.touch_items(item_ids)
+                            except Exception:
+                                pass
+
+                    try:
+                        claim_thread = threading.Thread(target=_claim_loop, daemon=True)
+                        claim_thread.start()
+                        result = self.run_batch(ctx, [c.item for c in batch])  # type: ignore[attr-defined]
+                    except FileNotFoundError as exc:
+                        for claimed in batch:
+                            wq.mark_blocked(claimed.item.id, claimed.attempt, str(exc))
+                        if not allow_failures:
+                            error_reason = str(exc)
+                            raise
+                    except Exception as exc:
+                        for claimed in batch:
+                            wq.mark_failed(claimed.item.id, claimed.attempt, str(exc))
+                        if not allow_failures:
+                            error_reason = str(exc)
+                            raise
+                    else:
+                        status_map: dict[str, tuple[str, str | None]] = {}
+                        if isinstance(result, dict):
+                            for k, v in result.items():
+                                if isinstance(v, tuple) and len(v) == 2:
+                                    status_map[str(k)] = (str(v[0]), v[1])
+                                else:
+                                    status_map[str(k)] = (str(v), None)
+                        elif isinstance(result, (set, list, tuple)):
+                            for k in result:
+                                status_map[str(k)] = ("failed", None)
+                        for claimed in batch:
+                            status, err = status_map.get(claimed.item.id, ("done", None))
+                            if status == "done":
+                                if not self._ensure_item_done(ctx, claimed.item):
+                                    status = "failed"
+                                    err = err or "missing output"
+                            if status == "done":
+                                wq.mark_done(claimed.item.id, claimed.attempt)
+                            elif status == "blocked":
+                                wq.mark_blocked(claimed.item.id, claimed.attempt, err or "")
+                            else:
+                                wq.mark_failed(claimed.item.id, claimed.attempt, err or "")
+                    finally:
+                        stop_evt.set()
+                        if claim_thread is not None:
+                            claim_thread.join(timeout=1.0)
+                        self.cfg["_log_file"] = prev_log
+                        if prev_prefix is None:
+                            os.environ.pop("PPIFLOW_LOG_PREFIX", None)
+                        else:
+                            os.environ["PPIFLOW_LOG_PREFIX"] = prev_prefix
+                        if prev_log_path is None:
+                            os.environ.pop("PPIFLOW_LOG_PATH", None)
+                        else:
+                            os.environ["PPIFLOW_LOG_PATH"] = prev_log_path
+                    prog = wq.progress()
+                    if hb:
+                        hb.update(
+                            produced_total=int(prog.get("produced_total", 0)),
+                            expected_total=int(prog.get("expected_total", expected_total)),
+                            state=str(prog.get("status") or "running"),
+                        )
+                    continue
+
                 for claimed in batch:
                     item = claimed.item
                     attempt = claimed.attempt
@@ -325,7 +537,7 @@ class Step:
                     def _claim_loop() -> None:
                         while not stop_evt.wait(interval):
                             try:
-                                wq.heartbeat(item.id)
+                                wq.touch_items([item.id])
                             except Exception:
                                 pass
 
@@ -352,7 +564,13 @@ class Step:
                                 os.environ.pop("PPIFLOW_LOG_PATH", None)
                             else:
                                 os.environ["PPIFLOW_LOG_PATH"] = prev_log_path
-                        wq.mark_done(item.id, attempt)
+                        if not self._ensure_item_done(ctx, item):
+                            wq.mark_failed(item.id, attempt, "missing output")
+                            if not allow_failures:
+                                error_reason = "missing output"
+                                raise StepError(error_reason)
+                        else:
+                            wq.mark_done(item.id, attempt)
                     except FileNotFoundError as exc:
                         wq.mark_blocked(item.id, attempt, str(exc))
                         if not allow_failures:

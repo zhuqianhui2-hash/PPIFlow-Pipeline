@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import subprocess
+import sys
 import time
 from pathlib import Path
 from typing import Any
@@ -97,6 +98,21 @@ def _fix_binder_partial_chains(out_sub: Path, target_pdb: Path, target_chain: st
         _swap_pdb_chains(pdb_path, mapping)
 
 
+def _resolve_partial_pdb_path(ctx: StepContext, pdb_path: str | Path | None, row: dict[str, Any]) -> str | None:
+    if pdb_path:
+        candidate = Path(str(pdb_path))
+        if not candidate.is_absolute():
+            candidate = ctx.out_dir / candidate
+        if candidate.exists():
+            return str(candidate)
+    name = row.get("pdb_name") or row.get("structure_id")
+    if name:
+        alt = ctx.out_dir / "output" / "rosetta_interface" / "rosetta_jobs" / str(name) / f"{name}.pdb"
+        if alt.exists():
+            return str(alt)
+    return str(pdb_path) if pdb_path else None
+
+
 class PartialFlowStep(Step):
     name = "partial"
     stage = "partial"
@@ -164,11 +180,11 @@ class PartialFlowStep(Step):
             for pos, idx in enumerate(indices, start=1):
                 row = rows[idx]
                 sid = str(row.get("structure_id") or row.get("pdb_name") or idx)
-                pdb_path = row.get("pdb_path") or target.get("pdb")
+                pdb_path = _resolve_partial_pdb_path(ctx, row.get("pdb_path") or target.get("pdb"), row)
                 motif_contig = _normalize_optional_string(row.get("motif_contig"))
                 out_sub = out_dir / sid
                 cmd = [
-                    "python",
+                    sys.executable,
                     str(script),
                     "--input_pdb",
                     str(pdb_path),
@@ -203,9 +219,21 @@ class PartialFlowStep(Step):
                 start = time.time()
                 status = "OK"
                 try:
+                    env = os.environ.copy()
+                    # Force single-process execution for Lightning to avoid DDP/torchrun inside workers.
+                    env.update({
+                        "RANK": "0",
+                        "WORLD_SIZE": "1",
+                        "LOCAL_RANK": "0",
+                        "NODE_RANK": "0",
+                        "MASTER_ADDR": "127.0.0.1",
+                        "MASTER_PORT": "29500",
+                    })
+                    for key in ("TORCHRUN", "TORCHELASTIC_RUN_ID", "GROUP_RANK", "LOCAL_WORLD_SIZE"):
+                        env.pop(key, None)
                     run_command(
                         cmd,
-                        env=os.environ.copy(),
+                        env=env,
                         log_file=self.cfg.get("_log_file"),
                         verbose=bool(self.cfg.get("_verbose")),
                     )
@@ -250,7 +278,7 @@ class PartialFlowStep(Step):
             for pos, idx in enumerate(indices, start=1):
                 row = rows[idx]
                 sid = str(row.get("structure_id") or row.get("pdb_name") or idx)
-                pdb_path = row.get("pdb_path")
+                pdb_path = _resolve_partial_pdb_path(ctx, row.get("pdb_path"), row)
                 if not pdb_path:
                     raise StepError("fixed_positions.csv missing pdb_path for partial flow")
                 if "fixed_positions" not in row:
@@ -258,7 +286,7 @@ class PartialFlowStep(Step):
                 fixed_positions = _normalize_optional_string(row.get("fixed_positions")) or ""
                 out_sub = out_dir / sid
                 cmd = [
-                    "python",
+                    sys.executable,
                     str(script),
                     "--complex_pdb",
                     str(pdb_path),
@@ -298,9 +326,20 @@ class PartialFlowStep(Step):
                 start = time.time()
                 status = "OK"
                 try:
+                    env = os.environ.copy()
+                    env.update({
+                        "RANK": "0",
+                        "WORLD_SIZE": "1",
+                        "LOCAL_RANK": "0",
+                        "NODE_RANK": "0",
+                        "MASTER_ADDR": "127.0.0.1",
+                        "MASTER_PORT": "29500",
+                    })
+                    for key in ("TORCHRUN", "TORCHELASTIC_RUN_ID", "GROUP_RANK", "LOCAL_WORLD_SIZE"):
+                        env.pop(key, None)
                     run_command(
                         cmd,
-                        env=os.environ.copy(),
+                        env=env,
                         log_file=self.cfg.get("_log_file"),
                         verbose=bool(self.cfg.get("_verbose")),
                     )

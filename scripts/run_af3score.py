@@ -37,13 +37,13 @@ def _quiet_enabled() -> bool:
     return value.strip().lower() in {"1", "true", "yes"}
 
 
-def _run_cmd(cmd: list[str], *, env: dict, log_path: Path | None = None) -> None:
+def _run_cmd(cmd: list[str], *, env: dict, log_path: Path | None = None, cwd: str | None = None) -> None:
     if log_path is None:
-        subprocess.check_call(cmd, env=env)
+        subprocess.check_call(cmd, env=env, cwd=cwd)
         return
     log_path.parent.mkdir(parents=True, exist_ok=True)
     with log_path.open("w") as handle:
-        subprocess.check_call(cmd, env=env, stdout=handle, stderr=subprocess.STDOUT)
+        subprocess.check_call(cmd, env=env, cwd=cwd, stdout=handle, stderr=subprocess.STDOUT)
 
 
 def _write_progress(
@@ -385,6 +385,7 @@ def main() -> None:
                 str(args.num_jobs),
             ],
             env=env,
+            cwd=str(output_dir),
             log_path=(subproc_log_dir / "prep_json.log") if subproc_log_dir else None,
         )
     except Exception:
@@ -430,6 +431,7 @@ def main() -> None:
                     str(args.num_workers),
                 ],
                 env=env,
+                cwd=str(output_dir),
                 log_path=(subproc_log_dir / f"prep_jax_{folder_name}.log") if subproc_log_dir else None,
             )
         except Exception:
@@ -497,6 +499,7 @@ def main() -> None:
             _run_cmd(
                 cmd,
                 env=env,
+                cwd=str(output_dir),
                 log_path=(subproc_log_dir / f"run_af3_{folder_name}.log") if subproc_log_dir else None,
             )
         except Exception:
@@ -527,6 +530,7 @@ def main() -> None:
                 str(metrics_csv),
             ],
             env=env,
+            cwd=str(output_dir),
             log_path=(subproc_log_dir / "metrics.log") if subproc_log_dir else None,
         )
     except Exception:

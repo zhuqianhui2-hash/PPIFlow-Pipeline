@@ -209,9 +209,21 @@ class HeartbeatReporter:
         if extra is not None:
             payload["extra"] = extra
 
+        wq_dir = os.environ.get("PPIFLOW_WORK_QUEUE_DIR")
+        if wq_dir:
+            try:
+                from .work_queue import load_progress
+
+                progress = load_progress(Path(wq_dir))
+                if progress:
+                    expected_from_db = int(progress.get("expected_total") or 0)
+                    if expected_from_db > 0:
+                        payload["progress"]["expected_total"] = expected_from_db
+            except Exception:
+                pass
+
         _atomic_write_json(self._rank_path(), payload)
 
-        wq_dir = os.environ.get("PPIFLOW_WORK_QUEUE_DIR")
         if self.rank == 0 or wq_dir:
             agg = self._aggregate(now=now)
             _atomic_write_json(self._global_path(), agg)
@@ -316,7 +328,6 @@ class HeartbeatReporter:
                 "produced_total": produced_sum,
                 "primary_counter": self._primary_counter,
             },
-            "distributed": {"per_rank": per_rank},
         }
 
 

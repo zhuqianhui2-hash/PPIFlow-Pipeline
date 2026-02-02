@@ -57,7 +57,11 @@ class Experiment:
         )
 
         if torch.cuda.is_available():
+            trainer_cfg = dict(self._exp_cfg.trainer) if hasattr(self._exp_cfg, "trainer") else {}
+            if isinstance(self._train_device_ids, (list, tuple)) and len(self._train_device_ids) <= 1:
+                trainer_cfg.pop("strategy", None)
             trainer = Trainer(
+                **trainer_cfg,
                 logger=False,
                 use_distributed_sampler=False,
                 enable_model_summary=True,

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import sys
 import subprocess
 import time
 from pathlib import Path
@@ -26,6 +27,10 @@ class GenStep(Step):
     supports_indices = True
     supports_work_queue = True
     work_queue_mode = "items"
+    # Drain per-worker batches to avoid repeated model reloads.
+    per_worker_batch = True
+    # 0 means "claim all available items for this worker".
+    batch_size = 0
 
     def expected_total(self, ctx: StepContext) -> int:
         sampling = ctx.input_data.get("sampling") or {}
@@ -99,12 +104,29 @@ class GenStep(Step):
         write_json(schedule_path, {"lengths": schedule}, indent=2)
         return schedule_path
 
+    def _serialize_sample_ids(self, indices: list[int]) -> str:
+        if not indices:
+            return ""
+        ids = sorted(set(int(i) for i in indices))
+        ranges: list[tuple[int, int]] = []
+        start = prev = ids[0]
+        for val in ids[1:]:
+            if val == prev + 1:
+                prev = val
+                continue
+            ranges.append((start, prev))
+            start = prev = val
+        ranges.append((start, prev))
+        parts = [f"{s}-{e}" if s != e else str(s) for s, e in ranges]
+        return ",".join(parts)
+
     def run_indices(self, ctx: StepContext, indices: list[int]) -> None:
         protocol = ctx.input_data.get("protocol")
         out_dir = self.output_dir(ctx)
         name = ctx.input_data.get("name")
         tools = ctx.input_data.get("tools") or {}
         config_path = tools.get("ppiflow_config")
+        sample_ids = self._serialize_sample_ids(indices)
 
         if protocol == "binder":
             script = _resolve_repo_path("src/entrypoints/sample_binder.py")
@@ -133,7 +155,7 @@ class GenStep(Step):
                 raise StepError("tools.ppiflow_ckpt is required for binder generation")
 
             cmd = [
-                "python",
+                sys.executable,
                 str(script),
                 "--input_pdb",
                 str(target.get("pdb")),
@@ -158,7 +180,7 @@ class GenStep(Step):
                 "--seed",
                 str(int((ctx.state.get("runs") or [{}])[0].get("run_seed", 0) or 0)),
                 "--sample_ids",
-                ",".join(str(i) for i in indices),
+                sample_ids,
             ]
             if hotspots_file:
                 cmd.extend(["--hotspots_file", str(hotspots_file)])
@@ -183,7 +205,7 @@ class GenStep(Step):
             if not ckpt:
                 raise StepError("tools.ppiflow_ckpt is required for antibody/vhh generation")
             cmd = [
-                "python",
+                sys.executable,
                 str(script),
                 "--antigen_pdb",
                 str(target.get("pdb")),
@@ -208,7 +230,7 @@ class GenStep(Step):
                 "--seed",
                 str(int((ctx.state.get("runs") or [{}])[0].get("run_seed", 0) or 0)),
                 "--sample_ids",
-                ",".join(str(i) for i in indices),
+                sample_ids,
             ]
             light_chain = framework.get("light_chain")
             if light_chain:
@@ -246,6 +268,27 @@ class GenStep(Step):
                 elapsed=time.time() - start,
                 log_file=self.cfg.get("_log_file"),
             )
+
+    def run_batch(self, ctx: StepContext, items: list[WorkItem]) -> dict[str, tuple[str, str | None]]:
+        sample_ids = []
+        for item in items:
+            try:
+                sample_ids.append(int((item.payload or {}).get("sample_id")))
+            except Exception:
+                sample_ids.append(int(item.id))
+        err: str | None = None
+        try:
+            # Run all sample IDs in a single command.
+            self.run_indices(ctx, sample_ids)
+        except Exception as exc:
+            err = str(exc)
+        results: dict[str, tuple[str, str | None]] = {}
+        for item in items:
+            if self.item_done(ctx, item):
+                results[item.id] = ("done", None)
+            else:
+                results[item.id] = ("failed", err or "missing output")
+        return results
 
     def write_manifest(self, ctx: StepContext) -> None:
         out_dir = self.output_dir(ctx)

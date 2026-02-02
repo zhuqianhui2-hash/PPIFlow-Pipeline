@@ -80,8 +80,12 @@ class Experiment:
         )
 
         if torch.cuda.is_available():
+            trainer_cfg = dict(self._exp_cfg.trainer)
+            # Avoid DDP when running a single device inside per-item workers.
+            if isinstance(self._train_device_ids, (list, tuple)) and len(self._train_device_ids) <= 1:
+                trainer_cfg.pop("strategy", None)
             trainer = Trainer(
-                **self._exp_cfg.trainer,
+                **trainer_cfg,
                 logger=logger,
                 use_distributed_sampler=False,
                 enable_model_summary=True,

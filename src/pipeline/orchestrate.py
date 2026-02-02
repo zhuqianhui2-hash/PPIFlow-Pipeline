@@ -12,6 +12,8 @@ from typing import Any, Dict, Iterable, List, Optional
 
 from .configure import configure_pipeline
 from .io import ensure_dir, read_json, read_yaml, repo_root, write_json
+from .steps import STEP_REGISTRY
+from .steps.base import StepContext
 from .work_queue import WaitResult, wait_for_step, WorkQueue
 
 
@@ -47,6 +49,95 @@ def _load_steps(out_dir: Path) -> list[str]:
         if name:
             steps.append(str(name))
     return steps
+
+
+def _load_step_configs(out_dir: Path) -> dict[str, dict[str, Any]]:
+    steps_yaml = out_dir / "steps.yaml"
+    if not steps_yaml.exists():
+        raise OrchestratorError(f"steps.yaml not found at {steps_yaml}")
+    steps_data = read_yaml(steps_yaml)
+    steps_list = steps_data.get("steps") if isinstance(steps_data, dict) else None
+    if not steps_list:
+        raise OrchestratorError("steps.yaml is empty or invalid")
+    cfgs: dict[str, dict[str, Any]] = {}
+    for entry in steps_list:
+        if not isinstance(entry, dict):
+            continue
+        name = entry.get("name")
+        if not name:
+            continue
+        cfg: dict[str, Any] = dict(entry)
+        cfg_path = entry.get("config_file")
+        if cfg_path:
+            p = Path(str(cfg_path))
+            if not p.is_absolute():
+                p = out_dir / p
+            if p.exists():
+                try:
+                    loaded = read_yaml(p)
+                    if isinstance(loaded, dict):
+                        cfg = loaded
+                except Exception:
+                    pass
+        if "name" not in cfg:
+            cfg["name"] = name
+        cfgs[str(name)] = cfg
+    return cfgs
+
+
+def _build_ready_context(out_dir: Path, input_data: dict, work_queue_cfg: dict) -> StepContext:
+    state_path = out_dir / "pipeline_state.json"
+    state = {}
+    if state_path.exists():
+        try:
+            state = read_json(state_path) or {}
+        except Exception:
+            state = {}
+    run_id = int((state.get("runs") or [{"run_id": 0}])[0].get("run_id", 0) or 0)
+    return StepContext(
+        out_dir=out_dir,
+        input_data=input_data,
+        state=state,
+        run_id=run_id,
+        rank=0,
+        world_size=1,
+        local_rank=0,
+        reuse=False,
+        heartbeat=None,
+        work_queue=work_queue_cfg,
+    )
+
+
+def _wait_for_ready_outputs(
+    *,
+    step_name: str,
+    step_cfg: dict[str, Any],
+    ctx: StepContext,
+    timeout: Optional[float],
+    poll_seconds: float = 2.0,
+) -> bool:
+    step_cls = STEP_REGISTRY.get(step_name)
+    if not step_cls:
+        return True
+    step = step_cls(step_cfg)
+    start = time.time()
+    warned = False
+    while True:
+        try:
+            if step.ready_outputs(ctx):
+                return True
+        except Exception:
+            pass
+        if timeout is not None and (time.time() - start) >= float(timeout):
+            return False
+        if not warned:
+            print(
+                f"[orchestrator] waiting for outputs of {step_name}",
+                file=sys.__stdout__,
+                flush=True,
+            )
+            warned = True
+        time.sleep(max(float(poll_seconds), 0.5))
 
 
 def _normalize_failure_policy(raw: Dict[str, Any], override_mode: Optional[str]) -> FailurePolicy:
@@ -204,7 +295,14 @@ def _build_plan(
     return plan
 
 
-def _build_worker_cmd(out_dir: Path, steps: list[str], *, continue_on_error: bool, wait_timeout: Optional[int]) -> list[str]:
+def _build_worker_cmd(
+    out_dir: Path,
+    steps: list[str],
+    *,
+    continue_on_error: bool,
+    wait_timeout: Optional[int],
+    work_queue_rebuild: bool = False,
+) -> list[str]:
     root = repo_root(out_dir)
     ppiflow = root / "ppiflow.py"
     cmd = [sys.executable, str(ppiflow), "execute", "--output", str(out_dir), "--steps", ",".join(steps), "--work-queue"]
@@ -212,6 +310,8 @@ def _build_worker_cmd(out_dir: Path, steps: list[str], *, continue_on_error: boo
         cmd.append("--continue-on-error")
     if wait_timeout is not None:
         cmd.extend(["--work-queue-wait-timeout", str(wait_timeout)])
+    if work_queue_rebuild:
+        cmd.append("--work-queue-rebuild")
     return cmd
 
 
@@ -226,6 +326,8 @@ def _spawn_workers(
     wait_timeout: Optional[int],
     run_dir: Path,
     log_ctx: Dict[str, Any],
+    progress_log_path: Path | None = None,
+    work_queue_rebuild: bool = False,
     retry_failed_override: Optional[bool] = None,
 ) -> tuple[list[subprocess.Popen], list[dict]]:
     procs: list[subprocess.Popen] = []
@@ -248,7 +350,15 @@ def _spawn_workers(
             device = env.get("CUDA_VISIBLE_DEVICES")
         if retry_failed_override is not None:
             env["PPIFLOW_WORK_QUEUE_RETRY_FAILED"] = "1" if retry_failed_override else "0"
-        cmd = _build_worker_cmd(out_dir, steps, continue_on_error=continue_on_error, wait_timeout=wait_timeout)
+        if progress_log_path is not None:
+            env["PPIFLOW_PROGRESS_LOG_PATH"] = str(progress_log_path)
+        cmd = _build_worker_cmd(
+            out_dir,
+            steps,
+            continue_on_error=continue_on_error,
+            wait_timeout=wait_timeout,
+            work_queue_rebuild=work_queue_rebuild,
+        )
         stdout_path = run_dir / f"stdout_rank{rank}.log"
         stderr_path = run_dir / f"stderr_rank{rank}.log"
         proc = subprocess.Popen(cmd, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
@@ -296,36 +406,50 @@ def _clear_failure_markers(step_dir: Path) -> None:
 
 
 def _reset_attempt_logs(run_dir: Path) -> None:
-    for path in run_dir.glob("stdout*.log"):
-        try:
-            path.unlink()
-        except Exception:
-            pass
-    for path in run_dir.glob("stderr*.log"):
-        try:
-            path.unlink()
-        except Exception:
-            pass
+    # Intentionally do not truncate logs; append across attempts.
+    return
 
 
-def _open_log_context(run_dir: Path) -> Dict[str, Any]:
+def _open_log_context(
+    run_dir: Path,
+    *,
+    run_log_path: Path | None = None,
+    step_name: str | None = None,
+    attempt: int | None = None,
+) -> Dict[str, Any]:
     stdout_path = run_dir / "stdout.log"
     stderr_path = run_dir / "stderr.log"
     ctx = {
         "stdout_path": str(stdout_path),
         "stderr_path": str(stderr_path),
-        "stdout_handle": stdout_path.open("w"),
-        "stderr_handle": stderr_path.open("w"),
+        "stdout_handle": stdout_path.open("a"),
+        "stderr_handle": stderr_path.open("a"),
         "lock": threading.Lock(),
         "threads": [],
+        "run_log_path": str(run_log_path) if run_log_path else None,
+        "run_log_handle": run_log_path.open("a") if run_log_path else None,
+        "step_name": step_name,
     }
+    if attempt is not None:
+        header = f"===== {step_name or run_dir.name} attempt {attempt} =====\n"
+        try:
+            ctx["stdout_handle"].write(header)
+            ctx["stdout_handle"].flush()
+        except Exception:
+            pass
+        try:
+            if ctx["run_log_handle"] is not None:
+                ctx["run_log_handle"].write(header)
+                ctx["run_log_handle"].flush()
+        except Exception:
+            pass
     return ctx
 
 
 def _close_log_context(log_ctx: Dict[str, Any]) -> None:
     for thread in log_ctx.get("threads") or []:
         thread.join(timeout=2.0)
-    for key in ("stdout_handle", "stderr_handle"):
+    for key in ("stdout_handle", "stderr_handle", "run_log_handle"):
         handle = log_ctx.get(key)
         try:
             if handle:
@@ -345,8 +469,10 @@ def _start_log_threads(
     stdout_handle = log_ctx["stdout_handle"]
     stderr_handle = log_ctx["stderr_handle"]
     lock = log_ctx["lock"]
+    run_log_handle = log_ctx.get("run_log_handle")
+    step_name = log_ctx.get("step_name")
 
-    def _fan_in(pipe, per_rank_path: Path, agg_handle) -> None:
+    def _fan_in(pipe, per_rank_path: Path, agg_handle, stream_label: str) -> None:
         if pipe is None:
             return
         try:
@@ -354,7 +480,7 @@ def _start_log_threads(
         except Exception:
             wrapper = pipe
         try:
-            with per_rank_path.open("w") as per_rank:
+            with per_rank_path.open("a") as per_rank:
                 for line in wrapper:
                     if not line.endswith("\n"):
                         line = line + "\n"
@@ -363,6 +489,14 @@ def _start_log_threads(
                     with lock:
                         agg_handle.write(f"[rank={rank}] {line}")
                         agg_handle.flush()
+                        if run_log_handle is not None:
+                            prefix = f"[step={step_name or 'unknown'} rank={rank}"
+                            if stream_label:
+                                prefix = f"{prefix} {stream_label}] "
+                            else:
+                                prefix = f"{prefix}] "
+                            run_log_handle.write(prefix + line)
+                            run_log_handle.flush()
         finally:
             try:
                 wrapper.close()
@@ -372,7 +506,7 @@ def _start_log_threads(
     if proc.stdout is not None:
         t_out = threading.Thread(
             target=_fan_in,
-            args=(proc.stdout, stdout_path, stdout_handle),
+            args=(proc.stdout, stdout_path, stdout_handle, ""),
             daemon=True,
         )
         log_ctx["threads"].append(t_out)
@@ -380,7 +514,7 @@ def _start_log_threads(
     if proc.stderr is not None:
         t_err = threading.Thread(
             target=_fan_in,
-            args=(proc.stderr, stderr_path, stderr_handle),
+            args=(proc.stderr, stderr_path, stderr_handle, "stderr"),
             daemon=True,
         )
         log_ctx["threads"].append(t_err)
@@ -409,6 +543,8 @@ def _wait_for_step_with_process_check(
 def orchestrate_pipeline(args) -> None:
     out_dir = Path(args.output).resolve()
     ensure_dir(out_dir)
+    log_dir = out_dir / "logs"
+    ensure_dir(log_dir)
 
     steps_yaml = out_dir / "steps.yaml"
     input_json = out_dir / "pipeline_input.json"
@@ -428,7 +564,8 @@ def orchestrate_pipeline(args) -> None:
         raise OrchestratorError("orchestrator groups are not supported; use per-step pools only")
     work_queue_cfg = input_data.get("work_queue") or {}
     retry_failed_configured = bool(work_queue_cfg.get("retry_failed"))
-    if retry_failed_configured:
+    explicit_retry = bool(getattr(args, "retry_failed", False) or getattr(args, "work_queue_rebuild", False))
+    if retry_failed_configured and not explicit_retry:
         print(
             "[orchestrator] note: disabling item-level retry_failed for worker runs",
             file=sys.__stdout__,
@@ -444,6 +581,8 @@ def orchestrate_pipeline(args) -> None:
         orch_cfg.setdefault("retries", {})["max_step_attempts"] = int(args.max_retries)
 
     available_steps = _load_steps(out_dir)
+    step_cfgs = _load_step_configs(out_dir)
+    ready_ctx = _build_ready_context(out_dir, input_data, work_queue_cfg)
 
     step_arg = getattr(args, "steps", None)
     if step_arg and step_arg not in {"", "all"}:
@@ -561,6 +700,8 @@ def orchestrate_pipeline(args) -> None:
 
     summary: dict[str, Any] = {"status": "running", "steps": []}
 
+    rebuild_requested = bool(getattr(args, "work_queue_rebuild", False))
+
     for entry in plan:
         attempt = 0
         step_success = False
@@ -574,7 +715,14 @@ def orchestrate_pipeline(args) -> None:
             attempt_idx = _next_attempt(run_dir)
             attempt_path = run_dir / f"attempt_{attempt_idx:04d}.json"
             _reset_attempt_logs(run_dir)
-            log_ctx = _open_log_context(run_dir)
+            run_log_path = log_dir / "run.log"
+            progress_log_path = log_dir / f"{entry.name}.progress.log"
+            log_ctx = _open_log_context(
+                run_dir,
+                run_log_path=run_log_path,
+                step_name=entry.name,
+                attempt=attempt,
+            )
 
             continue_on_error = failure_policy.mode in {"allow", "threshold"}
             procs, workers = _spawn_workers(
@@ -587,7 +735,9 @@ def orchestrate_pipeline(args) -> None:
                 wait_timeout=step_wait_timeout,
                 run_dir=run_dir,
                 log_ctx=log_ctx,
-                retry_failed_override=False,
+                progress_log_path=progress_log_path,
+                work_queue_rebuild=(rebuild_requested and attempt == 1),
+                retry_failed_override=True if explicit_retry else False,
             )
             write_json(run_dir / "workers.json", {"workers": workers}, indent=2)
 
@@ -622,6 +772,18 @@ def orchestrate_pipeline(args) -> None:
                         step_ok = False
                         failed_reason = "failure_policy"
                         break
+                    step_cfg = step_cfgs.get(step_name) or {"name": step_name}
+                    if not _wait_for_ready_outputs(
+                        step_name=step_name,
+                        step_cfg=step_cfg,
+                        ctx=ready_ctx,
+                        timeout=step_wait_timeout,
+                    ):
+                        step_ok = False
+                        failed_reason = "outputs_not_ready"
+                        step_info["status"] = "failed"
+                        step_info["reason"] = failed_reason
+                        break
             if not step_ok:
                 _terminate_workers(procs)
             else:
@@ -653,6 +815,8 @@ def orchestrate_pipeline(args) -> None:
                 "logs": {
                     "stdout": log_ctx["stdout_path"],
                     "stderr": log_ctx["stderr_path"],
+                    "run": str(run_log_path),
+                    "progress": str(progress_log_path),
                 },
             }
             write_json(attempt_path, attempt_payload, indent=2)
