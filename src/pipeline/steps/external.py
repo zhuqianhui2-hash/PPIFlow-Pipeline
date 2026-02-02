@@ -4,8 +4,10 @@ import csv
 import json
 import os
 import re
+import shlex
 import shutil
 import subprocess
+import threading
 import time
 import sys
 from pathlib import Path
@@ -1777,6 +1779,240 @@ class AF3ScoreStep(ExternalCommandStep):
         if cfg.get("target_chain"):
             cmd.extend(["--target_chain", str(cfg.get("target_chain"))])
 
+        allow_reuse = bool((ctx.work_queue or {}).get("allow_reuse", True))
+        metrics_items = out_dir / "metrics_items"
+        metrics_items.mkdir(parents=True, exist_ok=True)
+        metrics_pdbs = out_dir / "metrics_pdbs"
+
+        def _norm_name(value: str) -> str:
+            norm = str(value).strip().lower()
+            if norm.endswith(".pdb"):
+                norm = norm[:-4]
+            return norm
+
+        item_by_stem: dict[str, WorkItem] = {}
+        item_by_norm: dict[str, WorkItem] = {}
+        attempt_by_id: dict[str, int] = {}
+        for item in valid_items:
+            run_stem = str((item.payload or {}).get("run_stem") or item.id)
+            item_by_stem[run_stem] = item
+            item_by_norm[_norm_name(run_stem)] = item
+            try:
+                attempt_by_id[item.id] = int((item.payload or {}).get("_attempt") or 1)
+            except Exception:
+                attempt_by_id[item.id] = 1
+
+        def _resolve_af3_python() -> list[str]:
+            override = os.environ.get("AF3SCORE_PYTHON")
+            if override:
+                return shlex.split(override)
+            env_name = os.environ.get("AF3SCORE_ENV", "ppiflow-af3score")
+            conda_exe = os.environ.get("CONDA_EXE") or shutil.which("conda")
+            if conda_exe and env_name:
+                return [conda_exe, "run", "-n", env_name, "python"]
+            return [sys.executable]
+
+        python_cmd = _resolve_af3_python()
+        get_metrics = af3_repo / "04_get_metrics.py"
+
+        def _job_complete(job_dir: Path, job_name: str) -> bool:
+            if (job_dir / f"{job_name}_model.cif").exists():
+                return True
+            if list(job_dir.glob("seed-*/model.cif")):
+                return True
+            if list(job_dir.glob("seed-*/*/model.cif")):
+                return True
+            return False
+
+        def _input_pdb_for_job(job_name: str, item: WorkItem) -> Path | None:
+            cand = input_dir / f"{job_name}.pdb"
+            if cand.exists():
+                return cand
+            if metrics_pdbs.exists():
+                cand = metrics_pdbs / f"{job_name}.pdb"
+                if cand.exists():
+                    return cand
+            raw_path = (item.payload or {}).get("pdb_path")
+            if raw_path:
+                path = Path(str(raw_path))
+                if path.exists():
+                    return path
+            return None
+
+        def _promote_job_outputs(job_name: str, job_dir: Path) -> bool:
+            try:
+                promote_tree(job_dir, out_dir / "af3score_outputs" / job_name, allow_reuse=allow_reuse)
+            except Exception:
+                if not allow_reuse:
+                    return False
+            for sub in ["single_chain_cif", "json", "pdbs"]:
+                src_dir = batch_dir / sub
+                if not src_dir.exists():
+                    continue
+                for fp in src_dir.glob(f"{job_name}*"):
+                    promote_file(fp, out_dir / sub / fp.name, allow_reuse=allow_reuse)
+            return True
+
+        def _write_metrics_for_job(job_name: str, job_dir: Path, input_pdb: Path, item: WorkItem) -> bool:
+            if not get_metrics.exists():
+                return False
+            tmp_root = batch_dir / ".metrics_tmp" / job_name
+            shutil.rmtree(tmp_root, ignore_errors=True)
+            input_tmp = tmp_root / "input_pdbs"
+            af3_tmp = tmp_root / "af3score_outputs"
+            input_tmp.mkdir(parents=True, exist_ok=True)
+            af3_tmp.mkdir(parents=True, exist_ok=True)
+            job_link = af3_tmp / job_name
+            if not job_link.exists():
+                try:
+                    os.symlink(job_dir, job_link, target_is_directory=True)
+                except Exception:
+                    try:
+                        shutil.copytree(job_dir, job_link)
+                    except Exception:
+                        return False
+            pdb_dst = input_tmp / f"{job_name}.pdb"
+            if not pdb_dst.exists():
+                try:
+                    os.link(input_pdb, pdb_dst)
+                except Exception:
+                    shutil.copy2(input_pdb, pdb_dst)
+            metrics_csv = tmp_root / "metrics.csv"
+            try:
+                run_command(
+                    python_cmd
+                    + [
+                        str(get_metrics),
+                        "--input_pdb_dir",
+                        str(input_tmp),
+                        "--af3score_output_dir",
+                        str(af3_tmp),
+                        "--save_metric_csv",
+                        str(metrics_csv),
+                    ],
+                    env=os.environ.copy(),
+                    cwd=str(tmp_root),
+                    log_file=self.cfg.get("_log_file"),
+                    verbose=bool(self.cfg.get("_verbose")),
+                )
+            except Exception:
+                return False
+            if not metrics_csv.exists():
+                return False
+            try:
+                promote_file(metrics_csv, metrics_items / f"{item.id}.csv", allow_reuse=allow_reuse)
+            except Exception:
+                return False
+            shutil.rmtree(tmp_root, ignore_errors=True)
+            return True
+
+        committed: set[str] = set()
+        commit_lock = threading.Lock()
+        strict_collision = False
+
+        from ..work_queue import WorkQueue
+
+        wq = WorkQueue(ctx.out_dir, self.name, ctx.work_queue or {})
+
+        def _mark_done(item: WorkItem) -> None:
+            try:
+                attempt = attempt_by_id.get(item.id, 1)
+                wq.mark_done(item.id, attempt)
+            except Exception:
+                pass
+            if ctx.heartbeat:
+                try:
+                    prog = wq.progress()
+                    ctx.heartbeat.update(
+                        produced_total=int(prog.get("produced_total", 0)),
+                        expected_total=int(prog.get("expected_total", 0)),
+                        state=str(prog.get("status") or "running"),
+                    )
+                except Exception:
+                    pass
+
+        def _commit_job(job_name: str, job_dir: Path) -> bool:
+            item = item_by_stem.get(job_name)
+            if item is None:
+                item = item_by_norm.get(_norm_name(job_name))
+            if not item:
+                return False
+            metrics_path = metrics_items / f"{item.id}.csv"
+            if metrics_path.exists():
+                committed.add(job_name)
+                _mark_done(item)
+                return True
+            if not _job_complete(job_dir, job_name):
+                return False
+            input_pdb = _input_pdb_for_job(job_name, item)
+            if input_pdb is None:
+                return False
+            with commit_lock:
+                if job_name in committed:
+                    return True
+                if not _promote_job_outputs(job_name, job_dir):
+                    if not allow_reuse:
+                        return False
+                if _write_metrics_for_job(job_name, job_dir, input_pdb, item):
+                    committed.add(job_name)
+                    _mark_done(item)
+                    return True
+            return False
+
+        def _reconcile_existing_outputs() -> None:
+            af3_out = out_dir / "af3score_outputs"
+            if not af3_out.exists():
+                return
+            for job_dir in af3_out.iterdir():
+                if not job_dir.is_dir():
+                    continue
+                job_name = job_dir.name
+                item = item_by_stem.get(job_name) or item_by_norm.get(_norm_name(job_name))
+                if not item:
+                    continue
+                if (metrics_items / f"{item.id}.csv").exists():
+                    committed.add(job_name)
+                    _mark_done(item)
+                    continue
+                if _job_complete(job_dir, job_name):
+                    input_pdb = _input_pdb_for_job(job_name, item)
+                    if input_pdb and _write_metrics_for_job(job_name, job_dir, input_pdb, item):
+                        committed.add(job_name)
+                        _mark_done(item)
+
+        def _scan_batch_outputs(max_per_pass: int | None = None) -> None:
+            af3_dir = batch_dir / "af3score_outputs"
+            if not af3_dir.exists():
+                return
+            processed = 0
+            for job_dir in sorted(af3_dir.iterdir()):
+                if max_per_pass is not None and processed >= max_per_pass:
+                    break
+                if not job_dir.is_dir():
+                    continue
+                job_name = job_dir.name
+                if job_name not in item_by_stem and _norm_name(job_name) not in item_by_norm:
+                    continue
+                if job_name in committed:
+                    continue
+                if _commit_job(job_name, job_dir):
+                    processed += 1
+
+        commit_poll = float((ctx.work_queue or {}).get("af3score_commit_poll_s", 5.0) or 5.0)
+        commit_batch = int((ctx.work_queue or {}).get("af3score_commit_batch", 25) or 25)
+        stop_evt = threading.Event()
+
+        def _commit_loop() -> None:
+            while not stop_evt.wait(commit_poll):
+                try:
+                    _scan_batch_outputs(max_per_pass=commit_batch)
+                except Exception:
+                    pass
+
+        _reconcile_existing_outputs()
+        commit_thread = threading.Thread(target=_commit_loop, daemon=True)
+        commit_thread.start()
+
         err: str | None = None
         if valid_items:
             try:
@@ -1790,8 +2026,10 @@ class AF3ScoreStep(ExternalCommandStep):
             except Exception as exc:
                 err = str(exc)
 
-        allow_reuse = bool((ctx.work_queue or {}).get("allow_reuse", True))
-        strict_collision = False
+        stop_evt.set()
+        commit_thread.join(timeout=2.0)
+        _scan_batch_outputs()
+
         for sub in [
             "af3score_outputs",
             "single_chain_cif",
@@ -1808,8 +2046,6 @@ class AF3ScoreStep(ExternalCommandStep):
                 if not allow_reuse:
                     strict_collision = True
 
-        metrics_items = out_dir / "metrics_items"
-        metrics_items.mkdir(parents=True, exist_ok=True)
         metrics_src = batch_dir / "metrics.csv"
         if metrics_src.exists():
             try:
@@ -1817,17 +2053,28 @@ class AF3ScoreStep(ExternalCommandStep):
 
                 df = pd.read_csv(metrics_src)
                 for item in valid_items:
+                    if (metrics_items / f"{item.id}.csv").exists():
+                        continue
                     run_stem = str((item.payload or {}).get("run_stem") or item.id)
+                    run_stem_norm = run_stem.lower()
+                    if run_stem_norm.endswith(".pdb"):
+                        run_stem_norm = run_stem_norm[:-4]
                     mask = None
                     for col in ("description", "name", "model", "pdb_name"):
                         if col in df.columns:
-                            mask = df[col].astype(str) == run_stem
+                            series = df[col].astype(str)
+                            series_norm = series.str.lower()
+                            series_norm = series_norm.str.removesuffix(".pdb")
+                            mask = series_norm == run_stem_norm
                             if mask.any():
                                 break
                     if mask is None or not mask.any():
                         for col in df.columns:
                             if df[col].dtype == object:
-                                mask = df[col].astype(str) == run_stem
+                                series = df[col].astype(str)
+                                series_norm = series.str.lower()
+                                series_norm = series_norm.str.removesuffix(".pdb")
+                                mask = series_norm == run_stem_norm
                                 if mask.any():
                                     break
                     if mask is not None and mask.any():
@@ -1837,7 +2084,8 @@ class AF3ScoreStep(ExternalCommandStep):
             except Exception:
                 pass
 
-        shutil.rmtree(batch_dir, ignore_errors=True)
+        if err is None:
+            shutil.rmtree(batch_dir, ignore_errors=True)
 
         for item in valid_items:
             if strict_collision:

@@ -80,6 +80,14 @@ def _resolve_python_cmd() -> list[str]:
     conda_exe = os.environ.get("CONDA_EXE") or shutil.which("conda")
     if conda_exe and env_name:
         return [conda_exe, "run", "-n", env_name, "python"]
+    # Fallback to the bundled AF3Score env if available (default install layout).
+    try:
+        repo_root = Path(__file__).resolve().parents[1]
+        local_py = repo_root / ".miniforge3" / "envs" / "ppiflow-af3score" / "bin" / "python"
+        if local_py.exists():
+            return [str(local_py)]
+    except Exception:
+        pass
     return ["python"]
 
 

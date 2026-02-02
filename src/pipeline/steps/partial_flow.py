@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 import subprocess
 import sys
@@ -67,6 +68,57 @@ def _swap_pdb_chains(pdb_path: Path, mapping: dict[str, str]) -> None:
     pdb_path.write_text("\n".join(out_lines) + "\n")
 
 
+def _load_chain_offset_map(offsets_path: Path) -> list[int] | None:
+    try:
+        payload = json.loads(offsets_path.read_text())
+    except Exception:
+        return None
+    chains = payload.get("chains") if isinstance(payload, dict) else None
+    if not chains:
+        return None
+    mapping: list[int] = []
+    for seg in chains:
+        try:
+            length = int(seg.get("length") or 0)
+            start = int(seg.get("start_resseq_B") or 0)
+        except Exception:
+            return None
+        if length <= 0 or start <= 0:
+            return None
+        for i in range(length):
+            mapping.append(start + i)
+    return mapping or None
+
+
+def _renumber_chain_with_offsets(pdb_path: Path, chain_id: str, mapping: list[int]) -> bool:
+    try:
+        parser = PDB.PDBParser(QUIET=True)
+        structure = parser.get_structure("model", str(pdb_path))
+        model = structure[0]
+        if chain_id not in model:
+            return False
+        chain = model[chain_id]
+        residues = [r for r in chain if r.id[0] == " "]
+        if len(residues) != len(mapping):
+            return False
+        for idx, res in enumerate(residues, start=1):
+            res.id = (" ", int(mapping[idx - 1]), " ")
+        io = PDB.PDBIO()
+        io.set_structure(structure)
+        io.save(str(pdb_path))
+        return True
+    except Exception:
+        return False
+
+
+def _apply_target_offsets(out_sub: Path, target_chain: str | None, mapping: list[int] | None) -> None:
+    if not target_chain or not mapping:
+        return
+    for pdb_path in sorted(out_sub.rglob("sample*.pdb")):
+        if not _renumber_chain_with_offsets(pdb_path, target_chain, mapping):
+            raise StepError(f"Failed to apply target chain offsets to {pdb_path}")
+
+
 def _fix_binder_partial_chains(out_sub: Path, target_pdb: Path, target_chain: str) -> None:
     if not out_sub.exists() or not target_pdb.exists() or not target_chain:
         return
@@ -111,6 +163,15 @@ def _resolve_partial_pdb_path(ctx: StepContext, pdb_path: str | Path | None, row
         if alt.exists():
             return str(alt)
     return str(pdb_path) if pdb_path else None
+
+
+def _resolve_ctx_path(ctx: StepContext, value: str | Path | None) -> Path | None:
+    if not value:
+        return None
+    p = Path(str(value))
+    if p.is_absolute():
+        return p
+    return (ctx.out_dir / p).resolve()
 
 
 class PartialFlowStep(Step):
@@ -172,6 +233,14 @@ class PartialFlowStep(Step):
             target = ctx.input_data.get("target") or {}
             binder_chain = ctx.input_data.get("binder_chain") or "A"
             target_chain = target.get("chains", [None])[0]
+            offsets_path = _resolve_ctx_path(ctx, target.get("chain_offsets"))
+            offset_map = None
+            if offsets_path:
+                if not offsets_path.exists():
+                    raise StepError(f"Target offsets file not found: {offsets_path}")
+                offset_map = _load_chain_offset_map(offsets_path)
+                if not offset_map:
+                    raise StepError(f"Failed to load target chain offsets: {offsets_path}")
             ckpt = tools.get("ppiflow_ckpt")
             if not ckpt:
                 raise StepError("tools.ppiflow_ckpt is required for binder partial flow")
@@ -240,6 +309,7 @@ class PartialFlowStep(Step):
                     target_pdb = target.get("pdb")
                     if target_pdb and target_chain:
                         _fix_binder_partial_chains(out_sub, Path(str(target_pdb)), str(target_chain))
+                    _apply_target_offsets(out_sub, str(target_chain) if target_chain else None, offset_map)
                 except Exception as exc:
                     status = "FAILED"
                     if allow_failures:
@@ -270,6 +340,15 @@ class PartialFlowStep(Step):
             config_path = str(_resolve_repo_path(config_path))
             target = ctx.input_data.get("target") or {}
             framework = ctx.input_data.get("framework") or {}
+            target_chain = (target.get("chains") or [None])[0]
+            offsets_path = _resolve_ctx_path(ctx, target.get("chain_offsets"))
+            offset_map = None
+            if offsets_path:
+                if not offsets_path.exists():
+                    raise StepError(f"Target offsets file not found: {offsets_path}")
+                offset_map = _load_chain_offset_map(offsets_path)
+                if not offset_map:
+                    raise StepError(f"Failed to load target chain offsets: {offsets_path}")
             ckpt = tools.get("ppiflow_ckpt")
             if not ckpt:
                 raise StepError("tools.ppiflow_ckpt is required for antibody/vhh partial flow")
@@ -343,6 +422,7 @@ class PartialFlowStep(Step):
                         log_file=self.cfg.get("_log_file"),
                         verbose=bool(self.cfg.get("_verbose")),
                     )
+                    _apply_target_offsets(out_sub, str(target_chain) if target_chain else None, offset_map)
                 except Exception as exc:
                     status = "FAILED"
                     if allow_failures:

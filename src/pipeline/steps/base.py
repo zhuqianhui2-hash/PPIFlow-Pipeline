@@ -468,6 +468,12 @@ class Step:
                     try:
                         claim_thread = threading.Thread(target=_claim_loop, daemon=True)
                         claim_thread.start()
+                        for claimed in batch:
+                            try:
+                                if isinstance(claimed.item.payload, dict):
+                                    claimed.item.payload.setdefault("_attempt", claimed.attempt)
+                            except Exception:
+                                pass
                         result = self.run_batch(ctx, [c.item for c in batch])  # type: ignore[attr-defined]
                     except FileNotFoundError as exc:
                         for claimed in batch:
