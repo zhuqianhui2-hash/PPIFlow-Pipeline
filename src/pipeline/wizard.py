@@ -159,6 +159,7 @@ def _build_args() -> argparse.Namespace:
         "output": None,
         "input": None,
         "preset": "full",
+        "output_mode": None,
         "protocol": None,
         "steps": "all",
         "reuse": False,

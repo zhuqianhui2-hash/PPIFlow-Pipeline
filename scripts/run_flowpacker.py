@@ -131,6 +131,32 @@ def _progress(idx: int, total: int, item: str, status: str, elapsed: float) -> N
     )
 
 
+def _parse_bool(value: str | bool | None, default: bool = True) -> bool:
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    return str(value).strip().lower() in {"1", "true", "yes", "y"}
+
+
+def _promote_tree(src: Path, dst: Path) -> None:
+    if not src.exists():
+        return
+    for root, _, files in os.walk(src):
+        root_path = Path(root)
+        rel = root_path.relative_to(src)
+        for fname in files:
+            src_file = root_path / fname
+            dst_file = dst / rel / fname
+            dst_file.parent.mkdir(parents=True, exist_ok=True)
+            if dst_file.exists():
+                continue
+            try:
+                os.link(src_file, dst_file)
+            except Exception:
+                shutil.copy2(src_file, dst_file)
+
+
 def _write_progress(output_dir: Path, produced: int, expected: int, *, item: str | None = None, status: str = "running") -> None:
     payload = {
         "expected_total": max(int(expected), 0),
@@ -158,11 +184,16 @@ def main() -> None:
     parser.add_argument("--num_jobs", type=int, default=1)
     parser.add_argument("--binder_chain", default="A")
     parser.add_argument("--link_suffix", default=".pdb")
+    parser.add_argument("--scratch_dir", default=None)
+    parser.add_argument("--keep_flowpacker_outputs", default="true")
     parser.add_argument("--batch_yaml", default=None, help="Run a single batch yaml (per-item mode)")
     parser.add_argument("--csv_file", default=None, help="Precomputed sequence CSV (link_name,seq,seq_idx)")
     args = parser.parse_args()
 
     output_dir = Path(args.output_dir).resolve()
+    scratch_dir = Path(args.scratch_dir).resolve() if args.scratch_dir else None
+    work_root = scratch_dir if scratch_dir else output_dir
+    keep_flowpacker_outputs = _parse_bool(args.keep_flowpacker_outputs, default=True)
     flowpacker_repo = Path(args.flowpacker_repo).resolve()
 
     if not flowpacker_repo.exists():
@@ -181,12 +212,12 @@ def main() -> None:
             seq_fasta_dir = Path(args.seq_fasta_dir).resolve()
             if not seq_fasta_dir.exists():
                 raise FileNotFoundError(f"seq_fasta_dir not found: {seq_fasta_dir}")
-            csv_path = output_dir / "flowpacker_input.csv"
+            csv_path = work_root / "flowpacker_input.csv"
             seq_count = build_seq_csv(seq_fasta_dir, csv_path, args.link_suffix)
             if seq_count == 0:
                 raise RuntimeError(f"No sequences written to {csv_path}")
 
-        flowpacker_out = output_dir / "flowpacker_outputs"
+        flowpacker_out = work_root / "flowpacker_outputs"
         flowpacker_out.mkdir(parents=True, exist_ok=True)
         sampler_script = Path(__file__).resolve().parent / "flowpacker_sampler_pipe.py"
         if not sampler_script.exists():
@@ -206,6 +237,10 @@ def main() -> None:
             args.binder_chain,
         ]
         subprocess.check_call(cmd, env=env)
+        if work_root != output_dir:
+            _promote_tree(work_root / "after_pdbs", output_dir / "after_pdbs")
+            if keep_flowpacker_outputs:
+                _promote_tree(flowpacker_out, output_dir / "flowpacker_outputs")
         return
 
     if not args.input_pdb_dir:
@@ -223,7 +258,7 @@ def main() -> None:
     if args.csv_file:
         csv_path = Path(args.csv_file).resolve()
     else:
-        csv_path = output_dir / "flowpacker_input.csv"
+        csv_path = work_root / "flowpacker_input.csv"
         seq_count = build_seq_csv(seq_fasta_dir, csv_path, args.link_suffix)
         if seq_count == 0:
             raise RuntimeError(f"No sequences written to {csv_path}")
@@ -234,14 +269,14 @@ def main() -> None:
     if not pdbs:
         raise RuntimeError(f"No PDBs found in {input_pdb_dir}")
 
-    batch_dir = output_dir / "input_pdb_batch"
+    batch_dir = work_root / "input_pdb_batch"
     batches = split_batches(pdbs, batch_dir, args.num_jobs)
 
     base_yaml = _resolve_base_yaml(flowpacker_repo, args.base_yaml)
-    yaml_dir = output_dir / "batch_yml"
+    yaml_dir = work_root / "batch_yml"
     yaml_paths = write_batch_yamls(base_yaml, batches, yaml_dir, flowpacker_repo)
 
-    flowpacker_out = output_dir / "flowpacker_outputs"
+    flowpacker_out = work_root / "flowpacker_outputs"
     flowpacker_out.mkdir(parents=True, exist_ok=True)
 
     sampler_script = Path(__file__).resolve().parent / "flowpacker_sampler_pipe.py"
@@ -280,6 +315,10 @@ def main() -> None:
             else:
                 phase_status = "failed"
             _write_progress(output_dir, idx, total, item=yaml_path.stem, status=phase_status)
+    if work_root != output_dir:
+        _promote_tree(work_root / "after_pdbs", output_dir / "after_pdbs")
+        if keep_flowpacker_outputs:
+            _promote_tree(flowpacker_out, output_dir / "flowpacker_outputs")
 
 
 if __name__ == "__main__":

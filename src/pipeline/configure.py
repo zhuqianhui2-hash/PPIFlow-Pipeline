@@ -10,6 +10,7 @@ from Bio import PDB
 
 from .config import InputSpec, apply_preset, build_input_from_cli, load_input, normalize_input, validate_input, write_cli_input_yaml
 from .io import ensure_dir, write_json, write_yaml, repo_root
+from .output_policy import mode as output_mode, scratch_dir as resolve_scratch_dir
 from .state import collect_tool_versions, init_or_update_state, sha256_json
 from .steps import STEP_ORDER
 
@@ -289,6 +290,12 @@ def _apply_default_command(
             "--num_jobs",
             str(num_jobs),
         ]
+        mode = output_mode(input_data)
+        scratch = resolve_scratch_dir(input_data, out_dir=out_dir)
+        if scratch:
+            cfg["command"].extend(["--scratch_dir", str(scratch / step_name)])
+        if mode == "minimal":
+            cfg["command"].extend(["--keep_flowpacker_outputs", "false"])
         return
 
     if step_name in {"af3score1", "af3score2"}:
@@ -326,6 +333,8 @@ def _apply_default_command(
             "true",
             "--export_pdb_dir",
             str(output_dir / "pdbs"),
+            "--export_cif_dir",
+            str(output_dir / "cif"),
         ]
         if args is not None:
             num_workers = getattr(args, "af3_num_workers", None)
@@ -369,6 +378,8 @@ def _apply_default_command(
             "true",
             "--export_pdb_dir",
             str(output_dir / "pdbs"),
+            "--export_cif_dir",
+            str(output_dir / "cif"),
         ]
         if args is not None:
             num_workers = getattr(args, "af3_num_workers", None)
@@ -444,6 +455,12 @@ def configure_pipeline(args) -> dict:
     data = apply_preset(data, args.preset)
     validate_input(data)
     normalized = normalize_input(data, base_dir=base_dir, output_dir=out_dir)
+    if getattr(args, "output_mode", None):
+        output_cfg = normalized.get("output")
+        if not isinstance(output_cfg, dict):
+            output_cfg = {}
+        output_cfg["mode"] = args.output_mode
+        normalized["output"] = output_cfg
     try:
         gap = int(normalized.get("target_concat_gap") or 50)
         chain_map = (normalized.get("target") or {}).get("chain_map")

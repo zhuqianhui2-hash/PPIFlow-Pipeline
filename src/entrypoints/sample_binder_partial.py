@@ -298,6 +298,14 @@ def run_pipeline(args):
             "max_t": args.start_t + 0.02,
         },
     }
+    wandb_updates: Dict[str, Any] = {}
+    if args.wandb_mode:
+        wandb_updates["mode"] = args.wandb_mode
+    if args.wandb_dir:
+        wandb_updates["dir"] = args.wandb_dir
+        wandb_updates["save_dir"] = args.wandb_dir
+    if wandb_updates:
+        update_configs["experiment"]["wandb"] = wandb_updates
     conf.update_config(update_configs)
     os.makedirs(f"{args.output_dir}/yaml", exist_ok=True)
     config_save_path = os.path.join(
@@ -436,6 +444,12 @@ def get_parser():
     )
     parser.add_argument(
         "--name", type=str, default="test_target", help="Test target name"
+    )
+    parser.add_argument(
+        "--wandb_mode", type=str, default=None, help="Override W&B mode (e.g., disabled)"
+    )
+    parser.add_argument(
+        "--wandb_dir", type=str, default=None, help="Override W&B log directory"
     )
     return parser
 

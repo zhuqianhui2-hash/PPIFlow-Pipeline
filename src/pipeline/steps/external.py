@@ -20,6 +20,7 @@ from ..direct_legacy import compute_run_stems, promote_file, promote_tree
 from ..io import collect_pdbs, is_ignored_path
 from ..logging_utils import log_command_progress, run_command
 from ..manifests import build_name_map, extract_design_id, find_metrics_file, structure_id_from_name, write_csv
+from ..output_policy import is_minimal, step_scratch_dir
 from ..work_queue import WorkItem
 
 
@@ -346,7 +347,11 @@ class SeqDesignStep(ExternalCommandStep):
     def run_item(self, ctx: StepContext, item: WorkItem) -> None:
         tools = ctx.input_data.get("tools") or {}
         out_dir = self.output_dir(ctx)
-        item_tmp = out_dir / ".tmp" / item.id
+        step_name = str(self.cfg.get("name") or self.name)
+        if is_minimal(ctx):
+            item_tmp = step_scratch_dir(ctx, step_name) / item.id
+        else:
+            item_tmp = out_dir / ".tmp" / item.id
         item_tmp.mkdir(parents=True, exist_ok=True)
 
         mpnn_run = self._default_mpnn_run(ctx)
@@ -506,7 +511,11 @@ class SeqDesignStep(ExternalCommandStep):
         tools = ctx.input_data.get("tools") or {}
         out_dir = self.output_dir(ctx)
         batch_id = items[0].id if items else "batch"
-        batch_dir = out_dir / ".tmp" / f"batch_{batch_id}"
+        step_name = str(self.cfg.get("name") or self.name)
+        if is_minimal(ctx):
+            batch_dir = step_scratch_dir(ctx, step_name) / f"batch_{batch_id}"
+        else:
+            batch_dir = out_dir / ".tmp" / f"batch_{batch_id}"
         batch_dir.mkdir(parents=True, exist_ok=True)
         pdb_dir = batch_dir / "pdbs"
         pdb_dir.mkdir(parents=True, exist_ok=True)
@@ -1151,8 +1160,8 @@ class FlowPackerStep(ExternalCommandStep):
 
     def item_done(self, ctx: StepContext, item: WorkItem) -> bool:
         out_dir = self.output_dir(ctx)
-        flowpacker_out = out_dir / "flowpacker_outputs" / "run_1"
-        if not flowpacker_out.exists():
+        after_dir = out_dir / "after_pdbs"
+        if not after_dir.exists():
             return False
         stem = str((item.payload or {}).get("run_stem") or (item.payload or {}).get("pdb_stem") or item.id)
         cfg = self._flowpacker_config()
@@ -1162,7 +1171,7 @@ class FlowPackerStep(ExternalCommandStep):
             pattern = link_name.replace(".pdb", "_*.pdb")
         else:
             pattern = f"{link_name}_*"
-        return any(flowpacker_out.glob(pattern))
+        return any(after_dir.glob(pattern))
 
     def run_item(self, ctx: StepContext, item: WorkItem) -> None:
         cfg = self._flowpacker_config()
@@ -1186,7 +1195,11 @@ class FlowPackerStep(ExternalCommandStep):
         base_yaml = cfg.get("base_yaml")
 
         out_dir = self.output_dir(ctx)
-        item_dir = out_dir / ".tmp" / item.id
+        step_name = str(self.cfg.get("name") or self.name)
+        if is_minimal(ctx):
+            item_dir = step_scratch_dir(ctx, step_name) / item.id
+        else:
+            item_dir = out_dir / ".tmp" / item.id
         item_dir.mkdir(parents=True, exist_ok=True)
         pdb_dir = item_dir / "input_pdb"
         pdb_dir.mkdir(parents=True, exist_ok=True)
@@ -1244,10 +1257,11 @@ class FlowPackerStep(ExternalCommandStep):
         )
 
         allow_reuse = bool((ctx.work_queue or {}).get("allow_reuse", True))
-        flowpacker_out = out_dir / "flowpacker_outputs" / "run_1"
         after_pdbs = out_dir / "after_pdbs"
-        promote_tree(item_out / "flowpacker_outputs" / "run_1", flowpacker_out, allow_reuse=allow_reuse)
         promote_tree(item_out / "after_pdbs", after_pdbs, allow_reuse=allow_reuse)
+        if not is_minimal(ctx):
+            flowpacker_out = out_dir / "flowpacker_outputs" / "run_1"
+            promote_tree(item_out / "flowpacker_outputs" / "run_1", flowpacker_out, allow_reuse=allow_reuse)
         shutil.rmtree(item_dir, ignore_errors=True)
 
     def run_batch(self, ctx: StepContext, items: list[WorkItem]) -> dict[str, tuple[str, str | None]]:
@@ -1262,7 +1276,11 @@ class FlowPackerStep(ExternalCommandStep):
 
         out_dir = self.output_dir(ctx)
         batch_id = items[0].id if items else "batch"
-        batch_dir = out_dir / ".tmp" / f"batch_{batch_id}"
+        step_name = str(self.cfg.get("name") or self.name)
+        if is_minimal(ctx):
+            batch_dir = step_scratch_dir(ctx, step_name) / f"batch_{batch_id}"
+        else:
+            batch_dir = out_dir / ".tmp" / f"batch_{batch_id}"
         batch_dir.mkdir(parents=True, exist_ok=True)
         pdb_dir = batch_dir / "input_pdb"
         pdb_dir.mkdir(parents=True, exist_ok=True)
@@ -1369,11 +1387,12 @@ class FlowPackerStep(ExternalCommandStep):
 
         allow_reuse = bool((ctx.work_queue or {}).get("allow_reuse", True))
         strict_collision = False
-        flowpacker_out = out_dir / "flowpacker_outputs" / "run_1"
         after_pdbs = out_dir / "after_pdbs"
         try:
-            promote_tree(batch_dir / "flowpacker_outputs" / "run_1", flowpacker_out, allow_reuse=allow_reuse)
             promote_tree(batch_dir / "after_pdbs", after_pdbs, allow_reuse=allow_reuse)
+            if not is_minimal(ctx):
+                flowpacker_out = out_dir / "flowpacker_outputs" / "run_1"
+                promote_tree(batch_dir / "flowpacker_outputs" / "run_1", flowpacker_out, allow_reuse=allow_reuse)
         except Exception as exc:
             if err is None:
                 err = str(exc)
@@ -1392,6 +1411,7 @@ class FlowPackerStep(ExternalCommandStep):
 
     def write_manifest(self, ctx: StepContext) -> None:
         out_dir = self.output_dir(ctx)
+        pdb_root = out_dir / "after_pdbs"
         # Write legacy flowpacker_input.csv if possible.
         cfg = self._flowpacker_config()
         seq_fasta_dir = self._resolve_path(ctx, cfg.get("seq_fasta_dir")) if cfg else None
@@ -1424,7 +1444,8 @@ class FlowPackerStep(ExternalCommandStep):
                         pass
 
         rows = []
-        for fp in sorted(out_dir.rglob("*.pdb")):
+        search_root = pdb_root if pdb_root.exists() else out_dir
+        for fp in sorted(search_root.rglob("*.pdb")):
             if is_ignored_path(fp):
                 continue
             rows.append({
@@ -1441,7 +1462,7 @@ class FlowPackerStep(ExternalCommandStep):
         if done:
             return done
         out_dir = self.output_dir(ctx)
-        for sub in [out_dir / "flowpacker_outputs", out_dir / "after_pdbs", out_dir]:
+        for sub in [out_dir / "after_pdbs", out_dir]:
             if sub.exists():
                 for fp in sub.rglob("*.pdb"):
                     if is_ignored_path(fp):
@@ -1482,6 +1503,7 @@ class AF3ScoreStep(ExternalCommandStep):
                 "--model_seeds",
                 "--write_cif_model",
                 "--export_pdb_dir",
+                "--export_cif_dir",
                 "--target_offsets_json",
                 "--target_chain",
             }:
@@ -1661,6 +1683,12 @@ class AF3ScoreStep(ExternalCommandStep):
             cmd.append("--write_ranking_scores_csv")
         if cfg.get("export_pdb_dir") is not None:
             cmd.extend(["--export_pdb_dir", str(item_out / "pdbs")])
+        export_cif_dir = cfg.get("export_cif_dir")
+        if export_cif_dir is None:
+            export_cif_dir = str(out_dir / "cif")
+        export_cif_path = self._resolve_path(ctx, str(export_cif_dir)) if export_cif_dir else None
+        if export_cif_path:
+            cmd.extend(["--export_cif_dir", str(export_cif_path)])
         if cfg.get("target_offsets_json"):
             offsets_path = self._resolve_path(ctx, cfg.get("target_offsets_json"))
             if offsets_path:
@@ -1779,6 +1807,12 @@ class AF3ScoreStep(ExternalCommandStep):
             cmd.append("--write_ranking_scores_csv")
         if cfg.get("export_pdb_dir") is not None:
             cmd.extend(["--export_pdb_dir", str(batch_dir / "pdbs")])
+        export_cif_dir = cfg.get("export_cif_dir")
+        if export_cif_dir is None:
+            export_cif_dir = str(out_dir / "cif")
+        export_cif_path = self._resolve_path(ctx, str(export_cif_dir)) if export_cif_dir else None
+        if export_cif_path:
+            cmd.extend(["--export_cif_dir", str(export_cif_path)])
         if cfg.get("target_offsets_json"):
             offsets_path = self._resolve_path(ctx, cfg.get("target_offsets_json"))
             if offsets_path:

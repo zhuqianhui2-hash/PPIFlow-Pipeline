@@ -15,6 +15,13 @@ def _add_common_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--input", type=str, help="Path to design.yaml")
     parser.add_argument("--output", type=str, required=True, help="Output directory")
     parser.add_argument(
+        "--output-mode",
+        type=str,
+        choices=["minimal", "full"],
+        default=None,
+        help="Output mode (minimal or full). Default: minimal.",
+    )
+    parser.add_argument(
         "--steps",
         type=str,
         default="all",
@@ -181,6 +188,13 @@ def build_parser() -> argparse.ArgumentParser:
     p_orch.add_argument("--output", type=str, required=True)
     p_orch.add_argument("--input", type=str, help="Path to design.yaml (used with --configure)")
     p_orch.add_argument("--preset", type=str, choices=["fast", "full", "custom"], default="full")
+    p_orch.add_argument(
+        "--output-mode",
+        type=str,
+        choices=["minimal", "full"],
+        default=None,
+        help="Output mode (minimal or full). Default: minimal.",
+    )
     p_orch.add_argument("--configure", action="store_true", help="Run configure if steps.yaml is missing")
     p_orch.add_argument("--steps", type=str, default=None, help="Run a single step only")
     p_orch.add_argument("--pool-size", type=int, default=None, help="Override pool size (advanced)")

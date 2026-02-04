@@ -402,7 +402,8 @@ class RankStep(Step):
         )
 
         summary_path = results_dir / "summary.csv"
-        with open(summary_path, "w", newline="") as f:
+        tmp_path = summary_path.with_suffix(".csv.tmp")
+        with open(tmp_path, "w", newline="") as f:
             writer = csv.DictWriter(
                 f,
                 fieldnames=[
@@ -430,6 +431,7 @@ class RankStep(Step):
                     "passed_filter": r.get("passed_filter"),
                     "source_path": r.get("source_path"),
                 })
+        tmp_path.replace(summary_path)
 
         # Copy top structures
         ranking_cfg = self.cfg.get("ranking") or {}

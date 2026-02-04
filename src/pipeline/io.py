@@ -63,7 +63,7 @@ def list_files(path: str | Path, pattern: str) -> list[Path]:
     return list(p.glob(pattern))
 
 
-def is_ignored_path(path: Path, *, ignored: tuple[str, ...] = (".tmp", ".work", ".done")) -> bool:
+def is_ignored_path(path: Path, *, ignored: tuple[str, ...] = (".tmp", ".work", ".done", "_scratch", "scratch", "_optional")) -> bool:
     return any(part in ignored for part in path.parts)
 
 

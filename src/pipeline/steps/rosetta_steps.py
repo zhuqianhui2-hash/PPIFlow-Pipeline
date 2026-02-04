@@ -15,6 +15,7 @@ from ..direct_legacy import compute_run_stems, promote_file, promote_tree
 from ..io import collect_pdbs, is_ignored_path
 from ..logging_utils import log_command_progress, run_command
 from ..manifests import extract_design_id, structure_id_from_name, write_csv
+from ..output_policy import is_minimal, optional_dir, step_scratch_dir
 from ..work_queue import WorkItem
 
 
@@ -216,7 +217,12 @@ class RosettaInterfaceStep(Step):
         if not input_pdb.exists():
             shutil.copy2(pdb_path, input_pdb)
 
-        job_root = item_out / "rosetta_jobs"
+        step_name = str(self.cfg.get("name") or self.name)
+        output_enabled = isinstance(ctx.input_data.get("output"), dict)
+        if output_enabled:
+            job_root = step_scratch_dir(ctx, step_name) / item.id / "rosetta_jobs"
+        else:
+            job_root = item_out / "rosetta_jobs"
         job_root.mkdir(parents=True, exist_ok=True)
         name = run_stem
         job_dir = job_root / name
@@ -274,7 +280,8 @@ class RosettaInterfaceStep(Step):
         )
 
         allow_reuse = bool((ctx.work_queue or {}).get("allow_reuse", True))
-        promote_tree(job_root, out_dir / "rosetta_jobs", allow_reuse=allow_reuse)
+        if output_enabled and not is_minimal(ctx):
+            promote_tree(job_root, optional_dir(ctx) / "rosetta_interface" / "rosetta_jobs", allow_reuse=allow_reuse)
         residue_items = out_dir / "residue_energy_items"
         residue_items.mkdir(parents=True, exist_ok=True)
         residue_src = item_out / "residue_energy.csv"
@@ -291,6 +298,8 @@ class RosettaInterfaceStep(Step):
                 pass
             promote_file(residue_src, residue_items / f"{item.id}.csv", allow_reuse=allow_reuse)
         shutil.rmtree(item_dir, ignore_errors=True)
+        if output_enabled:
+            shutil.rmtree(job_root.parent, ignore_errors=True)
 
     def run_full(self, ctx: StepContext) -> None:
         input_dir = self.cfg.get("input_dir")
@@ -318,7 +327,12 @@ class RosettaInterfaceStep(Step):
         run_stems = compute_run_stems(pdbs, input_path)
 
         out_dir = self.output_dir(ctx)
-        rosetta_root = out_dir / "rosetta_jobs"
+        step_name = str(self.cfg.get("name") or self.name)
+        output_enabled = isinstance(ctx.input_data.get("output"), dict)
+        if output_enabled:
+            rosetta_root = step_scratch_dir(ctx, step_name) / "rosetta_jobs"
+        else:
+            rosetta_root = out_dir / "rosetta_jobs"
         rosetta_root.mkdir(parents=True, exist_ok=True)
 
         jobs: list[tuple[list[str], Path, Path]] = []
@@ -451,6 +465,14 @@ class RosettaInterfaceStep(Step):
                     write_csv(out_dir / "interface_scores.csv", rows, ["pdb_name", "interface_score"])
             except Exception:
                 pass
+
+        if output_enabled and not is_minimal(ctx):
+            try:
+                promote_tree(rosetta_root, optional_dir(ctx) / "rosetta_interface" / "rosetta_jobs", allow_reuse=True)
+            except Exception:
+                pass
+        if output_enabled:
+            shutil.rmtree(rosetta_root, ignore_errors=True)
 
     def write_manifest(self, ctx: StepContext) -> None:
         out_dir = self.output_dir(ctx)
@@ -592,7 +614,12 @@ class RosettaRelaxStep(Step):
         if not input_pdb.exists():
             shutil.copy2(pdb_path, input_pdb)
 
-        job_root = item_out / "rosetta_jobs"
+        step_name = str(self.cfg.get("name") or self.name)
+        output_enabled = isinstance(ctx.input_data.get("output"), dict)
+        if output_enabled:
+            job_root = step_scratch_dir(ctx, step_name) / item.id / "rosetta_jobs"
+        else:
+            job_root = item_out / "rosetta_jobs"
         job_root.mkdir(parents=True, exist_ok=True)
         name = run_stem
         job_dir = job_root / name
@@ -629,8 +656,11 @@ class RosettaRelaxStep(Step):
         target = out_dir / f"{name}.pdb"
         allow_reuse = bool((ctx.work_queue or {}).get("allow_reuse", True))
         promote_file(relaxed, target, allow_reuse=allow_reuse)
-        promote_tree(job_root, out_dir / "rosetta_jobs", allow_reuse=allow_reuse)
+        if output_enabled and not is_minimal(ctx):
+            promote_tree(job_root, optional_dir(ctx) / "relax" / "rosetta_jobs", allow_reuse=allow_reuse)
         shutil.rmtree(item_dir, ignore_errors=True)
+        if output_enabled:
+            shutil.rmtree(job_root.parent, ignore_errors=True)
 
     def run_full(self, ctx: StepContext) -> None:
         input_dir = self.cfg.get("input_dir")
@@ -658,7 +688,12 @@ class RosettaRelaxStep(Step):
         run_stems = compute_run_stems(pdbs, input_path)
 
         out_dir = self.output_dir(ctx)
-        rosetta_root = out_dir / "rosetta_jobs"
+        step_name = str(self.cfg.get("name") or self.name)
+        output_enabled = isinstance(ctx.input_data.get("output"), dict)
+        if output_enabled:
+            rosetta_root = step_scratch_dir(ctx, step_name) / "rosetta_jobs"
+        else:
+            rosetta_root = out_dir / "rosetta_jobs"
         rosetta_root.mkdir(parents=True, exist_ok=True)
 
         jobs: list[tuple[list[str], Path, Path, Path]] = []
@@ -734,6 +769,13 @@ class RosettaRelaxStep(Step):
                     if not target.exists():
                         shutil.copy2(pdb, target)
                     break
+        if output_enabled and not is_minimal(ctx):
+            try:
+                promote_tree(rosetta_root, optional_dir(ctx) / "relax" / "rosetta_jobs", allow_reuse=True)
+            except Exception:
+                pass
+        if output_enabled:
+            shutil.rmtree(rosetta_root, ignore_errors=True)
 
     def write_manifest(self, ctx: StepContext) -> None:
         out_dir = self.output_dir(ctx)

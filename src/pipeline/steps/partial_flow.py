@@ -17,6 +17,7 @@ from ..work_queue import WorkItem
 from ..logging_utils import log_command_progress, run_command
 from ..io import repo_root, is_ignored_path
 from ..manifests import extract_design_id, structure_id_from_name, write_csv
+from ..output_policy import is_minimal, scratch_dir
 
 
 def _normalize_optional_string(value: Any) -> str | None:
@@ -300,6 +301,12 @@ class PartialFlowStep(Step):
                     })
                     for key in ("TORCHRUN", "TORCHELASTIC_RUN_ID", "GROUP_RANK", "LOCAL_WORLD_SIZE"):
                         env.pop(key, None)
+                    if is_minimal(ctx):
+                        wandb_root = scratch_dir(ctx) / "wandb"
+                        wandb_root.mkdir(parents=True, exist_ok=True)
+                        env.setdefault("WANDB_MODE", "disabled")
+                        env.setdefault("WANDB_DIR", str(wandb_root))
+                        cmd.extend(["--wandb_mode", "disabled", "--wandb_dir", str(wandb_root)])
                     run_command(
                         cmd,
                         env=env,
@@ -416,6 +423,12 @@ class PartialFlowStep(Step):
                     })
                     for key in ("TORCHRUN", "TORCHELASTIC_RUN_ID", "GROUP_RANK", "LOCAL_WORLD_SIZE"):
                         env.pop(key, None)
+                    if is_minimal(ctx):
+                        wandb_root = scratch_dir(ctx) / "wandb"
+                        wandb_root.mkdir(parents=True, exist_ok=True)
+                        env.setdefault("WANDB_MODE", "disabled")
+                        env.setdefault("WANDB_DIR", str(wandb_root))
+                        cmd.extend(["--wandb_mode", "disabled", "--wandb_dir", str(wandb_root)])
                     run_command(
                         cmd,
                         env=env,

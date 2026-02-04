@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import shutil
 import sys
 import time
 import traceback
@@ -14,6 +15,8 @@ from .io import read_yaml
 from .state import collect_tool_versions, init_or_update_state, load_state, sha256_json, validate_state
 from .steps import STEP_ORDER, STEP_REGISTRY
 from .steps.base import StepContext, StepError
+from .output_policy import mode as output_mode
+from . import prune as prune_outputs
 
 
 def _resolve_steps(steps_arg: str | None) -> list[str]:
@@ -390,6 +393,30 @@ def execute_pipeline(args) -> None:
         if not getattr(args, "verbose", False) and not failed:
             if step.name in {"af3score", "flowpacker"}:
                 _mirror_log_prefixes(log_file, [f"[{step.name}]"])
+
+        if not failed and isinstance(ctx.input_data.get("output"), dict):
+            prune_outputs.mark_rank_done(ctx, step.name)
+            if ctx.rank == 0:
+                safe = True
+                if ctx.world_size > 1:
+                    safe = prune_outputs.wait_for_all_ranks(ctx, step.name, ctx.world_size)
+                if safe:
+                    stats = prune_outputs.step_cleanup(ctx, step.name, cfg)
+                    if (
+                        output_mode(ctx) == "minimal"
+                        and (ctx.work_queue or {}).get("rebuild_from_outputs")
+                        and not stats.get("skipped")
+                        and not stats.get("dry_run")
+                    ):
+                        shutil.rmtree(ctx.out_dir / ".work" / step.name, ignore_errors=True)
+                    if stats.get("skipped"):
+                        reason = stats.get("reason") or "unknown"
+                        _console(f"prune: skipped ({reason})")
+                    elif stats.get("freed_bytes") or stats.get("moved_bytes"):
+                        prefix = "prune(dry-run)" if stats.get("dry_run") else "prune"
+                        _console(
+                            f"{prefix}: freed={stats.get('freed_bytes', 0)}B moved={stats.get('moved_bytes', 0)}B"
+                        )
 
         if pending_exc and not getattr(args, "continue_on_error", False):
             raise pending_exc[1].with_traceback(pending_exc[2])

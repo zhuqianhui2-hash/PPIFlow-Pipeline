@@ -264,6 +264,7 @@ def main() -> None:
     parser.add_argument("--write_best_model_root", action="store_true")
     parser.add_argument("--write_ranking_scores_csv", action="store_true")
     parser.add_argument("--export_pdb_dir", type=str, default=None)
+    parser.add_argument("--export_cif_dir", type=str, default=None)
     parser.add_argument("--target_offsets_json", type=str, default=None)
     parser.add_argument("--target_chain", type=str, default="B")
     args = parser.parse_args()
@@ -577,6 +578,33 @@ def main() -> None:
                 continue
             if _convert_cif_to_pdb(cif_path, pdb_path) and offset_map:
                 _renumber_chain_with_offsets(pdb_path, args.target_chain, offset_map)
+
+    if args.export_cif_dir:
+        export_dir = Path(args.export_cif_dir).resolve()
+        export_dir.mkdir(parents=True, exist_ok=True)
+        for job_dir in sorted(output_dir_af3score.iterdir()):
+            if not job_dir.is_dir():
+                continue
+            job_name = job_dir.name
+            cif_path = job_dir / f"{job_name}_model.cif"
+            if not cif_path.exists():
+                seed_cifs = sorted(job_dir.glob("seed-*/*/model.cif"))
+                if not seed_cifs:
+                    seed_cifs = sorted(job_dir.glob("seed-*/model.cif"))
+                if seed_cifs:
+                    cif_path = seed_cifs[0]
+                else:
+                    continue
+            dst = export_dir / f"{job_name}.cif"
+            if dst.exists():
+                continue
+            try:
+                os.link(cif_path, dst)
+            except Exception:
+                try:
+                    shutil.copy2(cif_path, dst)
+                except Exception:
+                    pass
 
 
 if __name__ == "__main__":

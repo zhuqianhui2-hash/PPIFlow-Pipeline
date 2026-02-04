@@ -115,6 +115,7 @@ Common flags:
 - `--preset`: `fast|full|custom` (default: `full`)
 - `--input`: path to `design.yaml` (optional)
 - `--output`: output directory (required)
+- `--output-mode`: `minimal|full` (default: `minimal`). Use `full` to keep heavy intermediates under `output/_optional/`.
 - `--steps`: `all|gen,seq1,flowpacker1,af3score1,rosetta_interface,interface_enrich,partial,seq2,flowpacker2,af3score2,relax,af3_refold,dockq,rank_features,rank_finalize`
 - `--reuse`: skip outputs that already exist
 - `--work-queue`: enable parallel/resume engine (default in configs)
@@ -158,6 +159,15 @@ Advanced knobs (optional):
 - Sequence design knobs: `--seq1_num_per_backbone`, `--seq1_temp`,
   `--seq1_bias_large_residues`, `--seq1_bias_num`, `--seq2_num_per_backbone`,
   `--seq2_temp`, `--seq2_use_soluble_ckpt`
+
+**Output Structure**
+Runs are written under the run root (`--output`). Minimal mode is the default and always keeps AF3 CIFs in `output/af3score_round*/cif/` and `output/af3_refold/cif/`.
+
+- `output/`: minimal artifacts needed for resume and ranking (e.g. `seqs_round*`, `flowpacker_round*`, `af3score_round*`, `rosetta_interface`, `relax`, `partial_flow`, `results_v*`).
+- `output/_optional/`: heavy intermediates preserved when `--output-mode full` or when `output.keep_optional` includes a key.
+- `scratch/`: transient work dirs for large intermediates; safe to delete after the run unless you override `output.scratch_dir`.
+- `logs/`: step logs (kept unless `output.keep_logs` is false).
+- `output.keep_optional` keys: `flowpacker_outputs`, `af3score_outputs`, `rosetta_jobs`, `json`, `pdbs`, `af3_input_batch`, `single_chain_cif`, `af3score_subprocess_logs`, `.tmp`, `wandb`, `yaml`, `config.yaml`, `input`.
 
 ## Input Schema (`design.yaml`)
 

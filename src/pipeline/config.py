@@ -292,6 +292,16 @@ def normalize_input(
     work_queue.setdefault("wait_timeout", None)
     work_queue.setdefault("allow_reuse", True)
     out["work_queue"] = work_queue
+
+    output_cfg = out.get("output")
+    if not isinstance(output_cfg, dict):
+        output_cfg = {}
+    output_cfg.setdefault("mode", "minimal")
+    output_cfg.setdefault("scratch_dir", None)
+    output_cfg.setdefault("keep_optional", [])
+    output_cfg.setdefault("keep_logs", True)
+    output_cfg.setdefault("prune_dry_run", False)
+    out["output"] = output_cfg
     return out
 
 
@@ -389,6 +399,9 @@ def build_input_from_cli(args: Any) -> InputSpec:
         "samples_per_target": partial_samples,
     }
     ranking = {"top_k": args.rank_top_k}
+    output_cfg = {}
+    if getattr(args, "output_mode", None):
+        output_cfg["mode"] = args.output_mode
     work_queue = {
         "enabled": True if args.work_queue else None,
         "lease_seconds": args.work_queue_lease_seconds,
@@ -411,6 +424,7 @@ def build_input_from_cli(args: Any) -> InputSpec:
         "filters": filters,
         "partial": partial,
         "ranking": ranking,
+        "output": output_cfg,
         "work_queue": work_queue,
         "optional_af3_refold": bool(args.af3_refold) if args.af3_refold else None,
         "tools": {

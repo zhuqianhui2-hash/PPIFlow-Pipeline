@@ -428,6 +428,14 @@ def run_pipeline(args):
             "min_t": args.start_t if args.start_t else 0.8,
         },
     }
+    wandb_updates: Dict[str, Any] = {}
+    if args.wandb_mode:
+        wandb_updates["mode"] = args.wandb_mode
+    if args.wandb_dir:
+        wandb_updates["dir"] = args.wandb_dir
+        wandb_updates["save_dir"] = args.wandb_dir
+    if wandb_updates:
+        update_configs["experiment"]["wandb"] = wandb_updates
     conf.update_config(update_configs)
 
     os.makedirs(f"{args.output_dir}/yaml", exist_ok=True)
@@ -572,6 +580,18 @@ def get_parser():
         type=str,
         default="flow",
         help="Name of the test target (default: 'flow').",
+    )
+    parser.add_argument(
+        "--wandb_mode",
+        type=str,
+        default=None,
+        help="Override W&B mode (e.g., disabled).",
+    )
+    parser.add_argument(
+        "--wandb_dir",
+        type=str,
+        default=None,
+        help="Override W&B log directory.",
     )
 
     return parser
