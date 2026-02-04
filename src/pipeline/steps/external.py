@@ -1155,7 +1155,14 @@ class FlowPackerStep(ExternalCommandStep):
         if not flowpacker_out.exists():
             return False
         stem = str((item.payload or {}).get("run_stem") or (item.payload or {}).get("pdb_stem") or item.id)
-        return any(fp.name.startswith(f"{stem}_") for fp in flowpacker_out.glob("*.pdb"))
+        cfg = self._flowpacker_config()
+        link_suffix = str(cfg.get("link_suffix") or ".pdb")
+        link_name = f"{stem}{link_suffix}"
+        if ".pdb" in link_name:
+            pattern = link_name.replace(".pdb", "_*.pdb")
+        else:
+            pattern = f"{link_name}_*"
+        return any(flowpacker_out.glob(pattern))
 
     def run_item(self, ctx: StepContext, item: WorkItem) -> None:
         cfg = self._flowpacker_config()

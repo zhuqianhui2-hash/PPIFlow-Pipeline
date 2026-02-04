@@ -1,11 +1,14 @@
 from __future__ import annotations
 
+import json
 import os
 import sys
 import subprocess
 import time
 from pathlib import Path
 from typing import Any
+
+from Bio import PDB
 
 from .base import Step, StepContext, StepError
 from ..work_queue import WorkItem
@@ -19,6 +22,58 @@ def _resolve_repo_path(path: str | Path) -> Path:
     if p.is_absolute():
         return p
     return repo_root() / p
+
+
+def _resolve_ctx_path(ctx: StepContext, value: str | Path | None) -> Path | None:
+    if not value:
+        return None
+    p = Path(str(value))
+    if p.is_absolute():
+        return p
+    return (ctx.out_dir / p).resolve()
+
+
+def _load_chain_offset_map(offsets_path: Path) -> list[int] | None:
+    try:
+        payload = json.loads(offsets_path.read_text())
+    except Exception:
+        return None
+    chains = payload.get("chains") if isinstance(payload, dict) else None
+    if not chains:
+        return None
+    mapping: list[int] = []
+    for seg in chains:
+        try:
+            length = int(seg.get("length") or 0)
+            start = int(seg.get("start_resseq_B") or 0)
+        except Exception:
+            return None
+        if length <= 0 or start <= 0:
+            return None
+        for i in range(length):
+            mapping.append(start + i)
+    return mapping or None
+
+
+def _renumber_chain_with_offsets(pdb_path: Path, chain_id: str, mapping: list[int]) -> bool:
+    try:
+        parser = PDB.PDBParser(QUIET=True)
+        structure = parser.get_structure("model", str(pdb_path))
+        model = structure[0]
+        if chain_id not in model:
+            return False
+        chain = model[chain_id]
+        residues = [r for r in chain if r.id[0] == " "]
+        if len(residues) != len(mapping):
+            return False
+        for idx, res in enumerate(residues, start=1):
+            res.id = (" ", int(mapping[idx - 1]), " ")
+        io = PDB.PDBIO()
+        io.set_structure(structure)
+        io.save(str(pdb_path))
+        return True
+    except Exception:
+        return False
 
 
 class GenStep(Step):
@@ -127,6 +182,16 @@ class GenStep(Step):
         tools = ctx.input_data.get("tools") or {}
         config_path = tools.get("ppiflow_config")
         sample_ids = self._serialize_sample_ids(indices)
+        target = ctx.input_data.get("target") or {}
+        target_chain = (target.get("chains") or [None])[0]
+        offsets_path = _resolve_ctx_path(ctx, target.get("chain_offsets"))
+        offset_map = None
+        if offsets_path:
+            if not offsets_path.exists():
+                raise StepError(f"Target offsets file not found: {offsets_path}")
+            offset_map = _load_chain_offset_map(offsets_path)
+            if not offset_map:
+                raise StepError(f"Failed to load target chain offsets: {offsets_path}")
 
         if protocol == "binder":
             script = _resolve_repo_path("src/entrypoints/sample_binder.py")
@@ -144,7 +209,6 @@ class GenStep(Step):
             else:
                 min_len = max_len = int(length_spec)
 
-            target = ctx.input_data.get("target") or {}
             target_chains = target.get("chains") or []
             target_chain = target_chains[0] if target_chains else None
             binder_chain = ctx.input_data.get("binder_chain") or "A"
@@ -199,7 +263,6 @@ class GenStep(Step):
             )
             config_path = config_path or config_default
             config_path = str(_resolve_repo_path(config_path))
-            target = ctx.input_data.get("target") or {}
             framework = ctx.input_data.get("framework") or {}
             ckpt = tools.get("ppiflow_ckpt")
             if not ckpt:
@@ -255,6 +318,16 @@ class GenStep(Step):
                 log_file=self.cfg.get("_log_file"),
                 verbose=bool(self.cfg.get("_verbose")),
             )
+            if offset_map and target_chain:
+                for sample_id in indices:
+                    if protocol == "binder":
+                        out_path = out_dir / f"{name}_{sample_id}.pdb"
+                    else:
+                        out_path = out_dir / f"{name}_antigen_antibody_sample_{sample_id}.pdb"
+                    if not out_path.exists():
+                        continue
+                    if not _renumber_chain_with_offsets(out_path, str(target_chain), offset_map):
+                        raise StepError(f"Failed to apply target chain offsets to {out_path}")
         except Exception:
             status = "FAILED"
             raise
