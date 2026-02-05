@@ -252,7 +252,10 @@ class PartialFlowStep(Step):
                 sid = str(row.get("structure_id") or row.get("pdb_name") or idx)
                 pdb_path = _resolve_partial_pdb_path(ctx, row.get("pdb_path") or target.get("pdb"), row)
                 motif_contig = _normalize_optional_string(row.get("motif_contig"))
+                fixed_structure = _normalize_optional_string(row.get("fixed_structure") or row.get("fixed_positions"))
+                fixed_sequence = _normalize_optional_string(row.get("fixed_sequence"))
                 out_sub = out_dir / sid
+                start_t = (ctx.input_data.get("partial") or {}).get("start_t")
                 cmd = [
                     sys.executable,
                     str(script),
@@ -275,8 +278,14 @@ class PartialFlowStep(Step):
                     "--seed",
                     str(int((ctx.state.get("runs") or [{}])[0].get("run_seed", 0) or 0)),
                 ]
+                if start_t is not None:
+                    cmd.extend(["--start_t", str(start_t)])
                 if motif_contig:
                     cmd.extend(["--motif_contig", str(motif_contig)])
+                if fixed_structure:
+                    cmd.extend(["--fixed_structure", str(fixed_structure)])
+                if fixed_sequence:
+                    cmd.extend(["--fixed_sequence", str(fixed_sequence)])
                 hotspots = target.get("hotspots")
                 hotspots_file = target.get("hotspots_file")
                 if hotspots_file:
@@ -367,9 +376,10 @@ class PartialFlowStep(Step):
                 pdb_path = _resolve_partial_pdb_path(ctx, row.get("pdb_path"), row)
                 if not pdb_path:
                     raise StepError("fixed_positions.csv missing pdb_path for partial flow")
-                if "fixed_positions" not in row:
-                    raise StepError("fixed_positions.csv missing fixed_positions")
-                fixed_positions = _normalize_optional_string(row.get("fixed_positions")) or ""
+                if "fixed_positions" not in row and "fixed_structure" not in row:
+                    raise StepError("fixed_positions.csv missing fixed_structure/fixed_positions")
+                fixed_positions = _normalize_optional_string(row.get("fixed_structure") or row.get("fixed_positions")) or ""
+                cdr_position = _normalize_optional_string(row.get("cdr_position"))
                 out_sub = out_dir / sid
                 cmd = [
                     sys.executable,
@@ -397,6 +407,8 @@ class PartialFlowStep(Step):
                     "--seed",
                     str(int((ctx.state.get("runs") or [{}])[0].get("run_seed", 0) or 0)),
                 ]
+                if cdr_position:
+                    cmd.extend(["--cdr_position", str(cdr_position)])
                 light_chain = framework.get("light_chain")
                 if light_chain:
                     cmd.extend(["--light_chain", str(light_chain)])

@@ -105,7 +105,11 @@ class SeqDesignStep(ExternalCommandStep):
         if protocol == "binder":
             return str(ctx.input_data.get("binder_chain") or "A")
         framework = ctx.input_data.get("framework") or {}
-        return str(framework.get("heavy_chain") or "A")
+        heavy = str(framework.get("heavy_chain") or "A")
+        light = framework.get("light_chain")
+        if light:
+            return f"{heavy},{light}"
+        return heavy
 
     def _default_mpnn_run(self, ctx: StepContext) -> Path | None:
         tools = ctx.input_data.get("tools") or {}
@@ -128,6 +132,29 @@ class SeqDesignStep(ExternalCommandStep):
         path.write_text(json.dumps(bias) + "\n")
         return path
 
+    def _parse_fixed_positions_by_chain(
+        self, value: str, default_chain: str
+    ) -> dict[str, list[int]]:
+        mapping: dict[str, list[int]] = {}
+        if not value:
+            return mapping
+        tokens = re.split(r"[\\s,]+", str(value).strip())
+        for token in tokens:
+            token = token.strip()
+            if not token:
+                continue
+            match = re.match(r"^([A-Za-z]+)?(\\d+)(?:-(?:[A-Za-z]+)?(\\d+))?$", token)
+            if not match:
+                continue
+            chain = match.group(1) or default_chain or "A"
+            start = int(match.group(2))
+            end = int(match.group(3) or start)
+            if end < start:
+                start, end = end, start
+            indices = list(range(start, end + 1))
+            mapping.setdefault(chain, []).extend(indices)
+        return {k: sorted(set(v)) for k, v in mapping.items()}
+
     def _build_fixed_positions_map(self, fixed_positions_csv: str | Path) -> dict[str, dict[str, object]]:
         mapping: dict[str, dict[str, object]] = {}
         path = Path(fixed_positions_csv)
@@ -140,9 +167,14 @@ class SeqDesignStep(ExternalCommandStep):
                 if not sid:
                     continue
                 chain = str(row.get("binder_chain") or row.get("chain") or "").strip()
-                indices_raw = row.get("fixed_positions_indices") or row.get("fixed_positions") or ""
-                indices = [int(x) for x in re.findall(r"\d+", str(indices_raw))]
-                entry = {"chain": chain, "indices": indices}
+                indices_raw = (
+                    row.get("fixed_sequence")
+                    or row.get("fixed_positions_indices")
+                    or row.get("fixed_positions")
+                    or ""
+                )
+                fixed_positions = self._parse_fixed_positions_by_chain(indices_raw, chain or "A")
+                entry = {"fixed_positions": fixed_positions}
                 mapping[sid] = entry
                 pname = str(row.get("pdb_name") or "").strip()
                 if pname:
@@ -184,14 +216,18 @@ class SeqDesignStep(ExternalCommandStep):
                 entry = self._resolve_fixed_positions(pdb_path, mapping)
                 if not entry:
                     continue
-                indices = [int(x) for x in entry.get("indices") or []]
-                if not indices:
-                    continue
-                chain = str(entry.get("chain") or default_chain or "A")
-                payload = {
-                    "name": pdb_path.stem,
-                    "fixed_positions": {chain: indices},
-                }
+                fixed_positions = entry.get("fixed_positions")
+                if isinstance(fixed_positions, dict) and fixed_positions:
+                    payload = {"name": pdb_path.stem, "fixed_positions": fixed_positions}
+                else:
+                    indices = [int(x) for x in entry.get("indices") or []]
+                    if not indices:
+                        continue
+                    chain = str(entry.get("chain") or default_chain or "A")
+                    payload = {
+                        "name": pdb_path.stem,
+                        "fixed_positions": {chain: indices},
+                    }
                 handle.write(json.dumps(payload) + "\n")
                 count += 1
         if count == 0:
@@ -212,15 +248,66 @@ class SeqDesignStep(ExternalCommandStep):
         entry = self._resolve_fixed_positions(pdb_path, mapping)
         if not entry:
             return None
-        indices = [int(x) for x in entry.get("indices") or []]
-        if not indices:
-            return None
-        chain = str(entry.get("chain") or default_chain or "A")
-        payload = {
-            "name": run_stem,
-            "fixed_positions": {chain: indices},
-        }
+        fixed_positions = entry.get("fixed_positions")
+        if isinstance(fixed_positions, dict) and fixed_positions:
+            payload = {"name": run_stem, "fixed_positions": fixed_positions}
+        else:
+            indices = [int(x) for x in entry.get("indices") or []]
+            if not indices:
+                return None
+            chain = str(entry.get("chain") or default_chain or "A")
+            payload = {
+                "name": run_stem,
+                "fixed_positions": {chain: indices},
+            }
         out_dir.mkdir(parents=True, exist_ok=True)
+        jsonl_path = out_dir / "fixed_positions.jsonl"
+        jsonl_path.write_text(json.dumps(payload) + "\n")
+        return jsonl_path
+
+    def _fixed_positions_from_bfactor(
+        self,
+        pdb_path: Path,
+        chains: list[str],
+        threshold: float = 3.9,
+    ) -> dict[str, list[int]]:
+        positions: dict[str, set[int]] = {}
+        chain_set = {c.strip() for c in chains if c and str(c).strip()}
+        if not chain_set:
+            return {}
+        try:
+            lines = pdb_path.read_text().splitlines()
+        except Exception:
+            return {}
+        for line in lines:
+            if not line.startswith(("ATOM", "HETATM")) or len(line) < 66:
+                continue
+            chain_id = line[21].strip()
+            if chain_id not in chain_set:
+                continue
+            try:
+                b_factor = float(line[60:66])
+            except Exception:
+                continue
+            if b_factor < threshold:
+                continue
+            try:
+                resseq = int(line[22:26])
+            except Exception:
+                continue
+            positions.setdefault(chain_id, set()).add(resseq)
+        return {c: sorted(v) for c, v in positions.items() if v}
+
+    def _write_fixed_positions_jsonl_from_mapping(
+        self,
+        out_dir: Path,
+        run_stem: str,
+        mapping: dict[str, list[int]],
+    ) -> Path | None:
+        if not mapping:
+            return None
+        out_dir.mkdir(parents=True, exist_ok=True)
+        payload = {"name": run_stem, "fixed_positions": mapping}
         jsonl_path = out_dir / "fixed_positions.jsonl"
         jsonl_path.write_text(json.dumps(payload) + "\n")
         return jsonl_path
@@ -264,8 +351,54 @@ class SeqDesignStep(ExternalCommandStep):
                 lines.append(line)
             (seq_dir / name).write_text("\n".join(lines) + "\n")
 
-    def _collect_pdbs(self, input_dir: Path) -> list[Path]:
-        return collect_pdbs(input_dir)
+    def _collect_pdbs(self, ctx: StepContext, input_dir: Path) -> list[Path]:
+        pdbs = collect_pdbs(input_dir)
+        protocol = ctx.input_data.get("protocol")
+        if protocol in {"antibody", "vhh"} and str(self.cfg.get("name") or "") == "seq1":
+            metrics_path = input_dir / "sample_metrics.csv"
+            if not metrics_path.exists():
+                raise StepError(f"Missing sample_metrics.csv for CDR interface prefilter at {metrics_path}")
+            try:
+                df = pd.read_csv(metrics_path)
+            except Exception as exc:
+                raise StepError(f"Failed to read {metrics_path}: {exc}") from exc
+            if "cdr_interface_ratio" not in df.columns or "pdb_path" not in df.columns:
+                raise StepError("sample_metrics.csv missing cdr_interface_ratio or pdb_path columns")
+            try:
+                df = df[df["cdr_interface_ratio"].astype(float) >= 0.6]
+            except Exception:
+                df = df[df["cdr_interface_ratio"] >= 0.6]
+            if df.empty:
+                raise StepError("No backbones pass cdr_interface_ratio >= 0.6")
+            filtered: list[Path] = []
+            for path_val in df["pdb_path"].tolist():
+                if not path_val:
+                    continue
+                cand = Path(str(path_val))
+                if not cand.is_absolute():
+                    cand = (input_dir / cand).resolve()
+                if cand.exists():
+                    # Prefer paths under the input_dir to keep run_stem resolution stable.
+                    try:
+                        cand.relative_to(input_dir)
+                    except Exception:
+                        alt = input_dir / cand.name
+                        if alt.exists():
+                            cand = alt
+                    filtered.append(cand)
+                    continue
+                # Fallback for moved outputs: try input_dir/<name>.pdb
+                alt = input_dir / Path(str(path_val)).name
+                if alt.exists():
+                    filtered.append(alt)
+                    continue
+                alt = input_dir / f"{Path(str(path_val)).stem}.pdb"
+                if alt.exists():
+                    filtered.append(alt)
+            if not filtered:
+                raise StepError("No backbone PDBs found after cdr_interface_ratio prefilter")
+            return filtered
+        return pdbs
 
     def _stage_pdbs(self, pdbs: list[Path], out_dir: Path) -> list[Path]:
         if not pdbs:
@@ -308,7 +441,7 @@ class SeqDesignStep(ExternalCommandStep):
             raise StepError(f"Input dir not found: {input_path}")
         out_dir = self.output_dir(ctx)
 
-        pdbs = self._collect_pdbs(input_path)
+        pdbs = self._collect_pdbs(ctx, input_path)
         if not pdbs:
             raise StepError(f"No PDBs found for sequence design in {input_path}")
         run_stems = compute_run_stems(pdbs, input_path)
@@ -370,6 +503,7 @@ class SeqDesignStep(ExternalCommandStep):
             raise StepError("sequence_design.num_seq_per_backbone must be > 0")
         chain_list = self._default_chain_list(ctx)
         protocol = ctx.input_data.get("protocol")
+        omit_aas = seq_cfg.get("omit_aas") if protocol != "binder" else None
         use_soluble = bool(seq_cfg.get("use_soluble_ckpt"))
         if protocol == "binder" and use_soluble and self.cfg.get("name") == "seq2":
             ckpt = tools.get("mpnn_ckpt_soluble") or ckpt
@@ -407,14 +541,17 @@ class SeqDesignStep(ExternalCommandStep):
             ]
             if weight_dir is not None:
                 cmd.extend(["--path_to_model_weights", str(weight_dir)])
-            elif use_soluble_model:
-                cmd.append("--use_soluble_model")
             else:
-                raise StepError("Missing tools.mpnn_ckpt/abmpnn_ckpt for sequence design")
+                if use_soluble_model:
+                    cmd.append("--use_soluble_model")
+                else:
+                    raise StepError("Missing tools.mpnn_ckpt/abmpnn_ckpt for sequence design")
             if model_name:
                 cmd.extend(["--model_name", model_name])
             elif protocol != "binder":
                 cmd.extend(["--model_name", "abmpnn"])
+            if use_soluble_model and protocol != "binder":
+                cmd.append("--use_soluble_model")
             return cmd
 
         pdb_path = Path(str((item.payload or {}).get("pdb_path") or ""))
@@ -422,6 +559,12 @@ class SeqDesignStep(ExternalCommandStep):
             raise FileNotFoundError(f"PDB not found: {pdb_path}")
         if not run_stem:
             run_stem = pdb_path.stem
+        if fixed_positions_jsonl is None and protocol in {"antibody", "vhh"} and step_name == "seq1":
+            chains = [c.strip() for c in str(chain_list).split(",") if c.strip()]
+            mapping = self._fixed_positions_from_bfactor(pdb_path, chains)
+            fixed_positions_jsonl = self._write_fixed_positions_jsonl_from_mapping(
+                item_tmp, run_stem, mapping
+            )
         # Materialize legacy pdbs/ for downstream flowpacker (seq2).
         pdbs_dir = out_dir / "pdbs"
         pdbs_dir.mkdir(parents=True, exist_ok=True)
@@ -458,6 +601,8 @@ class SeqDesignStep(ExternalCommandStep):
                     cmd.extend(["--pdb_path_chains", chain_arg])
                 if fixed_positions_jsonl:
                     cmd.extend(["--fixed_positions_jsonl", str(fixed_positions_jsonl)])
+                if omit_aas:
+                    cmd.extend(["--omit_AAs", str(omit_aas)])
                 run_command(
                     cmd,
                     env=env,
@@ -491,6 +636,8 @@ class SeqDesignStep(ExternalCommandStep):
                 cmd.extend(["--pdb_path_chains", chain_arg])
             if fixed_positions_jsonl:
                 cmd.extend(["--fixed_positions_jsonl", str(fixed_positions_jsonl)])
+            if omit_aas:
+                cmd.extend(["--omit_AAs", str(omit_aas)])
             run_command(
                 cmd,
                 env=env,
@@ -537,6 +684,7 @@ class SeqDesignStep(ExternalCommandStep):
         chain_list = self._default_chain_list(ctx)
         chain_arg = " ".join(str(chain_list).replace(",", " ").split())
         protocol = ctx.input_data.get("protocol")
+        omit_aas = seq_cfg.get("omit_aas") if protocol != "binder" else None
         use_soluble = bool(seq_cfg.get("use_soluble_ckpt"))
         if protocol == "binder" and use_soluble and self.cfg.get("name") == "seq2":
             ckpt = tools.get("mpnn_ckpt_soluble") or ckpt
@@ -603,6 +751,17 @@ class SeqDesignStep(ExternalCommandStep):
                 str(fixed_positions_csv),
                 default_chain,
             )
+        if fixed_positions_jsonl is None and protocol in {"antibody", "vhh"} and step_name == "seq1":
+            lines = []
+            chains = [c.strip() for c in str(chain_list).split(",") if c.strip()]
+            for pdb_path in staged_pdbs:
+                mapping = self._fixed_positions_from_bfactor(pdb_path, chains)
+                if not mapping:
+                    continue
+                lines.append(json.dumps({"name": pdb_path.stem, "fixed_positions": mapping}))
+            if lines:
+                fixed_positions_jsonl = batch_dir / "fixed_positions.jsonl"
+                fixed_positions_jsonl.write_text("\n".join(lines) + "\n")
 
         def build_base_cmd(out_folder: Path, num_seq_target: int, temp: float, use_soluble_model: bool) -> list[str]:
             cmd = [
@@ -627,14 +786,19 @@ class SeqDesignStep(ExternalCommandStep):
                 cmd.extend(["--fixed_positions_jsonl", str(fixed_positions_jsonl)])
             if weight_dir is not None:
                 cmd.extend(["--path_to_model_weights", str(weight_dir)])
-            elif use_soluble_model:
-                cmd.append("--use_soluble_model")
             else:
-                raise StepError("Missing tools.mpnn_ckpt/abmpnn_ckpt for sequence design")
+                if use_soluble_model:
+                    cmd.append("--use_soluble_model")
+                else:
+                    raise StepError("Missing tools.mpnn_ckpt/abmpnn_ckpt for sequence design")
             if model_name:
                 cmd.extend(["--model_name", model_name])
             elif protocol != "binder":
                 cmd.extend(["--model_name", "abmpnn"])
+            if use_soluble_model and protocol != "binder":
+                cmd.append("--use_soluble_model")
+            if omit_aas:
+                cmd.extend(["--omit_AAs", str(omit_aas)])
             return cmd
 
         env = os.environ.copy()
@@ -768,6 +932,7 @@ class SeqDesignStep(ExternalCommandStep):
         chain_list = self._default_chain_list(ctx)
         position_list = self.cfg.get("fixed_positions_csv")
         protocol = ctx.input_data.get("protocol")
+        omit_aas = seq_cfg.get("omit_aas") if protocol != "binder" else None
         use_soluble = bool(seq_cfg.get("use_soluble_ckpt"))
         if protocol == "binder" and use_soluble and self.cfg.get("name") == "seq2":
             ckpt = tools.get("mpnn_ckpt_soluble") or ckpt
@@ -793,14 +958,19 @@ class SeqDesignStep(ExternalCommandStep):
             ]
             if weight_dir is not None:
                 cmd.extend(["--path_to_model_weights", str(weight_dir)])
-            elif use_soluble_model:
-                cmd.append("--use_soluble_model")
             else:
-                raise StepError("Missing tools.mpnn_ckpt/abmpnn_ckpt for sequence design")
+                if use_soluble_model:
+                    cmd.append("--use_soluble_model")
+                else:
+                    raise StepError("Missing tools.mpnn_ckpt/abmpnn_ckpt for sequence design")
             if model_name:
                 cmd.extend(["--model_name", model_name])
             elif protocol != "binder":
                 cmd.extend(["--model_name", "abmpnn"])
+            if use_soluble_model and protocol != "binder":
+                cmd.append("--use_soluble_model")
+            if omit_aas:
+                cmd.extend(["--omit_AAs", str(omit_aas)])
             return cmd
 
 
@@ -841,6 +1011,17 @@ class SeqDesignStep(ExternalCommandStep):
             )
             if not fixed_positions_jsonl:
                 print("Warning: fixed_positions_csv provided but could not generate fixed_positions_jsonl; skipping anchors.")
+        if fixed_positions_jsonl is None and protocol in {"antibody", "vhh"} and step_label == "seq1":
+            lines = []
+            chains = [c.strip() for c in str(chain_list).split(",") if c.strip()]
+            for pdb_path in pdbs:
+                mapping = self._fixed_positions_from_bfactor(pdb_path, chains)
+                if not mapping:
+                    continue
+                lines.append(json.dumps({"name": pdb_path.stem, "fixed_positions": mapping}))
+            if lines:
+                fixed_positions_jsonl = Path(out_dir) / "fixed_positions.jsonl"
+                fixed_positions_jsonl.write_text("\n".join(lines) + "\n")
 
         env = os.environ.copy()
 
@@ -2310,8 +2491,6 @@ class AF3ScoreStep(ExternalCommandStep):
         filtered_dir.mkdir(parents=True, exist_ok=True)
         for r in rows:
             if not r.get("passed_filter"):
-                continue
-            if top_k is not None and not r.get("passed_top_k"):
                 continue
             pdb_path = r.get("pdb_path")
             if not pdb_path:

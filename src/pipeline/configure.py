@@ -8,7 +8,7 @@ from typing import Any
 
 from Bio import PDB
 
-from .config import InputSpec, apply_preset, build_input_from_cli, load_input, normalize_input, validate_input, write_cli_input_yaml
+from .config import ConfigError, InputSpec, apply_preset, build_input_from_cli, load_input, normalize_input, validate_input, write_cli_input_yaml
 from .io import ensure_dir, write_json, write_yaml, repo_root
 from .output_policy import mode as output_mode, scratch_dir as resolve_scratch_dir
 from .state import collect_tool_versions, init_or_update_state, sha256_json
@@ -56,12 +56,19 @@ def _step_config(name: str, run_id: int, input_data: dict) -> dict:
         })
     elif name == "rosetta_interface":
         af3_r1 = ((input_data.get("filters") or {}).get("af3score") or {}).get("round1") or {}
-        use_filtered = af3_r1.get("iptm_min") is not None or af3_r1.get("top_k") is not None
+        use_filtered = af3_r1.get("iptm_min") is not None or af3_r1.get("ptm_min") is not None
         cfg.update({
             "stage": "rosetta",
             "output_dir": f"{run_dir}/rosetta_interface",
             "manifest": f"{manifests_dir}/rosetta_interface.csv",
             "input_dir": f"{run_dir}/af3score_round1/filtered_pdbs" if use_filtered else f"{run_dir}/af3score_round1",
+        })
+    elif name == "rosetta_interface2":
+        cfg.update({
+            "stage": "rosetta",
+            "output_dir": f"{run_dir}/rosetta_interface2",
+            "manifest": f"{manifests_dir}/rosetta_interface2.csv",
+            "input_dir": f"{run_dir}/relax",
         })
     elif name == "interface_enrich":
         cfg.update({
@@ -102,7 +109,7 @@ def _step_config(name: str, run_id: int, input_data: dict) -> dict:
         })
     elif name == "relax":
         af3_r2 = ((input_data.get("filters") or {}).get("af3score") or {}).get("round2") or {}
-        use_filtered = af3_r2.get("iptm_min") is not None or af3_r2.get("ptm_min") is not None or af3_r2.get("top_k") is not None
+        use_filtered = af3_r2.get("iptm_min") is not None or af3_r2.get("ptm_min") is not None
         cfg.update({
             "stage": "rosetta",
             "output_dir": f"{run_dir}/relax",
@@ -110,17 +117,11 @@ def _step_config(name: str, run_id: int, input_data: dict) -> dict:
             "input_dir": f"{run_dir}/af3score_round2/filtered_pdbs" if use_filtered else f"{run_dir}/af3score_round2",
         })
     elif name == "dockq":
-        tools = input_data.get("tools") or {}
-        use_refold = bool(
-            input_data.get("optional_af3_refold")
-            and tools.get("af3score_repo")
-            and tools.get("af3_weights")
-        )
         cfg.update({
             "stage": "score",
             "output_dir": f"{run_dir}/dockq",
             "manifest": f"{manifests_dir}/dockq.csv",
-            "input_dir": f"{run_dir}/af3_refold/pdbs" if use_refold else f"{run_dir}/relax",
+            "input_dir": f"{run_dir}/af3_refold/pdbs",
         })
     elif name == "rank_features":
         cfg.update({
@@ -349,10 +350,10 @@ def _apply_default_command(
         af3_repo = tools.get("af3score_repo")
         af3_weights = tools.get("af3_weights")
         if not af3_repo or not af3_weights:
-            return
+            raise ConfigError("AF3 refold requires tools.af3score_repo and tools.af3_weights")
         script = root / "scripts" / "run_af3score.py"
         if not script.exists():
-            return
+            raise ConfigError(f"AF3 refold script not found: {script}")
         run_dir = out_dir / "output"
         num_jobs = int(os.environ.get("PPIFLOW_AF3_JOBS", "1"))
         input_pdb_dir = run_dir / "relax"
@@ -405,13 +406,12 @@ def _apply_default_command(
     if step_name == "dockq":
         dockq_bin = tools.get("dockq_bin")
         if not dockq_bin:
-            return
+            raise ConfigError("DockQ is required. Set tools.dockq_bin.")
         script = root / "scripts" / "run_dockq.py"
         if not script.exists():
-            return
+            raise ConfigError(f"DockQ script not found: {script}")
         run_dir = out_dir / "output"
-        use_refold = bool(input_data.get("optional_af3_refold") and tools.get("af3score_repo") and tools.get("af3_weights"))
-        input_pdb_dir = run_dir / "af3_refold" / "pdbs" if use_refold else run_dir / "relax"
+        input_pdb_dir = run_dir / "af3_refold" / "pdbs"
         reference_pdb_dir = run_dir / "af3score_round2" / "filtered_pdbs"
         output_dir = run_dir / "dockq"
         cfg["command"] = [
@@ -501,11 +501,6 @@ def configure_pipeline(args) -> dict:
 
     steps_info = []
     steps_to_write = list(STEP_ORDER)
-    dockq_min = ((normalized.get("filters") or {}).get("dockq") or {}).get("min")
-    if dockq_min is None:
-        steps_to_write = [s for s in steps_to_write if s != "dockq"]
-    if not normalized.get("optional_af3_refold"):
-        steps_to_write = [s for s in steps_to_write if s != "af3_refold"]
     run_id = int((state.get("runs") or [{"run_id": 0}])[0].get("run_id", 0))
     for step_name in steps_to_write:
         cfg = _step_config(step_name, run_id, normalized)

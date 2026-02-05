@@ -30,11 +30,9 @@ DEFAULT_CONFIG_PATHS = {
 PRESETS = {
     "fast": {
         "sampling": {"samples_per_target": 50},
-        "optional_af3_refold": False,
     },
     "full": {
         "sampling": {"samples_per_target": 200},
-        "optional_af3_refold": True,
     },
     "custom": {},
 }
@@ -235,8 +233,11 @@ def normalize_input(
         r1.setdefault("num_seq_per_backbone", 8)
         r1.setdefault("bias_large_residues", False)
         r1.setdefault("bias_num", 0)
+        r1.setdefault("omit_aas", "C")
         r2.setdefault("sampling_temp", 0.1)
         r2.setdefault("num_seq_per_backbone", 4)
+        r2.setdefault("omit_aas", "C")
+        r2.setdefault("use_soluble_ckpt", True)
     seq["round1"] = r1
     seq["round2"] = r2
     out["sequence_design"] = seq
@@ -264,7 +265,7 @@ def normalize_input(
     filters["af3_refold"].setdefault("no_templates", True)
     filters.setdefault("rosetta", {})
     filters["rosetta"].setdefault("interface_energy_min", -5.0)
-    filters["rosetta"].setdefault("interface_distance", 12.0)
+    filters["rosetta"].setdefault("interface_distance", 10.0)
     filters["rosetta"].setdefault("relax_max_iter", 170)
     filters["rosetta"].setdefault("relax_fixbb", False)
     filters["rosetta"].setdefault("fixed_chains", "")
@@ -426,7 +427,6 @@ def build_input_from_cli(args: Any) -> InputSpec:
         "ranking": ranking,
         "output": output_cfg,
         "work_queue": work_queue,
-        "optional_af3_refold": bool(args.af3_refold) if args.af3_refold else None,
         "tools": {
             "ppiflow_ckpt": args.ppiflow_ckpt,
             "abmpnn_ckpt": _env_fallback(

@@ -25,6 +25,30 @@ from collections import defaultdict
 torch.manual_seed(0)
 
 
+def _parse_fixed_positions_spec(value) -> list[int]:
+    if value is None:
+        return []
+    if isinstance(value, (list, tuple)):
+        items = []
+        for v in value:
+            items.extend(_parse_fixed_positions_spec(v))
+        return sorted(set(items))
+    text = str(value).strip()
+    if not text or text.lower() in {"nan", "none", "null"}:
+        return []
+    # Accept space/comma separated tokens and strip chain letters.
+    tokens = re.split(r"[\\s,]+", text)
+    indices: list[int] = []
+    for token in tokens:
+        token = token.strip()
+        if not token:
+            continue
+        match = re.search(r"(\\d+)", token)
+        if match:
+            indices.append(int(match.group(1)))
+    return sorted(set(indices))
+
+
 def _rog_filter(df, quantile):
     y_quant = pd.pivot_table(
         df,
@@ -159,6 +183,9 @@ def _process_csv_row(csv_row, motif_cfg=None):
         if "binder_motif" in processed_feats
         else None
     )
+    fixed_positions = _parse_fixed_positions_spec(
+        csv_row.get("fixed_positions") if hasattr(csv_row, "get") else None
+    )
 
     # Get target_interface_residues mask
     target_interface_mask = np.isin(
@@ -230,16 +257,39 @@ def _process_csv_row(csv_row, motif_cfg=None):
     target_interface_mask = torch.tensor(target_interface_mask, dtype=int)
     binder_interface_mask = torch.tensor(binder_interface_mask, dtype=int)
 
+    binder_motif_mask_t = None
     if binder_motif_mask is not None and motif_cfg:
         binder_motif_mask = binder_motif_mask * (new_chain_idx == 1)
-        binder_motif_mask = torch.tensor(binder_motif_mask, dtype=int)
+        binder_motif_mask_t = torch.tensor(binder_motif_mask, dtype=int)
         hotspot_interface_mask = hotspot_interface_mask * (
             new_chain_idx == 0
         )
         hotspot_interface_mask = torch.tensor(
             hotspot_interface_mask, dtype=int
         )
-        processed_feats["binder_motif_mask"] = binder_motif_mask
+
+    fixed_positions_mask = None
+    if fixed_positions:
+        fixed_positions_mask = np.isin(
+            processed_feats["residue_index"], fixed_positions
+        )
+        fixed_positions_mask = fixed_positions_mask * (new_chain_idx == 1)
+        fixed_positions_mask = torch.tensor(fixed_positions_mask, dtype=int)
+
+    if fixed_positions_mask is not None:
+        if binder_motif_mask_t is None:
+            binder_motif_mask_t = fixed_positions_mask
+        else:
+            binder_motif_mask_t = torch.maximum(
+                binder_motif_mask_t, fixed_positions_mask
+            )
+
+    if binder_motif_mask_t is None and motif_cfg:
+        # Ensure motif-aware paths have a binder_motif_mask even when empty.
+        binder_motif_mask_t = torch.zeros_like(target_interface_mask)
+
+    if binder_motif_mask_t is not None:
+        processed_feats["binder_motif_mask"] = binder_motif_mask_t
 
     processed_feats["chain_index"] = new_chain_idx
     processed_feats["target_interface_mask"] = target_interface_mask
@@ -253,6 +303,8 @@ def _process_csv_row(csv_row, motif_cfg=None):
     processed_feats = tree.map_structure(
         lambda x: x[min_idx : (max_idx + 1)], processed_feats
     )
+    if "binder_motif_mask" in processed_feats:
+        binder_motif_mask_t = processed_feats["binder_motif_mask"]
 
     # Run through OpenFold data transforms.
     chain_feats = {
@@ -310,7 +362,7 @@ def _process_csv_row(csv_row, motif_cfg=None):
         "target_interface_mask": target_interface_mask,
         "binder_interface_mask": binder_interface_mask,
         "hotspot_interface_mask": hotspot_interface_mask,
-        "binder_motif_mask": binder_motif_mask,
+        "binder_motif_mask": binder_motif_mask_t,
         "all_atom_positions": chain_feats["all_atom_positions"],
         "all_atom_mask": chain_feats["all_atom_mask"],
         "original_binder_motif": original_binder_motif,
@@ -956,7 +1008,10 @@ class PpiTestDataset(BaseDataset):
         csv_row, sample_ids, binder_len = self.all_sample_ids[row_idx]
         feats = self.process_csv_row(csv_row)
 
-        pdb_diffuse_mask = self.setup_binder_mask(feats)
+        if "binder_motif_mask" in feats:
+            pdb_diffuse_mask = self.setup_binder_mask_with_motif(feats)
+        else:
+            pdb_diffuse_mask = self.setup_binder_mask(feats)
         feats["diffuse_mask"] = pdb_diffuse_mask.int()
         hotspot_mask = self.setup_target_hotspots(feats)
         feats["hotspot_mask"] = hotspot_mask.int()

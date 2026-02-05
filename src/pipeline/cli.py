@@ -122,7 +122,6 @@ def _add_cli_input_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--partial_start_t", type=float, help="Partial flow start_t")
     parser.add_argument("--rank_top_k", type=int, help="Top K to keep in ranking")
 
-    parser.add_argument("--af3_refold", action="store_true", help="Enable AF3 refold step")
 
     # Tool paths (optional)
     parser.add_argument("--ppiflow_ckpt", type=str, help="PPIFlow checkpoint path")

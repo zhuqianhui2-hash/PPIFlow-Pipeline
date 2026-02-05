@@ -154,6 +154,35 @@ def _normalize_motif_contig(motif_contig):
     return motif_contig
 
 
+def _parse_fixed_positions(value: Optional[str], chain_id: Optional[str]) -> list[int]:
+    if not value:
+        return []
+    positions: list[int] = []
+    for token in str(value).split(","):
+        token = token.strip()
+        if not token:
+            continue
+        if chain_id and token.upper().startswith(chain_id.upper()):
+            token = token[len(chain_id):]
+        token = token.replace(":", "-")
+        if "-" in token:
+            start, end = token.split("-", 1)
+            start = re.sub(r"\\D", "", start)
+            end = re.sub(r"\\D", "", end)
+            if not start or not end:
+                continue
+            start_i = int(start)
+            end_i = int(end)
+            if end_i < start_i:
+                start_i, end_i = end_i, start_i
+            positions.extend(range(start_i, end_i + 1))
+        else:
+            match = re.match(r"(\\d+)", token)
+            if match:
+                positions.append(int(match.group(1)))
+    return sorted(set(positions))
+
+
 def preprocess_csv_and_pkl(pdb_path, output_dir, args) -> str:
     """
     Process PDB file to generate pkl and metadata
@@ -209,11 +238,19 @@ def preprocess_csv_and_pkl(pdb_path, output_dir, args) -> str:
             motif_contig, args.binder_chain
         )
 
+    fixed_positions: list[int] = []
+    fixed_positions.extend(_parse_fixed_positions(args.fixed_structure, args.binder_chain))
+    fixed_positions.extend(_parse_fixed_positions(args.fixed_sequence, args.binder_chain))
+    fixed_positions = sorted(set(fixed_positions))
+    if fixed_positions:
+        input_info["fixed_positions"] = fixed_positions
+
     metadata = process_file(input_info, write_dir=output_dir)
     metadata["num_chains"] = 2
     # metadata['contig'] = args.motif_contig
     # metadata['sample_binder_len'] = args.sample_binder_len
 
+    metadata["fixed_positions"] = " ".join(str(x) for x in fixed_positions)
     metadata_df = pd.DataFrame([metadata])  # one item only
     csv_path = os.path.join(output_dir, f"{args.name}_input.csv")
     metadata_df.to_csv(csv_path, index=False)
@@ -400,6 +437,16 @@ def get_parser():
     # Motif
     parser.add_argument(
         "--motif_contig", type=str, help="Motif contig, e.g., 'L19-27,L31'"
+    )
+    parser.add_argument(
+        "--fixed_structure",
+        type=str,
+        help="Fixed structure positions (binder chain), e.g. 'A34,A36,A56-A57'",
+    )
+    parser.add_argument(
+        "--fixed_sequence",
+        type=str,
+        help="Fixed sequence positions (binder chain), e.g. 'A34,A36,A56-A57'",
     )
     
     # Samples
