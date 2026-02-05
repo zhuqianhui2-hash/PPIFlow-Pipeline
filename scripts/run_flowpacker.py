@@ -235,6 +235,8 @@ def main() -> None:
             str(csv_path),
             "--binder_chain",
             args.binder_chain,
+            "--use_gt_masks",
+            "true",
         ]
         subprocess.check_call(cmd, env=env)
         if work_root != output_dir:
@@ -300,6 +302,8 @@ def main() -> None:
             str(csv_path),
             "--binder_chain",
             args.binder_chain,
+            "--use_gt_masks",
+            "true",
         ]
         start = time.time()
         status = "OK"
