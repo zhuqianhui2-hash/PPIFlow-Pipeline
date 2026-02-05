@@ -14,8 +14,8 @@ from .work_queue import WorkQueue
 
 
 _OPTIONAL_DIRS: dict[str, list[str]] = {
-    "flowpacker1": ["flowpacker_outputs", ".tmp"],
-    "flowpacker2": ["flowpacker_outputs", ".tmp"],
+    "flowpacker1": ["after_pdbs", "flowpacker_outputs", ".tmp"],
+    "flowpacker2": ["after_pdbs", "flowpacker_outputs", ".tmp"],
     "af3score1": ["af3score_outputs", "json", "af3_input_batch", "single_chain_cif", "pdbs", "af3score_subprocess_logs", ".tmp"],
     "af3score2": ["af3score_outputs", "json", "af3_input_batch", "single_chain_cif", "pdbs", "af3score_subprocess_logs", ".tmp"],
     "af3_refold": ["af3score_outputs", "json", "af3_input_batch", "single_chain_cif", "pdbs", "af3score_subprocess_logs", ".tmp"],
@@ -26,8 +26,8 @@ _OPTIONAL_DIRS: dict[str, list[str]] = {
 }
 
 _REQUIRED_OUTPUTS: dict[str, list[tuple[str, ...]]] = {
-    "flowpacker1": [("after_pdbs/*.pdb",)],
-    "flowpacker2": [("after_pdbs/*.pdb",)],
+    "flowpacker1": [("packed_pdbs/*.pdb",)],
+    "flowpacker2": [("packed_pdbs/*.pdb",)],
     "af3score1": [("metrics_items/*.csv", "metrics.csv")],
     "af3score2": [("metrics_items/*.csv", "metrics.csv")],
     "af3_refold": [("metrics_items/*.csv", "metrics.csv")],

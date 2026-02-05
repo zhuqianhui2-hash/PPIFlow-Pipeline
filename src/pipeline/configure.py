@@ -51,8 +51,7 @@ def _step_config(name: str, run_id: int, input_data: dict) -> dict:
             "stage": "score",
             "output_dir": f"{run_dir}/af3score_round1",
             "manifest": f"{manifests_dir}/af3score_round1.csv",
-            # FlowPacker itemization writes legacy PDBs into after_pdbs/.
-            "input_dir": f"{run_dir}/flowpacker_round1/after_pdbs",
+            "input_dir": f"{run_dir}/flowpacker_round1/packed_pdbs",
         })
     elif name == "rosetta_interface":
         af3_r1 = ((input_data.get("filters") or {}).get("af3score") or {}).get("round1") or {}
@@ -104,8 +103,7 @@ def _step_config(name: str, run_id: int, input_data: dict) -> dict:
             "stage": "score",
             "output_dir": f"{run_dir}/af3score_round2",
             "manifest": f"{manifests_dir}/af3score_round2.csv",
-            # FlowPacker itemization writes legacy PDBs into after_pdbs/.
-            "input_dir": f"{run_dir}/flowpacker_round2/after_pdbs",
+            "input_dir": f"{run_dir}/flowpacker_round2/packed_pdbs",
         })
     elif name == "relax":
         af3_r2 = ((input_data.get("filters") or {}).get("af3score") or {}).get("round2") or {}
@@ -310,12 +308,10 @@ def _apply_default_command(
         run_dir = out_dir / "output"
         num_jobs = int(os.environ.get("PPIFLOW_AF3_JOBS", "1"))
         if step_name == "af3score1":
-            # FlowPacker itemization writes legacy PDBs into after_pdbs/.
-            input_pdb_dir = run_dir / "flowpacker_round1" / "after_pdbs"
+            input_pdb_dir = run_dir / "flowpacker_round1" / "packed_pdbs"
             output_dir = run_dir / "af3score_round1"
         else:
-            # FlowPacker itemization writes legacy PDBs into after_pdbs/.
-            input_pdb_dir = run_dir / "flowpacker_round2" / "after_pdbs"
+            input_pdb_dir = run_dir / "flowpacker_round2" / "packed_pdbs"
             output_dir = run_dir / "af3score_round2"
         cfg["command"] = [
             sys.executable,

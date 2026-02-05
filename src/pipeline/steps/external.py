@@ -1341,8 +1341,8 @@ class FlowPackerStep(ExternalCommandStep):
 
     def item_done(self, ctx: StepContext, item: WorkItem) -> bool:
         out_dir = self.output_dir(ctx)
-        after_dir = out_dir / "after_pdbs"
-        if not after_dir.exists():
+        packed_dir = out_dir / "packed_pdbs"
+        if not packed_dir.exists():
             return False
         stem = str((item.payload or {}).get("run_stem") or (item.payload or {}).get("pdb_stem") or item.id)
         cfg = self._flowpacker_config()
@@ -1352,7 +1352,7 @@ class FlowPackerStep(ExternalCommandStep):
             pattern = link_name.replace(".pdb", "_*.pdb")
         else:
             pattern = f"{link_name}_*"
-        return any(after_dir.glob(pattern))
+        return any(packed_dir.glob(pattern))
 
     def run_item(self, ctx: StepContext, item: WorkItem) -> None:
         cfg = self._flowpacker_config()
@@ -1438,11 +1438,11 @@ class FlowPackerStep(ExternalCommandStep):
         )
 
         allow_reuse = bool((ctx.work_queue or {}).get("allow_reuse", True))
-        after_pdbs = out_dir / "after_pdbs"
-        promote_tree(item_out / "after_pdbs", after_pdbs, allow_reuse=allow_reuse)
+        packed_pdbs = out_dir / "packed_pdbs"
+        promote_tree(item_out / "flowpacker_outputs" / "run_1", packed_pdbs, allow_reuse=allow_reuse)
         if not is_minimal(ctx):
-            flowpacker_out = out_dir / "flowpacker_outputs" / "run_1"
-            promote_tree(item_out / "flowpacker_outputs" / "run_1", flowpacker_out, allow_reuse=allow_reuse)
+            after_pdbs = out_dir / "after_pdbs"
+            promote_tree(item_out / "after_pdbs", after_pdbs, allow_reuse=allow_reuse)
         shutil.rmtree(item_dir, ignore_errors=True)
 
     def run_batch(self, ctx: StepContext, items: list[WorkItem]) -> dict[str, tuple[str, str | None]]:
@@ -1568,12 +1568,12 @@ class FlowPackerStep(ExternalCommandStep):
 
         allow_reuse = bool((ctx.work_queue or {}).get("allow_reuse", True))
         strict_collision = False
-        after_pdbs = out_dir / "after_pdbs"
+        packed_pdbs = out_dir / "packed_pdbs"
         try:
-            promote_tree(batch_dir / "after_pdbs", after_pdbs, allow_reuse=allow_reuse)
+            promote_tree(batch_dir / "flowpacker_outputs" / "run_1", packed_pdbs, allow_reuse=allow_reuse)
             if not is_minimal(ctx):
-                flowpacker_out = out_dir / "flowpacker_outputs" / "run_1"
-                promote_tree(batch_dir / "flowpacker_outputs" / "run_1", flowpacker_out, allow_reuse=allow_reuse)
+                after_pdbs = out_dir / "after_pdbs"
+                promote_tree(batch_dir / "after_pdbs", after_pdbs, allow_reuse=allow_reuse)
         except Exception as exc:
             if err is None:
                 err = str(exc)
@@ -1592,7 +1592,7 @@ class FlowPackerStep(ExternalCommandStep):
 
     def write_manifest(self, ctx: StepContext) -> None:
         out_dir = self.output_dir(ctx)
-        pdb_root = out_dir / "after_pdbs"
+        pdb_root = out_dir / "packed_pdbs"
         # Write legacy flowpacker_input.csv if possible.
         cfg = self._flowpacker_config()
         seq_fasta_dir = self._resolve_path(ctx, cfg.get("seq_fasta_dir")) if cfg else None
@@ -1625,8 +1625,9 @@ class FlowPackerStep(ExternalCommandStep):
                         pass
 
         rows = []
-        search_root = pdb_root if pdb_root.exists() else out_dir
-        for fp in sorted(search_root.rglob("*.pdb")):
+        if not pdb_root.exists():
+            return
+        for fp in sorted(pdb_root.rglob("*.pdb")):
             if is_ignored_path(fp):
                 continue
             rows.append({
@@ -1643,12 +1644,12 @@ class FlowPackerStep(ExternalCommandStep):
         if done:
             return done
         out_dir = self.output_dir(ctx)
-        for sub in [out_dir / "after_pdbs", out_dir]:
-            if sub.exists():
-                for fp in sub.rglob("*.pdb"):
-                    if is_ignored_path(fp):
-                        continue
-                    return set(range(self.expected_total(ctx)))
+        packed_dir = out_dir / "packed_pdbs"
+        if packed_dir.exists():
+            for fp in packed_dir.rglob("*.pdb"):
+                if is_ignored_path(fp):
+                    continue
+                return set(range(self.expected_total(ctx)))
         return set()
 
 
