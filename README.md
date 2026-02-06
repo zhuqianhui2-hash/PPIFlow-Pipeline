@@ -370,6 +370,10 @@ python ppiflow.py execute --output out_dir --work-queue-strict
 python ppiflow.py execute --output out_dir --work-queue-rebuild
 ```
 
+Notes:
+- Resume uses preserved outputs as the source of truth. If `.work/` is missing, the work queue is rebuilt from outputs.
+- Strict completion prefers output metadata (input/config/tool stamps). For legacy outputs without metadata, use `--work-queue-reuse` to opt in.
+
 ## Troubleshooting
 
 - `steps.yaml not found`: run `configure` (or `pipeline`) first.

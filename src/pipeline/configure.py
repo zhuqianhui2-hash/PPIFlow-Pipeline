@@ -54,13 +54,11 @@ def _step_config(name: str, run_id: int, input_data: dict) -> dict:
             "input_dir": f"{run_dir}/flowpacker_round1/packed_pdbs",
         })
     elif name == "rosetta_interface":
-        af3_r1 = ((input_data.get("filters") or {}).get("af3score") or {}).get("round1") or {}
-        use_filtered = af3_r1.get("iptm_min") is not None or af3_r1.get("ptm_min") is not None
         cfg.update({
             "stage": "rosetta",
             "output_dir": f"{run_dir}/rosetta_interface",
             "manifest": f"{manifests_dir}/rosetta_interface.csv",
-            "input_dir": f"{run_dir}/af3score_round1/filtered_pdbs" if use_filtered else f"{run_dir}/af3score_round1",
+            "input_dir": f"{run_dir}/af3score_round1/filtered_pdbs",
         })
     elif name == "rosetta_interface2":
         cfg.update({
@@ -106,13 +104,11 @@ def _step_config(name: str, run_id: int, input_data: dict) -> dict:
             "input_dir": f"{run_dir}/flowpacker_round2/packed_pdbs",
         })
     elif name == "relax":
-        af3_r2 = ((input_data.get("filters") or {}).get("af3score") or {}).get("round2") or {}
-        use_filtered = af3_r2.get("iptm_min") is not None or af3_r2.get("ptm_min") is not None
         cfg.update({
             "stage": "rosetta",
             "output_dir": f"{run_dir}/relax",
             "manifest": f"{manifests_dir}/relax.csv",
-            "input_dir": f"{run_dir}/af3score_round2/filtered_pdbs" if use_filtered else f"{run_dir}/af3score_round2",
+            "input_dir": f"{run_dir}/af3score_round2/filtered_pdbs",
         })
     elif name == "dockq":
         cfg.update({

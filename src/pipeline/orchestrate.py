@@ -79,6 +79,7 @@ def _load_step_configs(out_dir: Path) -> dict[str, dict[str, Any]]:
                         cfg = loaded
                 except Exception:
                     pass
+            cfg["config_path"] = str(p)
         if "name" not in cfg:
             cfg["name"] = name
         cfgs[str(name)] = cfg
@@ -124,7 +125,7 @@ def _wait_for_ready_outputs(
     warned = False
     while True:
         try:
-            if step.ready_outputs(ctx):
+            if step.outputs_complete(ctx):
                 return True
         except Exception:
             pass
@@ -138,6 +139,22 @@ def _wait_for_ready_outputs(
             )
             warned = True
         time.sleep(max(float(poll_seconds), 0.5))
+
+
+def _outputs_complete(
+    *,
+    step_name: str,
+    step_cfg: dict[str, Any],
+    ctx: StepContext,
+) -> bool:
+    step_cls = STEP_REGISTRY.get(step_name)
+    if not step_cls:
+        return True
+    step = step_cls(step_cfg)
+    try:
+        return step.outputs_complete(ctx)
+    except Exception:
+        return False
 
 
 def _normalize_failure_policy(raw: Dict[str, Any], override_mode: Optional[str]) -> FailurePolicy:
@@ -524,6 +541,9 @@ def _start_log_threads(
 def _wait_for_step_with_process_check(
     *,
     step_dir: Path,
+    step_name: str,
+    step_cfg: dict[str, Any],
+    ctx: StepContext,
     procs: list[subprocess.Popen],
     timeout: Optional[float],
     poll_seconds: float = 2.0,
@@ -532,8 +552,15 @@ def _wait_for_step_with_process_check(
     while True:
         result = wait_for_step(step_dir, timeout=0)
         if result.status in {"completed", "failed"}:
+            if result.status == "failed":
+                if _outputs_complete(step_name=step_name, step_cfg=step_cfg, ctx=ctx):
+                    return WaitResult(status="completed", reason=None, complete=True)
             return result
+        if _outputs_complete(step_name=step_name, step_cfg=step_cfg, ctx=ctx):
+            return WaitResult(status="completed", reason=None, complete=True)
         if all(proc.poll() is not None for proc in procs):
+            if _outputs_complete(step_name=step_name, step_cfg=step_cfg, ctx=ctx):
+                return WaitResult(status="completed", reason=None, complete=True)
             return WaitResult(status="failed", reason="all workers exited")
         if timeout is not None and (time.time() - start) >= float(timeout):
             return WaitResult(status="timeout", reason="timeout")
@@ -562,9 +589,26 @@ def orchestrate_pipeline(args) -> None:
     orch_cfg = dict(input_data.get("orchestrator") or {})
     if orch_cfg.get("groups"):
         raise OrchestratorError("orchestrator groups are not supported; use per-step pools only")
-    work_queue_cfg = input_data.get("work_queue") or {}
+    work_queue_cfg = dict(input_data.get("work_queue") or {})
+    work_queue_cfg.setdefault("enabled", True)
+    work_queue_cfg.setdefault("lease_seconds", 1800)
+    work_queue_cfg.setdefault("max_attempts", 1)
+    work_queue_cfg.setdefault("retry_failed", False)
+    work_queue_cfg.setdefault("batch_size", 1)
+    work_queue_cfg.setdefault("leader_timeout", 600)
+    work_queue_cfg.setdefault("wait_timeout", None)
+    work_queue_cfg.setdefault("allow_reuse", True)
+    work_queue_cfg.setdefault("rebuild_from_outputs", False)
+    work_queue_cfg.setdefault("explicit_reuse", False)
+    if getattr(args, "work_queue_reuse", False):
+        work_queue_cfg["allow_reuse"] = True
+        work_queue_cfg["explicit_reuse"] = True
+    if getattr(args, "work_queue_strict", False):
+        work_queue_cfg["allow_reuse"] = False
+    if getattr(args, "work_queue_rebuild", False):
+        work_queue_cfg["rebuild_from_outputs"] = True
     retry_failed_configured = bool(work_queue_cfg.get("retry_failed"))
-    explicit_retry = bool(getattr(args, "retry_failed", False) or getattr(args, "work_queue_rebuild", False))
+    explicit_retry = bool(getattr(args, "retry_failed", False))
     if retry_failed_configured and not explicit_retry:
         print(
             "[orchestrator] note: disabling item-level retry_failed for worker runs",
@@ -576,6 +620,12 @@ def orchestrate_pipeline(args) -> None:
         orch_cfg.get("failure_policy") or {},
         getattr(args, "failure_policy", None),
     )
+
+    continue_on_error = failure_policy.mode in {"allow", "threshold"}
+    if continue_on_error:
+        # Keep ready_ctx consistent with worker behavior when we spawn with --continue-on-error.
+        options = input_data.setdefault("options", {})
+        options.setdefault("continue_on_item_error", True)
 
     if getattr(args, "max_retries", None) is not None:
         orch_cfg.setdefault("retries", {})["max_step_attempts"] = int(args.max_retries)
@@ -703,6 +753,16 @@ def orchestrate_pipeline(args) -> None:
     rebuild_requested = bool(getattr(args, "work_queue_rebuild", False))
 
     for entry in plan:
+        entry_complete = True
+        for step_name in entry.steps:
+            step_cfg = step_cfgs.get(step_name) or {"name": step_name}
+            if not _outputs_complete(step_name=step_name, step_cfg=step_cfg, ctx=ready_ctx):
+                entry_complete = False
+                break
+        if entry_complete:
+            summary["steps"].append({"name": entry.name, "status": "ok", "attempt": 0, "skipped": True})
+            continue
+
         attempt = 0
         step_success = False
         while attempt < max_attempts and not step_success:
@@ -724,7 +784,6 @@ def orchestrate_pipeline(args) -> None:
                 attempt=attempt,
             )
 
-            continue_on_error = failure_policy.mode in {"allow", "threshold"}
             procs, workers = _spawn_workers(
                 out_dir=out_dir,
                 steps=entry.steps,
@@ -749,6 +808,9 @@ def orchestrate_pipeline(args) -> None:
                 step_dir = out_dir / ".work" / step_name
                 result = _wait_for_step_with_process_check(
                     step_dir=step_dir,
+                    step_name=step_name,
+                    step_cfg=step_cfgs.get(step_name) or {"name": step_name},
+                    ctx=ready_ctx,
                     procs=procs,
                     timeout=step_wait_timeout,
                 )

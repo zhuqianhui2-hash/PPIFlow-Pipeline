@@ -11,7 +11,7 @@ from pathlib import Path
 from typing import Any
 
 from .base import Step, StepContext, StepError
-from ..direct_legacy import compute_run_stems, promote_file, promote_tree
+from ..direct_legacy import compute_run_stems, promote_file, promote_file_atomic, promote_tree
 from ..io import collect_pdbs, is_ignored_path
 from ..logging_utils import log_command_progress, run_command
 from ..manifests import extract_design_id, structure_id_from_name, write_csv
@@ -296,7 +296,7 @@ class RosettaInterfaceStep(Step):
                 df.to_csv(residue_src, index=False)
             except Exception:
                 pass
-            promote_file(residue_src, residue_items / f"{item.id}.csv", allow_reuse=allow_reuse)
+            promote_file_atomic(residue_src, residue_items / f"{item.id}.csv", allow_reuse=allow_reuse)
         shutil.rmtree(item_dir, ignore_errors=True)
         if output_enabled:
             shutil.rmtree(job_root.parent, ignore_errors=True)
@@ -477,57 +477,114 @@ class RosettaInterfaceStep(Step):
     def write_manifest(self, ctx: StepContext) -> None:
         out_dir = self.output_dir(ctx)
         residue_items = out_dir / "residue_energy_items"
-        if residue_items.exists():
-            residue_rows = []
-            for src_csv in sorted(residue_items.glob("*.csv")):
-                try:
-                    import pandas as pd
+        item_csvs = sorted(residue_items.glob("*.csv")) if residue_items.exists() else []
+        if not item_csvs:
+            raise StepError("rosetta_interface missing residue_energy_items/*.csv; cannot build residue_energy.csv")
 
-                    df_item = pd.read_csv(src_csv)
-                    residue_rows.append(df_item)
-                except Exception:
-                    pass
-            if residue_rows:
-                try:
-                    import pandas as pd
-
-                    df_all = pd.concat(residue_rows, ignore_index=True)
-                    df_all.to_csv(out_dir / "residue_energy.csv", index=False)
-                    # Optional interface score summary for ranking
-                    rows = []
-                    for _, row in df_all.iterrows():
-                        name = str(row.get("pdbname") or Path(str(row.get("pdbpath", ""))).stem)
-                        try:
-                            import ast
-
-                            energy_dict = ast.literal_eval(row.get("binder_energy") or "{}")
-                        except Exception:
-                            energy_dict = {}
-                        interface_score = sum(float(v) for v in (energy_dict or {}).values())
-                        rows.append({"pdb_name": name, "interface_score": interface_score})
-                    if rows:
-                        write_csv(out_dir / "interface_scores.csv", rows, ["pdb_name", "interface_score"])
-                except Exception:
-                    pass
-        residue_csv = out_dir / "residue_energy.csv"
-        if not residue_csv.exists():
-            return
         try:
             import pandas as pd
 
-            df = pd.read_csv(residue_csv)
+            df_all = pd.concat([pd.read_csv(p) for p in item_csvs], ignore_index=True)
+        except Exception as exc:
+            raise StepError(f"Failed to build residue_energy.csv from residue_energy_items: {exc}") from exc
+        if getattr(df_all, "empty", False):
+            raise StepError("rosetta_interface produced empty residue_energy.csv")
+
+        # Consolidated residue_energy.csv (atomic write).
+        residue_csv = out_dir / "residue_energy.csv"
+        tmp_residue = residue_csv.parent / f"{residue_csv.name}.tmp"
+        df_all.to_csv(tmp_residue, index=False)
+        os.replace(tmp_residue, residue_csv)
+
+        # Optional interface score summary for ranking (atomic write).
+        try:
+            import ast
+
+            rows = []
+            for _, row in df_all.iterrows():
+                name = str(row.get("pdbname") or Path(str(row.get("pdbpath", ""))).stem)
+                try:
+                    energy_dict = ast.literal_eval(row.get("binder_energy") or "{}")
+                except Exception:
+                    energy_dict = {}
+                interface_score = sum(float(v) for v in (energy_dict or {}).values())
+                rows.append({"pdb_name": name, "interface_score": interface_score})
+            if rows:
+                scores_csv = out_dir / "interface_scores.csv"
+                tmp_scores = scores_csv.parent / f"{scores_csv.name}.tmp"
+                write_csv(tmp_scores, rows, ["pdb_name", "interface_score"])
+                os.replace(tmp_scores, scores_csv)
         except Exception:
-            return
-        rows = []
-        for _, row in df.iterrows():
+            pass
+
+        # Manifest maps designs/structures to the consolidated residue_energy.csv path (atomic write).
+        manifest_rows = []
+        for _, row in df_all.iterrows():
             name = str(row.get("pdbname") or Path(str(row.get("pdbpath", ""))).stem)
-            rows.append({
+            manifest_rows.append({
                 "design_id": extract_design_id(name),
                 "structure_id": structure_id_from_name(name),
                 "residue_energy_csv": str(residue_csv),
             })
-        if rows:
-            write_csv(self.manifest_path(ctx), rows, ["design_id", "structure_id", "residue_energy_csv"])
+        if manifest_rows:
+            manifest_path = self.manifest_path(ctx)
+            tmp_manifest = manifest_path.parent / f"{manifest_path.name}.tmp"
+            write_csv(tmp_manifest, manifest_rows, ["design_id", "structure_id", "residue_energy_csv"])
+            os.replace(tmp_manifest, manifest_path)
+
+    def outputs_complete(self, ctx: StepContext) -> bool:
+        # Item outputs + metadata must be valid, and the downstream-critical derived output must exist.
+        if not super().outputs_complete(ctx):
+            return False
+        out_dir = self._resolve_output_dir_path(ctx)
+        residue_csv = out_dir / "residue_energy.csv"
+        if not residue_csv.exists():
+            return False
+        try:
+            if residue_csv.stat().st_size <= 0:
+                return False
+        except Exception:
+            return False
+        return True
+
+    def _finalize_work_queue_outputs(self, ctx: StepContext, wq, *, items: list[Any], allow_failures: bool) -> None:
+        # Strict finalize: never write metadata unless derived outputs are successfully materialized.
+        try:
+            counts = wq.counts()
+        except Exception:
+            counts = None
+        if counts and (counts.get("pending", 0) != 0 or counts.get("running", 0) != 0):
+            return
+        if not wq.acquire_leader():
+            return
+        try:
+            if self.cfg.get("manifest"):
+                self.write_manifest(ctx)
+
+            if allow_failures:
+                failed_ids: list[str] = []
+                try:
+                    for work_item, status in wq.iter_items():
+                        if status in {"failed", "blocked"}:
+                            failed_ids.append(str(work_item.id))
+                except Exception:
+                    failed_ids = []
+
+                failed_path = self._failed_items_path(ctx)
+                if failed_path is not None:
+                    if failed_ids:
+                        self._write_failed_items(ctx, failed_ids)
+                    else:
+                        try:
+                            failed_path.unlink()
+                        except FileNotFoundError:
+                            pass
+                        except Exception:
+                            pass
+
+            self._write_output_meta(ctx, items=items)
+        finally:
+            wq.release_leader()
 
 
 class RosettaRelaxStep(Step):
@@ -655,7 +712,7 @@ class RosettaRelaxStep(Step):
             raise StepError(f"Relax output missing for {name}")
         target = out_dir / f"{name}.pdb"
         allow_reuse = bool((ctx.work_queue or {}).get("allow_reuse", True))
-        promote_file(relaxed, target, allow_reuse=allow_reuse)
+        promote_file_atomic(relaxed, target, allow_reuse=allow_reuse)
         if output_enabled and not is_minimal(ctx):
             promote_tree(job_root, optional_dir(ctx) / "relax" / "rosetta_jobs", allow_reuse=allow_reuse)
         shutil.rmtree(item_dir, ignore_errors=True)
@@ -766,8 +823,7 @@ class RosettaRelaxStep(Step):
             for pdb in pdbs_out:
                 if pdb.name.endswith("_0001.pdb") or pdb.name.endswith("_0001.pdb.gz"):
                     target = out_dir / pdb.name.replace("_0001", "")
-                    if not target.exists():
-                        shutil.copy2(pdb, target)
+                    promote_file_atomic(pdb, target, allow_reuse=True)
                     break
         if output_enabled and not is_minimal(ctx):
             try:

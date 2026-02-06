@@ -18,7 +18,7 @@ _OPTIONAL_DIRS: dict[str, list[str]] = {
     "flowpacker2": ["after_pdbs", "flowpacker_outputs", ".tmp"],
     "af3score1": ["af3score_outputs", "json", "af3_input_batch", "single_chain_cif", "pdbs", "af3score_subprocess_logs", ".tmp"],
     "af3score2": ["af3score_outputs", "json", "af3_input_batch", "single_chain_cif", "pdbs", "af3score_subprocess_logs", ".tmp"],
-    "af3_refold": ["af3score_outputs", "json", "af3_input_batch", "single_chain_cif", "pdbs", "af3score_subprocess_logs", ".tmp"],
+    "af3_refold": ["af3score_outputs", "json", "af3_input_batch", "single_chain_cif", "af3score_subprocess_logs", ".tmp"],
     "rosetta_interface": ["rosetta_jobs", ".tmp"],
     "relax": ["rosetta_jobs", ".tmp"],
     "seq1": [".tmp"],
@@ -26,13 +26,15 @@ _OPTIONAL_DIRS: dict[str, list[str]] = {
 }
 
 _REQUIRED_OUTPUTS: dict[str, list[tuple[str, ...]]] = {
+    "gen": [("sample_metrics.csv",)],
     "flowpacker1": [("packed_pdbs/*.pdb",)],
     "flowpacker2": [("packed_pdbs/*.pdb",)],
-    "af3score1": [("metrics_items/*.csv", "metrics.csv")],
-    "af3score2": [("metrics_items/*.csv", "metrics.csv")],
-    "af3_refold": [("metrics_items/*.csv", "metrics.csv")],
+    "af3score1": [("metrics_items/*.csv",), ("cif/*.cif",), ("metrics.csv",), ("metrics_ppiflow.csv",), ("filtered_pdbs/*.pdb",)],
+    "af3score2": [("metrics_items/*.csv",), ("cif/*.cif",), ("metrics.csv",), ("metrics_ppiflow.csv",), ("filtered_pdbs/*.pdb",)],
+    "af3_refold": [("metrics_items/*.csv",), ("cif/*.cif",), ("pdbs/*.pdb",), ("metrics.csv",), ("metrics_ppiflow.csv",)],
     "rosetta_interface": [("residue_energy_items/*.csv", "residue_energy.csv")],
     "relax": [("*.pdb",)],
+    "seq2": [("seqs/*.fa*",), ("pdbs/*.pdb",)],
 }
 
 _PARTIAL_OPTIONAL = ["wandb", "yaml", "config.yaml"]
@@ -161,8 +163,8 @@ def _has_pattern(base: Path, pattern: str) -> bool:
     return (base / pattern).exists()
 
 
-def _required_outputs_ready(out_dir: Path, step_name: str) -> bool:
-    required = _REQUIRED_OUTPUTS.get(step_name)
+def _required_outputs_ready(ctx, out_dir: Path, step_name: str) -> bool:
+    required = list(_REQUIRED_OUTPUTS.get(step_name) or [])
     if not required:
         return True
     for group in required:
@@ -298,7 +300,7 @@ def step_cleanup(ctx, step_name: str, step_cfg: dict) -> dict:
         _log_prune(ctx, step_name, "skip reason=work_queue_active", keep_logs=keep_logs)
         return stats
 
-    if mode == "minimal" and not _required_outputs_ready(out_dir, step_name):
+    if mode == "minimal" and not _required_outputs_ready(ctx, out_dir, step_name):
         stats["skipped"] = True
         stats["reason"] = "missing_required_outputs"
         _log_prune(ctx, step_name, "skip reason=missing_required_outputs", keep_logs=keep_logs)

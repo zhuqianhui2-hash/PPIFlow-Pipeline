@@ -104,7 +104,11 @@ class DockQStep(Step):
         out_path = Path(str(output_dir))
         if not out_path.is_absolute():
             out_path = ctx.out_dir / out_path
-        model_name = str((item.payload or {}).get("model_name"))
+        model_name = str((item.payload or {}).get("model_name") or "")
+        if not model_name:
+            raw_id = str(getattr(item, "id", "") or "")
+            base = raw_id.split("__")[-1]
+            model_name = Path(base).stem
         return (out_path / f"{model_name}_dockq_score").exists()
 
     def run_item(self, ctx: StepContext, item: WorkItem) -> None:

@@ -267,6 +267,21 @@ class InterfaceEnrichStep(Step):
             return {0}
         return set()
 
+    def outputs_complete(self, ctx: StepContext) -> bool:
+        out_dir = self._resolve_output_dir_path(ctx)
+        marker = out_dir / "fixed_positions.csv"
+        if not marker.exists():
+            return False
+        meta = self._load_output_meta(ctx)
+        if meta is None:
+            if not self._allow_legacy_outputs(ctx):
+                return False
+            self._warn("missing output metadata; accepting legacy outputs due to explicit reuse")
+        else:
+            if not self._validate_output_meta(ctx, meta):
+                return False
+        return True
+
     def _default_residue_energy_path(self, ctx: StepContext) -> Path:
         run_dir = ctx.out_dir / "output"
         return run_dir / "rosetta_interface" / "residue_energy.csv"

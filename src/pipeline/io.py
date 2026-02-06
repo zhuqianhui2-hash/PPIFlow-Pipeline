@@ -4,7 +4,10 @@ import json
 from pathlib import Path
 from typing import Any
 
-import yaml
+try:
+    import yaml  # type: ignore
+except Exception:  # pragma: no cover
+    yaml = None
 
 
 def ensure_dir(path: str | Path) -> Path:
@@ -30,10 +33,14 @@ def read_json(path: str | Path) -> Any:
 
 
 def write_yaml(path: str | Path, data: Any) -> None:
+    if yaml is None:
+        raise RuntimeError("PyYAML is required for write_yaml()")
     _atomic_write(Path(path), yaml.dump(data, sort_keys=False, default_flow_style=False))
 
 
 def read_yaml(path: str | Path) -> Any:
+    if yaml is None:
+        raise RuntimeError("PyYAML is required for read_yaml()")
     with open(path, "r") as f:
         return yaml.safe_load(f)
 

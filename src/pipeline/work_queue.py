@@ -624,6 +624,25 @@ class WorkQueue:
         finally:
             conn.close()
 
+    def mark_failed_items(self, item_ids: Iterable[str], *, reason: str = "prior failure") -> None:
+        if not self.db_path.exists():
+            return
+        ids = [str(i) for i in item_ids if i]
+        if not ids:
+            return
+        conn = self._connect()
+        now = _iso()
+        try:
+            for idx in range(0, len(ids), 200):
+                chunk = ids[idx : idx + 200]
+                placeholders = ",".join("?" for _ in chunk)
+                conn.execute(
+                    f"UPDATE items SET status='failed', last_error=?, updated_at=? WHERE id IN ({placeholders})",
+                    (str(reason), now, *chunk),
+                )
+        finally:
+            conn.close()
+
     def mark_blocked(self, item_id: str, attempt: int, reason: str) -> None:
         if not self.db_path.exists():
             return

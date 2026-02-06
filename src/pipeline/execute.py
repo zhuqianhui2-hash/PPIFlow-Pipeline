@@ -227,6 +227,7 @@ def execute_pipeline(args) -> None:
         cfg.setdefault("wait_timeout", None)
         cfg.setdefault("allow_reuse", True)
         cfg.setdefault("rebuild_from_outputs", False)
+        cfg.setdefault("explicit_reuse", False)
         if getattr(args, "work_queue", False):
             cfg["enabled"] = True
         if getattr(args, "work_queue_lease_seconds", None) is not None:
@@ -243,6 +244,7 @@ def execute_pipeline(args) -> None:
             cfg["retry_failed"] = True
         if getattr(args, "work_queue_reuse", False):
             cfg["allow_reuse"] = True
+            cfg["explicit_reuse"] = True
         if getattr(args, "work_queue_strict", False):
             cfg["allow_reuse"] = False
         if getattr(args, "work_queue_rebuild", False):

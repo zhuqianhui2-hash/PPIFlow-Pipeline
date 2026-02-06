@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 import csv
+import hashlib
+import json
 import math
 import os
+import re
 import sys
 import threading
 import socket
@@ -12,7 +15,7 @@ from pathlib import Path
 from typing import Any, Iterable, Optional
 
 from ..heartbeat import HeartbeatReporter, start_keepalive
-from ..io import ensure_dir
+from ..io import ensure_dir, write_json
 
 
 @dataclass
@@ -72,6 +75,16 @@ class Step:
     def run_item(self, ctx: StepContext, item: Any) -> None:
         raise NotImplementedError
 
+    def list_items(self, ctx: StepContext, *, readonly: bool = False) -> list[Any]:
+        # Default to build_items; subclasses can override to avoid side effects when readonly.
+        return self.build_items(ctx)
+
+    def outputs_complete(self, ctx: StepContext) -> bool:
+        mode = str(getattr(self, "work_queue_mode", "items") or "items")
+        if mode == "leader":
+            return self._outputs_complete_leader(ctx)
+        return self._outputs_complete_items(ctx)
+
     def _output_wait_params(self, ctx: StepContext) -> tuple[int, float]:
         cfg = ctx.work_queue or {}
         try:
@@ -109,6 +122,211 @@ class Step:
             return len(rows) > 1
         except Exception:
             return False
+
+    def _output_meta_dir(self, ctx: StepContext) -> Optional[Path]:
+        try:
+            return self._resolve_output_dir_path(ctx)
+        except Exception:
+            return None
+
+    def _resolve_output_dir_path(self, ctx: StepContext) -> Path:
+        out_dir = self.cfg.get("output_dir")
+        if not out_dir:
+            raise StepError(f"Step {self.name} missing output_dir in config")
+        p = Path(out_dir)
+        if not p.is_absolute():
+            p = ctx.out_dir / p
+        return p
+
+    def _output_meta_path(self, ctx: StepContext, *, meta_dir: Optional[Path] = None) -> Optional[Path]:
+        base = meta_dir or self._output_meta_dir(ctx)
+        if base is None:
+            return None
+        return base / "step_meta.json"
+
+    def _failed_items_path(self, ctx: StepContext) -> Optional[Path]:
+        base = self._output_meta_dir(ctx)
+        if base is None:
+            return None
+        return base / "failed_items.json"
+
+    def _warn(self, message: str) -> None:
+        print(f"[{self.name}] WARN {message}", file=sys.__stdout__, flush=True)
+
+    def _allow_legacy_outputs(self, ctx: StepContext) -> bool:
+        cfg = ctx.work_queue or {}
+        return bool(cfg.get("explicit_reuse"))
+
+    def _load_output_meta(self, ctx: StepContext, *, meta_dir: Optional[Path] = None) -> Optional[dict]:
+        path = self._output_meta_path(ctx, meta_dir=meta_dir)
+        if path is None or not path.exists():
+            return None
+        try:
+            return json.loads(path.read_text())
+        except Exception:
+            return None
+
+    def _items_ids_hash(self, item_ids: list[str]) -> str:
+        payload = json.dumps(sorted(item_ids), sort_keys=True, separators=(",", ":")).encode()
+        return hashlib.sha256(payload).hexdigest()
+
+    def _safe_item_id(self, raw: str) -> str:
+        raw = str(raw)
+        safe = re.sub(r"[^A-Za-z0-9._-]+", "_", raw).strip("_")
+        if not safe:
+            safe = hashlib.sha256(raw.encode()).hexdigest()[:16]
+        if len(safe) > 128:
+            h = hashlib.sha256(raw.encode()).hexdigest()[:16]
+            safe = safe[:64] + "_" + h
+        return safe
+
+    def _items_hash(self, items: list[Any]) -> str:
+        ids = [str(getattr(item, "id", "")) for item in items]
+        return self._items_ids_hash(ids)
+
+    def _write_output_meta(
+        self,
+        ctx: StepContext,
+        *,
+        items: Optional[list[Any]] = None,
+        meta_dir: Optional[Path] = None,
+    ) -> None:
+        meta_path = self._output_meta_path(ctx, meta_dir=meta_dir)
+        if meta_path is None:
+            return
+        meta = dict(self._work_queue_meta(ctx))
+        meta.setdefault("schema_version", 1)
+        meta["created_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+        if items is not None:
+            try:
+                ids = [str(getattr(item, "id", "")) for item in items]
+                meta["expected_total"] = len(ids)
+                meta["item_ids_hash"] = self._items_ids_hash(ids)
+                meta["item_ids"] = ids
+                meta["items_hash"] = self._items_hash(items)
+            except Exception:
+                pass
+        else:
+            try:
+                meta["expected_total"] = int(self.expected_total(ctx))
+            except Exception:
+                pass
+        try:
+            write_json(meta_path, meta, indent=2)
+        except Exception:
+            pass
+
+    def _validate_output_meta(
+        self,
+        ctx: StepContext,
+        meta: dict,
+        *,
+        meta_dir: Optional[Path] = None,
+        items: Optional[list[Any]] = None,
+    ) -> bool:
+        if not meta:
+            return False
+        current = self._work_queue_meta(ctx)
+        for key in ("input_sha256", "tool_versions", "config_sha256"):
+            if key in meta and current.get(key) is not None:
+                if meta.get(key) != current.get(key):
+                    self._warn(f"output metadata mismatch for {key}")
+                    return False
+        if items is not None:
+            try:
+                ids = [str(getattr(item, "id", "")) for item in items]
+                ids_hash = self._items_ids_hash(ids)
+                if meta.get("item_ids_hash") and meta.get("item_ids_hash") != ids_hash:
+                    self._warn("output metadata item_ids_hash mismatch")
+                    return False
+                if not meta.get("item_ids_hash") and meta.get("items_hash"):
+                    items_hash = self._items_hash(items)
+                    if meta.get("items_hash") != items_hash:
+                        self._warn("output metadata items_hash mismatch")
+                        return False
+                expected = meta.get("expected_total")
+                if expected is not None and int(expected) != len(ids):
+                    self._warn("output metadata expected_total mismatch")
+                    return False
+                meta_ids = meta.get("item_ids")
+                if meta_ids and int(len(meta_ids)) != len(ids):
+                    self._warn("output metadata item_ids length mismatch")
+                    return False
+            except Exception:
+                return False
+        return True
+
+    def _load_failed_items(self, ctx: StepContext) -> set[str]:
+        path = self._failed_items_path(ctx)
+        if path is None or not path.exists():
+            return set()
+        try:
+            payload = json.loads(path.read_text())
+            if isinstance(payload, list):
+                return {str(x) for x in payload}
+        except Exception:
+            return set()
+        return set()
+
+    def _write_failed_items(self, ctx: StepContext, item_ids: list[str]) -> None:
+        path = self._failed_items_path(ctx)
+        if path is None:
+            return
+        try:
+            write_json(path, sorted(set(item_ids)), indent=2)
+        except Exception:
+            pass
+
+    def _outputs_complete_items(self, ctx: StepContext) -> bool:
+        allow_failures = bool((ctx.input_data.get("options") or {}).get("continue_on_item_error"))
+        meta = self._load_output_meta(ctx)
+        if meta is None:
+            if not self._allow_legacy_outputs(ctx):
+                return False
+            self._warn("missing output metadata; accepting legacy outputs due to explicit reuse")
+        items: Optional[list[Any]] = None
+        try:
+            items = self.list_items(ctx, readonly=True)
+        except Exception:
+            items = None
+        if items is None:
+            if meta and isinstance(meta.get("item_ids"), list):
+                try:
+                    from ..work_queue import WorkItem
+
+                    items = [WorkItem(id=str(item_id), payload={}) for item_id in meta.get("item_ids") or []]
+                except Exception:
+                    items = None
+        if items is None:
+            return False
+        if not items:
+            try:
+                expected = int(self.expected_total(ctx))
+            except Exception:
+                expected = 0
+            return expected <= 0
+        if meta is not None:
+            if not self._validate_output_meta(ctx, meta, items=items):
+                return False
+        failed_items = self._load_failed_items(ctx) if allow_failures else set()
+        for item in items:
+            try:
+                if self.item_done(ctx, item):
+                    continue
+            except Exception:
+                return False
+            if allow_failures:
+                raw_id = str(getattr(item, "id", ""))
+                safe_id = self._safe_item_id(raw_id)
+                if raw_id in failed_items or safe_id in failed_items:
+                    continue
+            return False
+        return True
+
+    def _outputs_complete_leader(self, ctx: StepContext) -> bool:
+        raise NotImplementedError(
+            f"{self.name} must implement outputs_complete() for leader-mode steps"
+        )
 
     def ready_outputs(self, ctx: StepContext) -> bool:
         # Prefer verifying item outputs for work-queue items.
@@ -277,14 +495,35 @@ class Step:
 
         worker_id = f"{socket.gethostname()}:{os.getpid()}:{ctx.rank}"
         wq = WorkQueue(ctx.out_dir, self.name, wq_cfg, worker_id=worker_id)
-        items = self.build_items(ctx)
+        rebuild = bool(wq_cfg.get("rebuild_from_outputs"))
+        if not wq.db_path.exists():
+            rebuild = True
+        explicit_reuse = self._allow_legacy_outputs(ctx)
+        items = self.list_items(ctx, readonly=rebuild)
+        meta = None
+        meta_valid = True
+        meta_missing = False
+        if rebuild:
+            meta = self._load_output_meta(ctx)
+            if meta is None:
+                meta_missing = True
+                if explicit_reuse:
+                    self._warn("missing output metadata; accepting legacy outputs due to explicit reuse")
+                else:
+                    # Safer rebuild behavior: we can still rebuild queue.db from promoted per-item outputs
+                    # via item_done(), but the step is not considered complete until metadata is restored.
+                    self._warn("missing output metadata; rebuilding queue from item outputs and re-finalizing")
+                    meta_valid = False
+            else:
+                if not self._validate_output_meta(ctx, meta, items=items):
+                    meta_valid = False
+        trust_outputs = rebuild and (meta_valid or meta_missing)
         try:
-            rebuild = bool(wq_cfg.get("rebuild_from_outputs"))
             wq.init_items(
                 items,
                 self._work_queue_meta(ctx),
                 rebuild=rebuild,
-                item_done_fn=(lambda item: self.item_done(ctx, item)) if rebuild else None,
+                item_done_fn=(lambda item: self.item_done(ctx, item)) if trust_outputs else None,
             )
         except WorkQueueError as exc:
             raise StepError(str(exc)) from exc
@@ -321,6 +560,14 @@ class Step:
 
         allow_failures = bool((ctx.input_data.get("options") or {}).get("continue_on_item_error"))
 
+        if rebuild and allow_failures:
+            failed_ids = list(self._load_failed_items(ctx))
+            if failed_ids:
+                try:
+                    wq.mark_failed_items(failed_ids, reason="prior failure")
+                except Exception:
+                    pass
+
         if counts.get("pending", 0) == 0 and counts.get("running", 0) == 0:
             print(
                 f"[{self.name}] reuse_check expected={expected_total} done={done_count} missing=0 run=0{extra}",
@@ -344,7 +591,7 @@ class Step:
                 raise StepError(
                     f"{self.name} has failed/blocked items; use --retry-failed or --continue-on-error to proceed."
                 )
-            self._maybe_write_manifest(ctx, wq)
+            self._finalize_work_queue_outputs(ctx, wq, items=items, allow_failures=allow_failures)
             return
 
         print(
@@ -559,6 +806,11 @@ class Step:
                         os.environ["PPIFLOW_LOG_PREFIX"] = f"{item.id}:{attempt}"
                         os.environ["PPIFLOW_LOG_PATH"] = str(attempt_log)
                         try:
+                            try:
+                                if isinstance(item.payload, dict):
+                                    item.payload.setdefault("_attempt", attempt)
+                            except Exception:
+                                pass
                             self.run_item(ctx, item)
                         finally:
                             self.cfg["_log_file"] = prev_log
@@ -626,7 +878,8 @@ class Step:
             os.environ.pop("PPIFLOW_WORK_QUEUE_DIR", None)
             os.environ.pop("PPIFLOW_WORK_QUEUE_MODE", None)
 
-        self._maybe_write_manifest(ctx, wq)
+        if success and counts.get("pending", 0) == 0 and counts.get("running", 0) == 0:
+            self._finalize_work_queue_outputs(ctx, wq, items=items, allow_failures=allow_failures)
 
     def _run_work_queue_leader(self, ctx: StepContext, wq_cfg: dict) -> None:
         from ..work_queue import WorkQueue, WorkQueueError
@@ -637,6 +890,25 @@ class Step:
             wq.init_leader(self._work_queue_meta(ctx))
         except WorkQueueError as exc:
             raise StepError(str(exc)) from exc
+
+        try:
+            if self.outputs_complete(ctx):
+                try:
+                    self._write_output_meta(ctx)
+                except Exception:
+                    pass
+                try:
+                    wq.write_complete()
+                except Exception:
+                    pass
+                print(
+                    f"[{self.name}] reuse_check expected={self.expected_total(ctx)} done={self.expected_total(ctx)} missing=0 run=0",
+                    file=sys.__stdout__,
+                    flush=True,
+                )
+                return
+        except Exception:
+            pass
 
         expected_total = self.expected_total(ctx)
         output_rows = None
@@ -726,6 +998,10 @@ class Step:
                         self.write_manifest(ctx)
                 except Exception:
                     pass
+                try:
+                    self._write_output_meta(ctx)
+                except Exception:
+                    pass
                 wq.write_complete()
                 success = True
             except Exception as exc:
@@ -753,21 +1029,48 @@ class Step:
             os.environ.pop("PPIFLOW_WORK_QUEUE_DIR", None)
             os.environ.pop("PPIFLOW_WORK_QUEUE_MODE", None)
 
-    def _maybe_write_manifest(self, ctx: StepContext, wq) -> None:
-        if not self.cfg.get("manifest"):
-            return
+    def _finalize_work_queue_outputs(self, ctx: StepContext, wq, *, items: list[Any], allow_failures: bool) -> None:
+        # Ensure derived outputs exist before writing step_meta.json (strict completion hinges on metadata).
         try:
             counts = wq.counts()
         except Exception:
-            return
-        if counts.get("pending", 0) != 0 or counts.get("running", 0) != 0:
+            counts = None
+        if counts and (counts.get("pending", 0) != 0 or counts.get("running", 0) != 0):
             return
         if not wq.acquire_leader():
             return
         try:
-            self.write_manifest(ctx)
-        except Exception:
-            pass
+            if self.cfg.get("manifest"):
+                try:
+                    self.write_manifest(ctx)
+                except Exception:
+                    pass
+
+            if allow_failures:
+                failed_ids: list[str] = []
+                try:
+                    for work_item, status in wq.iter_items():
+                        if status in {"failed", "blocked"}:
+                            failed_ids.append(str(work_item.id))
+                except Exception:
+                    failed_ids = []
+
+                failed_path = self._failed_items_path(ctx)
+                if failed_path is not None:
+                    if failed_ids:
+                        self._write_failed_items(ctx, failed_ids)
+                    else:
+                        try:
+                            failed_path.unlink()
+                        except FileNotFoundError:
+                            pass
+                        except Exception:
+                            pass
+
+            try:
+                self._write_output_meta(ctx, items=items)
+            except Exception:
+                pass
         finally:
             wq.release_leader()
 

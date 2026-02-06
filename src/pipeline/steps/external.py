@@ -16,11 +16,11 @@ from typing import Any
 import pandas as pd
 
 from .base import Step, StepContext, StepError
-from ..direct_legacy import compute_run_stems, promote_file, promote_tree
+from ..direct_legacy import compute_run_stems, promote_file, promote_file_atomic, promote_tree
 from ..io import collect_pdbs, is_ignored_path
 from ..logging_utils import log_command_progress, run_command
 from ..manifests import build_name_map, extract_design_id, find_metrics_file, structure_id_from_name, write_csv
-from ..output_policy import is_minimal, step_scratch_dir
+from ..output_policy import is_minimal, mode as output_mode, optional_dir, should_keep, step_scratch_dir
 from ..work_queue import WorkItem
 
 
@@ -325,6 +325,12 @@ class SeqDesignStep(ExternalCommandStep):
         if not vanilla_files and not bias_files:
             return
 
+        def _atomic_write_text(path: Path, content: str) -> None:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = path.parent / f".tmp.{path.name}.{os.getpid()}.{threading.get_ident()}"
+            tmp.write_text(content)
+            os.replace(tmp, path)
+
         for fasta in vanilla_files:
             name = fasta.name
             lines = []
@@ -338,7 +344,7 @@ class SeqDesignStep(ExternalCommandStep):
                     if line.startswith(">"):
                         line = f"{line}|bias"
                     lines.append(line)
-            (seq_dir / name).write_text("\n".join(lines) + "\n")
+            _atomic_write_text(seq_dir / name, "\n".join(lines) + "\n")
         # Handle bias-only files
         for fasta in bias_files:
             name = fasta.name
@@ -349,54 +355,81 @@ class SeqDesignStep(ExternalCommandStep):
                 if line.startswith(">"):
                     line = f"{line}|bias"
                 lines.append(line)
-            (seq_dir / name).write_text("\n".join(lines) + "\n")
+            _atomic_write_text(seq_dir / name, "\n".join(lines) + "\n")
 
     def _collect_pdbs(self, ctx: StepContext, input_dir: Path) -> list[Path]:
         pdbs = collect_pdbs(input_dir)
         protocol = ctx.input_data.get("protocol")
         if protocol in {"antibody", "vhh"} and str(self.cfg.get("name") or "") == "seq1":
             metrics_path = input_dir / "sample_metrics.csv"
-            if not metrics_path.exists():
-                raise StepError(f"Missing sample_metrics.csv for CDR interface prefilter at {metrics_path}")
+            df = None
+            if metrics_path.exists():
+                try:
+                    df = pd.read_csv(metrics_path)
+                except Exception:
+                    df = None
+                else:
+                    if "cdr_interface_ratio" not in df.columns or "pdb_path" not in df.columns:
+                        df = None
+
+            if df is not None:
+                try:
+                    df = df[df["cdr_interface_ratio"].astype(float) >= 0.6]
+                except Exception:
+                    df = df[df["cdr_interface_ratio"] >= 0.6]
+                if df.empty:
+                    raise StepError("No backbones pass cdr_interface_ratio >= 0.6")
+                filtered: list[Path] = []
+                for path_val in df["pdb_path"].tolist():
+                    if not path_val:
+                        continue
+                    cand = Path(str(path_val))
+                    if not cand.is_absolute():
+                        cand = (input_dir / cand).resolve()
+                    if cand.exists():
+                        # Prefer paths under the input_dir to keep run_stem resolution stable.
+                        try:
+                            cand.relative_to(input_dir)
+                        except Exception:
+                            alt = input_dir / cand.name
+                            if alt.exists():
+                                cand = alt
+                        filtered.append(cand)
+                        continue
+                    # Fallback for moved outputs: try input_dir/<name>.pdb
+                    alt = input_dir / Path(str(path_val)).name
+                    if alt.exists():
+                        filtered.append(alt)
+                        continue
+                    alt = input_dir / f"{Path(str(path_val)).stem}.pdb"
+                    if alt.exists():
+                        filtered.append(alt)
+                if not filtered:
+                    raise StepError("No backbone PDBs found after cdr_interface_ratio prefilter")
+                return filtered
+
+            # Output-first robustness: if sample_metrics.csv is missing/corrupt, recompute the
+            # single metric we need (cdr_interface_ratio) directly from the on-disk PDBs.
+            framework = ctx.input_data.get("framework") or {}
+            heavy_chain = str(framework.get("heavy_chain") or "A")
+            light_chain = str(framework.get("light_chain") or "")
             try:
-                df = pd.read_csv(metrics_path)
-            except Exception as exc:
-                raise StepError(f"Failed to read {metrics_path}: {exc}") from exc
-            if "cdr_interface_ratio" not in df.columns or "pdb_path" not in df.columns:
-                raise StepError("sample_metrics.csv missing cdr_interface_ratio or pdb_path columns")
-            try:
-                df = df[df["cdr_interface_ratio"].astype(float) >= 0.6]
-            except Exception:
-                df = df[df["cdr_interface_ratio"] >= 0.6]
-            if df.empty:
-                raise StepError("No backbones pass cdr_interface_ratio >= 0.6")
+                from analysis.antibody_metric import get_interface_residues
+            except Exception as exc:  # pragma: no cover
+                raise StepError(
+                    f"Missing or invalid {metrics_path} for CDR interface prefilter and failed to compute it from PDBs: {exc}"
+                ) from exc
+
             filtered: list[Path] = []
-            for path_val in df["pdb_path"].tolist():
-                if not path_val:
-                    continue
-                cand = Path(str(path_val))
-                if not cand.is_absolute():
-                    cand = (input_dir / cand).resolve()
-                if cand.exists():
-                    # Prefer paths under the input_dir to keep run_stem resolution stable.
-                    try:
-                        cand.relative_to(input_dir)
-                    except Exception:
-                        alt = input_dir / cand.name
-                        if alt.exists():
-                            cand = alt
-                    filtered.append(cand)
-                    continue
-                # Fallback for moved outputs: try input_dir/<name>.pdb
-                alt = input_dir / Path(str(path_val)).name
-                if alt.exists():
-                    filtered.append(alt)
-                    continue
-                alt = input_dir / f"{Path(str(path_val)).stem}.pdb"
-                if alt.exists():
-                    filtered.append(alt)
+            for pdb_path in pdbs:
+                try:
+                    _, _, ratio = get_interface_residues(str(pdb_path), 10, heavy_chain, light_chain)
+                except Exception:
+                    ratio = 0.0
+                if float(ratio) >= 0.6:
+                    filtered.append(pdb_path)
             if not filtered:
-                raise StepError("No backbone PDBs found after cdr_interface_ratio prefilter")
+                raise StepError("No backbones pass cdr_interface_ratio >= 0.6")
             return filtered
         return pdbs
 
@@ -439,8 +472,6 @@ class SeqDesignStep(ExternalCommandStep):
             input_path = ctx.out_dir / input_path
         if not input_path.exists():
             raise StepError(f"Input dir not found: {input_path}")
-        out_dir = self.output_dir(ctx)
-
         pdbs = self._collect_pdbs(ctx, input_path)
         if not pdbs:
             raise StepError(f"No PDBs found for sequence design in {input_path}")
@@ -569,11 +600,8 @@ class SeqDesignStep(ExternalCommandStep):
         pdbs_dir = out_dir / "pdbs"
         pdbs_dir.mkdir(parents=True, exist_ok=True)
         legacy_pdb = pdbs_dir / f"{run_stem}.pdb"
-        if not legacy_pdb.exists():
-            try:
-                os.link(pdb_path, legacy_pdb)
-            except OSError:
-                shutil.copy2(pdb_path, legacy_pdb)
+        allow_reuse = bool((ctx.work_queue or {}).get("allow_reuse", True))
+        promote_file_atomic(pdb_path, legacy_pdb, allow_reuse=allow_reuse)
         tmp_pdb = item_tmp / f"{run_stem}.pdb"
         if not tmp_pdb.exists():
             try:
@@ -651,7 +679,7 @@ class SeqDesignStep(ExternalCommandStep):
                 seq_dst = out_dir / "seqs"
                 seq_dst.mkdir(parents=True, exist_ok=True)
                 for fp in seq_src.glob("*.fa*"):
-                    promote_file(fp, seq_dst / fp.name, allow_reuse=bool((ctx.work_queue or {}).get("allow_reuse", True)))
+                    promote_file_atomic(fp, seq_dst / fp.name, allow_reuse=allow_reuse)
         shutil.rmtree(item_tmp, ignore_errors=True)
 
     def run_batch(self, ctx: StepContext, items: list[WorkItem]) -> dict[str, tuple[str, str | None]]:
@@ -710,11 +738,8 @@ class SeqDesignStep(ExternalCommandStep):
             pdbs_dir = out_dir / "pdbs"
             pdbs_dir.mkdir(parents=True, exist_ok=True)
             legacy_pdb = pdbs_dir / f"{run_stem}.pdb"
-            if not legacy_pdb.exists():
-                try:
-                    os.link(pdb_path, legacy_pdb)
-                except OSError:
-                    shutil.copy2(pdb_path, legacy_pdb)
+            allow_reuse = bool((ctx.work_queue or {}).get("allow_reuse", True))
+            promote_file_atomic(pdb_path, legacy_pdb, allow_reuse=allow_reuse)
             tmp_pdb = pdb_dir / f"{run_stem}.pdb"
             if not tmp_pdb.exists():
                 try:
@@ -887,7 +912,7 @@ class SeqDesignStep(ExternalCommandStep):
                     seq_dst = out_dir / "seqs"
                     seq_dst.mkdir(parents=True, exist_ok=True)
                     for fp in seq_src.glob("*.fa*"):
-                        promote_file(
+                        promote_file_atomic(
                             fp,
                             seq_dst / fp.name,
                             allow_reuse=bool((ctx.work_queue or {}).get("allow_reuse", True)),
@@ -1290,6 +1315,9 @@ class FlowPackerStep(ExternalCommandStep):
         return str((root / p).resolve())
 
     def build_items(self, ctx: StepContext) -> list[WorkItem]:
+        return self.list_items(ctx, readonly=False)
+
+    def list_items(self, ctx: StepContext, *, readonly: bool = False) -> list[WorkItem]:
         cfg = self._flowpacker_config()
         input_pdb_dir = self._resolve_path(ctx, cfg.get("input_pdb_dir")) if cfg else None
         seq_fasta_dir = self._resolve_path(ctx, cfg.get("seq_fasta_dir")) if cfg else None
@@ -1300,18 +1328,21 @@ class FlowPackerStep(ExternalCommandStep):
                 if alt_root.exists():
                     alt_pdbs = collect_pdbs(alt_root)
                     if alt_pdbs:
-                        stage_dir = ctx.out_dir / "output" / "seqs_round2" / "pdbs"
-                        stage_dir.mkdir(parents=True, exist_ok=True)
-                        run_stems = compute_run_stems(alt_pdbs, alt_root)
-                        for pdb_path in alt_pdbs:
-                            run_stem = run_stems[pdb_path]
-                            dst = stage_dir / f"{run_stem}.pdb"
-                            if not dst.exists():
-                                try:
-                                    os.link(pdb_path, dst)
-                                except OSError:
-                                    shutil.copy2(pdb_path, dst)
-                        input_pdb_dir = stage_dir
+                        if readonly:
+                            input_pdb_dir = alt_root
+                        else:
+                            stage_dir = ctx.out_dir / "output" / "seqs_round2" / "pdbs"
+                            stage_dir.mkdir(parents=True, exist_ok=True)
+                            run_stems = compute_run_stems(alt_pdbs, alt_root)
+                            for pdb_path in alt_pdbs:
+                                run_stem = run_stems[pdb_path]
+                                dst = stage_dir / f"{run_stem}.pdb"
+                                if not dst.exists():
+                                    try:
+                                        os.link(pdb_path, dst)
+                                    except OSError:
+                                        shutil.copy2(pdb_path, dst)
+                            input_pdb_dir = stage_dir
             if not input_pdb_dir or not input_pdb_dir.exists():
                 raise StepError("flowpacker input_pdb_dir missing or invalid")
         if not seq_fasta_dir or not seq_fasta_dir.exists():
@@ -1734,37 +1765,29 @@ class AF3ScoreStep(ExternalCommandStep):
                         pass
 
     def build_items(self, ctx: StepContext) -> list[WorkItem]:
+        return self.list_items(ctx, readonly=False)
+
+    def list_items(self, ctx: StepContext, *, readonly: bool = False) -> list[WorkItem]:
+        _ = readonly  # list_items must be read-only for rebuild/output checks.
         cfg = self._af3score_config()
-        input_pdb_dir = self._resolve_path(ctx, cfg.get("input_pdb_dir")) if cfg else None
-        if not input_pdb_dir or not input_pdb_dir.exists():
-            raise StepError("af3score input_pdb_dir missing or invalid")
+        input_dir = self.cfg.get("input_dir") or (cfg.get("input_pdb_dir") if cfg else None)
+        if not input_dir:
+            raise StepError("af3score input_dir missing or invalid")
+        input_pdb_dir = Path(str(input_dir))
+        if not input_pdb_dir.is_absolute():
+            input_pdb_dir = ctx.out_dir / input_pdb_dir
+        if not input_pdb_dir.exists():
+            raise StepError(f"af3score input_dir missing or invalid: {input_pdb_dir}")
         input_pdb_dir = self._resolve_input_dir(input_pdb_dir)
 
         pdbs = collect_pdbs(input_pdb_dir)
         if not pdbs:
             raise StepError(f"No PDBs found for af3score in {input_pdb_dir}")
-
-        out_dir = self.output_dir(ctx)
-        metrics_pdb_dir = out_dir / "metrics_pdbs"
-        metrics_pdb_dir.mkdir(parents=True, exist_ok=True)
         run_stems = compute_run_stems(pdbs, input_pdb_dir)
 
         items: list[WorkItem] = []
-        allow_reuse = bool((ctx.work_queue or {}).get("allow_reuse", True))
         for pdb_path in pdbs:
             run_stem = run_stems[pdb_path]
-            dst = metrics_pdb_dir / f"{run_stem}.pdb"
-            if allow_reuse:
-                try:
-                    promote_file(pdb_path, dst, allow_reuse=allow_reuse)
-                except Exception as exc:
-                    print(
-                        f"[af3score] WARN reuse collision at {dst}: {exc}",
-                        file=sys.__stdout__,
-                        flush=True,
-                    )
-            else:
-                promote_file(pdb_path, dst, allow_reuse=allow_reuse)
             items.append(
                 WorkItem(
                     id=run_stem,
@@ -1779,9 +1802,9 @@ class AF3ScoreStep(ExternalCommandStep):
 
     def item_done(self, ctx: StepContext, item: WorkItem) -> bool:
         out_dir = self.output_dir(ctx)
-        metrics_items = out_dir / "metrics_items"
-        metrics_path = metrics_items / f"{item.id}.csv"
-        return metrics_path.exists()
+        metrics_path = out_dir / "metrics_items" / f"{item.id}.csv"
+        cif_path = out_dir / "cif" / f"{item.id}.cif"
+        return metrics_path.exists() and cif_path.exists()
 
     def run_item(self, ctx: StepContext, item: WorkItem) -> None:
         cfg = self._af3score_config()
@@ -1796,26 +1819,21 @@ class AF3ScoreStep(ExternalCommandStep):
         if not pdb_path.exists():
             raise FileNotFoundError(f"PDB not found: {pdb_path}")
 
-        out_dir = self.output_dir(ctx)
-        item_dir = out_dir / ".tmp" / item.id
-        item_dir.mkdir(parents=True, exist_ok=True)
-        item_out = item_dir
-
-        # Write per-item batch yaml for provenance.
-        yaml_path = item_dir / "input.yaml"
         run_stem = str((item.payload or {}).get("run_stem") or pdb_path.stem)
-        tmp_pdb = item_dir / f"{run_stem}.pdb"
+        try:
+            attempt = int((item.payload or {}).get("_attempt") or 1)
+        except Exception:
+            attempt = 1
+
+        step_name = str(self.cfg.get("name") or self.name)
+        scratch_root = step_scratch_dir(ctx, step_name) / f"attempt_{attempt}" / "items" / item.id
+        scratch_root.mkdir(parents=True, exist_ok=True)
+        tmp_pdb = scratch_root / f"{run_stem}.pdb"
         if not tmp_pdb.exists():
             try:
                 os.link(pdb_path, tmp_pdb)
             except OSError:
                 shutil.copy2(pdb_path, tmp_pdb)
-        try:
-            import yaml
-
-            yaml_path.write_text(yaml.safe_dump({"input_pdb": str(tmp_pdb)}, sort_keys=False))
-        except Exception:
-            yaml_path.write_text(json.dumps({"input_pdb": str(tmp_pdb)}) + "\n")
 
         script = None
         cmd_cfg = self.cfg.get("command") or []
@@ -1834,7 +1852,7 @@ class AF3ScoreStep(ExternalCommandStep):
             "--input_pdb",
             str(tmp_pdb),
             "--output_dir",
-            str(item_out),
+            str(scratch_root),
             "--af3score_repo",
             str(af3_repo),
             "--model_dir",
@@ -1863,14 +1881,6 @@ class AF3ScoreStep(ExternalCommandStep):
             cmd.append("--write_best_model_root")
         if cfg.get("write_ranking_scores_csv"):
             cmd.append("--write_ranking_scores_csv")
-        if cfg.get("export_pdb_dir") is not None:
-            cmd.extend(["--export_pdb_dir", str(item_out / "pdbs")])
-        export_cif_dir = cfg.get("export_cif_dir")
-        if export_cif_dir is None:
-            export_cif_dir = str(out_dir / "cif")
-        export_cif_path = self._resolve_path(ctx, str(export_cif_dir)) if export_cif_dir else None
-        if export_cif_path:
-            cmd.extend(["--export_cif_dir", str(export_cif_path)])
         if cfg.get("target_offsets_json"):
             offsets_path = self._resolve_path(ctx, cfg.get("target_offsets_json"))
             if offsets_path:
@@ -1881,27 +1891,69 @@ class AF3ScoreStep(ExternalCommandStep):
         run_command(
             cmd,
             env=os.environ.copy(),
-            cwd=str(item_dir),
+            cwd=str(scratch_root),
             log_file=self.cfg.get("_log_file"),
             verbose=bool(self.cfg.get("_verbose")),
         )
 
+        def _best_job_cif(job_dir: Path, job_name: str) -> Path | None:
+            cand = job_dir / f"{job_name}_model.cif"
+            if cand.exists():
+                return cand
+            seed_cifs = sorted(job_dir.glob("seed-*/*/model.cif"))
+            if not seed_cifs:
+                seed_cifs = sorted(job_dir.glob("seed-*/model.cif"))
+            if seed_cifs:
+                return seed_cifs[0]
+            return None
+
         allow_reuse = bool((ctx.work_queue or {}).get("allow_reuse", True))
-        for sub in [
-            "af3score_outputs",
-            "single_chain_cif",
-            "json",
-            "af3_input_batch",
-            "pdbs",
-            "af3score_subprocess_logs",
-        ]:
-            promote_tree(item_out / sub, out_dir / sub, allow_reuse=allow_reuse)
+        out_dir = self.output_dir(ctx)
         metrics_items = out_dir / "metrics_items"
         metrics_items.mkdir(parents=True, exist_ok=True)
-        metrics_src = item_out / "metrics.csv"
-        if metrics_src.exists():
-            promote_file(metrics_src, metrics_items / f"{item.id}.csv", allow_reuse=allow_reuse)
-        shutil.rmtree(item_dir, ignore_errors=True)
+        metrics_src = scratch_root / "metrics.csv"
+        if not metrics_src.exists():
+            raise StepError(f"Missing metrics.csv for {item.id} at {metrics_src}")
+        promote_file_atomic(metrics_src, metrics_items / f"{item.id}.csv", allow_reuse=allow_reuse)
+
+        job_dir = scratch_root / "af3score_outputs" / run_stem
+        cif_src = _best_job_cif(job_dir, run_stem)
+        if cif_src is None or not cif_src.exists():
+            raise StepError(f"Missing CIF output for {item.id} under {job_dir}")
+        cif_dir = out_dir / "cif"
+        cif_dir.mkdir(parents=True, exist_ok=True)
+        promote_file_atomic(cif_src, cif_dir / f"{item.id}.cif", allow_reuse=allow_reuse)
+
+        # Optional retention: copy heavy/raw runner outputs under output/_optional/... (never required for resume).
+        try:
+            keep_all = output_mode(ctx) == "full"
+        except Exception:
+            keep_all = False
+        if keep_all or any(should_keep(ctx, k) for k in ["af3score_outputs", "af3_input_batch", "single_chain_cif", "json", "pdbs", "af3score_subprocess_logs"]):
+            try:
+                opt_root = optional_dir(ctx) / out_dir.name
+                raw_root = opt_root / "raw"
+                logs_root = opt_root / "logs"
+                raw_keys = ["af3score_outputs", "af3_input_batch", "single_chain_cif", "json", "pdbs", "input_pdbs"]
+                log_keys = ["af3score_subprocess_logs"]
+                for key in raw_keys:
+                    if not (keep_all or should_keep(ctx, key)):
+                        continue
+                    try:
+                        promote_tree(scratch_root / key, raw_root / key, allow_reuse=True)
+                    except Exception:
+                        pass
+                for key in log_keys:
+                    if not (keep_all or should_keep(ctx, key)):
+                        continue
+                    try:
+                        promote_tree(scratch_root / key, logs_root / key, allow_reuse=True)
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+
+        shutil.rmtree(scratch_root, ignore_errors=True)
 
     def run_batch(self, ctx: StepContext, items: list[WorkItem]) -> dict[str, tuple[str, str | None]]:
         cfg = self._af3score_config()
@@ -1912,9 +1964,16 @@ class AF3ScoreStep(ExternalCommandStep):
         if not model_dir or not model_dir.exists():
             raise StepError("model_dir missing or invalid")
 
-        out_dir = self.output_dir(ctx)
+        attempts: list[int] = []
+        for it in items:
+            try:
+                attempts.append(int((it.payload or {}).get("_attempt") or 1))
+            except Exception:
+                attempts.append(1)
+        batch_attempt = max(attempts) if attempts else 1
         batch_id = items[0].id if items else "batch"
-        batch_dir = out_dir / ".tmp" / f"batch_{batch_id}"
+        step_name = str(self.cfg.get("name") or self.name)
+        batch_dir = step_scratch_dir(ctx, step_name) / f"attempt_{batch_attempt}" / "batches" / f"batch_{batch_id}"
         batch_dir.mkdir(parents=True, exist_ok=True)
         input_dir = batch_dir / "input_pdbs"
         input_dir.mkdir(parents=True, exist_ok=True)
@@ -1987,14 +2046,6 @@ class AF3ScoreStep(ExternalCommandStep):
             cmd.append("--write_best_model_root")
         if cfg.get("write_ranking_scores_csv"):
             cmd.append("--write_ranking_scores_csv")
-        if cfg.get("export_pdb_dir") is not None:
-            cmd.extend(["--export_pdb_dir", str(batch_dir / "pdbs")])
-        export_cif_dir = cfg.get("export_cif_dir")
-        if export_cif_dir is None:
-            export_cif_dir = str(out_dir / "cif")
-        export_cif_path = self._resolve_path(ctx, str(export_cif_dir)) if export_cif_dir else None
-        if export_cif_path:
-            cmd.extend(["--export_cif_dir", str(export_cif_path)])
         if cfg.get("target_offsets_json"):
             offsets_path = self._resolve_path(ctx, cfg.get("target_offsets_json"))
             if offsets_path:
@@ -2003,9 +2054,11 @@ class AF3ScoreStep(ExternalCommandStep):
             cmd.extend(["--target_chain", str(cfg.get("target_chain"))])
 
         allow_reuse = bool((ctx.work_queue or {}).get("allow_reuse", True))
+        out_dir = self.output_dir(ctx)
         metrics_items = out_dir / "metrics_items"
         metrics_items.mkdir(parents=True, exist_ok=True)
-        metrics_pdbs = out_dir / "metrics_pdbs"
+        cif_dir = out_dir / "cif"
+        cif_dir.mkdir(parents=True, exist_ok=True)
 
         def _norm_name(value: str) -> str:
             norm = str(value).strip().lower()
@@ -2038,23 +2091,24 @@ class AF3ScoreStep(ExternalCommandStep):
         python_cmd = _resolve_af3_python()
         get_metrics = af3_repo / "04_get_metrics.py"
 
+        def _best_job_cif(job_dir: Path, job_name: str) -> Path | None:
+            cand = job_dir / f"{job_name}_model.cif"
+            if cand.exists():
+                return cand
+            seed_cifs = sorted(job_dir.glob("seed-*/*/model.cif"))
+            if not seed_cifs:
+                seed_cifs = sorted(job_dir.glob("seed-*/model.cif"))
+            if seed_cifs:
+                return seed_cifs[0]
+            return None
+
         def _job_complete(job_dir: Path, job_name: str) -> bool:
-            if (job_dir / f"{job_name}_model.cif").exists():
-                return True
-            if list(job_dir.glob("seed-*/model.cif")):
-                return True
-            if list(job_dir.glob("seed-*/*/model.cif")):
-                return True
-            return False
+            return _best_job_cif(job_dir, job_name) is not None
 
         def _input_pdb_for_job(job_name: str, item: WorkItem) -> Path | None:
             cand = input_dir / f"{job_name}.pdb"
             if cand.exists():
                 return cand
-            if metrics_pdbs.exists():
-                cand = metrics_pdbs / f"{job_name}.pdb"
-                if cand.exists():
-                    return cand
             raw_path = (item.payload or {}).get("pdb_path")
             if raw_path:
                 path = Path(str(raw_path))
@@ -2062,18 +2116,17 @@ class AF3ScoreStep(ExternalCommandStep):
                     return path
             return None
 
-        def _promote_job_outputs(job_name: str, job_dir: Path) -> bool:
+        def _promote_cif_for_job(job_name: str, job_dir: Path, item: WorkItem) -> bool:
+            dst = cif_dir / f"{item.id}.cif"
+            if dst.exists():
+                return True
+            cif_src = _best_job_cif(job_dir, job_name)
+            if cif_src is None or not cif_src.exists():
+                return False
             try:
-                promote_tree(job_dir, out_dir / "af3score_outputs" / job_name, allow_reuse=allow_reuse)
+                promote_file_atomic(cif_src, dst, allow_reuse=allow_reuse)
             except Exception:
-                if not allow_reuse:
-                    return False
-            for sub in ["single_chain_cif", "json", "pdbs"]:
-                src_dir = batch_dir / sub
-                if not src_dir.exists():
-                    continue
-                for fp in src_dir.glob(f"{job_name}*"):
-                    promote_file(fp, out_dir / sub / fp.name, allow_reuse=allow_reuse)
+                return False
             return True
 
         def _write_metrics_for_job(job_name: str, job_dir: Path, input_pdb: Path, item: WorkItem) -> bool:
@@ -2123,7 +2176,7 @@ class AF3ScoreStep(ExternalCommandStep):
             if not metrics_csv.exists():
                 return False
             try:
-                promote_file(metrics_csv, metrics_items / f"{item.id}.csv", allow_reuse=allow_reuse)
+                promote_file_atomic(metrics_csv, metrics_items / f"{item.id}.csv", allow_reuse=allow_reuse)
             except Exception:
                 return False
             shutil.rmtree(tmp_root, ignore_errors=True)
@@ -2131,7 +2184,6 @@ class AF3ScoreStep(ExternalCommandStep):
 
         committed: set[str] = set()
         commit_lock = threading.Lock()
-        strict_collision = False
 
         from ..work_queue import WorkQueue
 
@@ -2155,13 +2207,10 @@ class AF3ScoreStep(ExternalCommandStep):
                     pass
 
         def _commit_job(job_name: str, job_dir: Path) -> bool:
-            item = item_by_stem.get(job_name)
-            if item is None:
-                item = item_by_norm.get(_norm_name(job_name))
+            item = item_by_stem.get(job_name) or item_by_norm.get(_norm_name(job_name))
             if not item:
                 return False
-            metrics_path = metrics_items / f"{item.id}.csv"
-            if metrics_path.exists():
+            if (metrics_items / f"{item.id}.csv").exists() and (cif_dir / f"{item.id}.cif").exists():
                 committed.add(job_name)
                 _mark_done(item)
                 return True
@@ -2173,35 +2222,15 @@ class AF3ScoreStep(ExternalCommandStep):
             with commit_lock:
                 if job_name in committed:
                     return True
-                if not _promote_job_outputs(job_name, job_dir):
-                    if not allow_reuse:
-                        return False
-                if _write_metrics_for_job(job_name, job_dir, input_pdb, item):
+                if not _promote_cif_for_job(job_name, job_dir, item):
+                    return False
+                if not _write_metrics_for_job(job_name, job_dir, input_pdb, item):
+                    return False
+                if self.item_done(ctx, item):
                     committed.add(job_name)
                     _mark_done(item)
                     return True
             return False
-
-        def _reconcile_existing_outputs() -> None:
-            af3_out = out_dir / "af3score_outputs"
-            if not af3_out.exists():
-                return
-            for job_dir in af3_out.iterdir():
-                if not job_dir.is_dir():
-                    continue
-                job_name = job_dir.name
-                item = item_by_stem.get(job_name) or item_by_norm.get(_norm_name(job_name))
-                if not item:
-                    continue
-                if (metrics_items / f"{item.id}.csv").exists():
-                    committed.add(job_name)
-                    _mark_done(item)
-                    continue
-                if _job_complete(job_dir, job_name):
-                    input_pdb = _input_pdb_for_job(job_name, item)
-                    if input_pdb and _write_metrics_for_job(job_name, job_dir, input_pdb, item):
-                        committed.add(job_name)
-                        _mark_done(item)
 
         def _scan_batch_outputs(max_per_pass: int | None = None) -> None:
             af3_dir = batch_dir / "af3score_outputs"
@@ -2232,7 +2261,6 @@ class AF3ScoreStep(ExternalCommandStep):
                 except Exception:
                     pass
 
-        _reconcile_existing_outputs()
         commit_thread = threading.Thread(target=_commit_loop, daemon=True)
         commit_thread.start()
 
@@ -2253,22 +2281,7 @@ class AF3ScoreStep(ExternalCommandStep):
         commit_thread.join(timeout=2.0)
         _scan_batch_outputs()
 
-        for sub in [
-            "af3score_outputs",
-            "single_chain_cif",
-            "json",
-            "af3_input_batch",
-            "pdbs",
-            "af3score_subprocess_logs",
-        ]:
-            try:
-                promote_tree(batch_dir / sub, out_dir / sub, allow_reuse=allow_reuse)
-            except Exception as exc:
-                if err is None:
-                    err = str(exc)
-                if not allow_reuse:
-                    strict_collision = True
-
+        # Fallback: split wrapper metrics.csv into per-item shards if any are missing.
         metrics_src = batch_dir / "metrics.csv"
         if metrics_src.exists():
             try:
@@ -2291,36 +2304,82 @@ class AF3ScoreStep(ExternalCommandStep):
                             mask = series_norm == run_stem_norm
                             if mask.any():
                                 break
-                    if mask is None or not mask.any():
-                        for col in df.columns:
-                            if df[col].dtype == object:
-                                series = df[col].astype(str)
-                                series_norm = series.str.lower()
-                                series_norm = series_norm.str.removesuffix(".pdb")
-                                mask = series_norm == run_stem_norm
-                                if mask.any():
-                                    break
                     if mask is not None and mask.any():
-                        df.loc[mask].to_csv(metrics_items / f"{item.id}.csv", index=False)
+                        tmp = batch_dir / f".metrics_item.{item.id}.csv"
+                        try:
+                            df.loc[mask].to_csv(tmp, index=False)
+                            promote_file_atomic(tmp, metrics_items / f"{item.id}.csv", allow_reuse=allow_reuse)
+                        finally:
+                            try:
+                                tmp.unlink()
+                            except Exception:
+                                pass
                     elif len(valid_items) == 1:
-                        df.to_csv(metrics_items / f"{item.id}.csv", index=False)
+                        tmp = batch_dir / f".metrics_item.{item.id}.csv"
+                        try:
+                            df.to_csv(tmp, index=False)
+                            promote_file_atomic(tmp, metrics_items / f"{item.id}.csv", allow_reuse=allow_reuse)
+                        finally:
+                            try:
+                                tmp.unlink()
+                            except Exception:
+                                pass
             except Exception:
                 pass
 
-        if err is None:
+        # Finalize CIF promotion for any remaining items.
+        af3_dir = batch_dir / "af3score_outputs"
+        if af3_dir.exists():
+            for item in valid_items:
+                if (cif_dir / f"{item.id}.cif").exists():
+                    continue
+                run_stem = str((item.payload or {}).get("run_stem") or item.id)
+                job_dir = af3_dir / run_stem
+                if job_dir.exists():
+                    _promote_cif_for_job(run_stem, job_dir, item)
+
+        all_done = all(self.item_done(ctx, item) for item in valid_items)
+        if all_done:
+            # Optional retention: copy heavy/raw runner outputs under output/_optional/... (never required for resume).
+            try:
+                keep_all = output_mode(ctx) == "full"
+            except Exception:
+                keep_all = False
+            if keep_all or any(should_keep(ctx, k) for k in ["af3score_outputs", "af3_input_batch", "single_chain_cif", "json", "pdbs", "af3score_subprocess_logs"]):
+                try:
+                    opt_root = optional_dir(ctx) / out_dir.name
+                    raw_root = opt_root / "raw"
+                    logs_root = opt_root / "logs"
+                    raw_keys = ["af3score_outputs", "af3_input_batch", "single_chain_cif", "json", "pdbs", "input_pdbs"]
+                    log_keys = ["af3score_subprocess_logs"]
+                    for key in raw_keys:
+                        if not (keep_all or should_keep(ctx, key)):
+                            continue
+                        try:
+                            promote_tree(batch_dir / key, raw_root / key, allow_reuse=True)
+                        except Exception:
+                            pass
+                    for key in log_keys:
+                        if not (keep_all or should_keep(ctx, key)):
+                            continue
+                        try:
+                            promote_tree(batch_dir / key, logs_root / key, allow_reuse=True)
+                        except Exception:
+                            pass
+                except Exception:
+                    pass
             shutil.rmtree(batch_dir, ignore_errors=True)
 
         for item in valid_items:
-            if strict_collision:
-                results[item.id] = ("failed", err or "collision")
-            elif self.item_done(ctx, item):
+            if self.item_done(ctx, item):
                 results[item.id] = ("done", None)
             else:
-                results[item.id] = ("failed", err or "missing metrics output")
+                results[item.id] = ("failed", err or "missing output")
         return results
 
     def write_manifest(self, ctx: StepContext) -> None:
         out_dir = self.output_dir(ctx)
+
         df = None
         metrics_items = out_dir / "metrics_items"
         if metrics_items.exists():
@@ -2328,35 +2387,45 @@ class AF3ScoreStep(ExternalCommandStep):
             if metrics_paths:
                 try:
                     df = pd.concat([pd.read_csv(p) for p in metrics_paths], ignore_index=True)
-                    try:
-                        df.to_csv(out_dir / "metrics.csv", index=False)
-                    except Exception:
-                        pass
                 except Exception:
                     df = None
-
         if df is None:
             metrics_path = find_metrics_file(out_dir)
             if not metrics_path:
                 return
             df = pd.read_csv(metrics_path)
-        # Prefer the FlowPacker inputs captured for metrics to avoid AF3Score CIF->PDB issues.
-        metrics_pdb_dir = out_dir / "metrics_pdbs"
-        step_label = str(self.cfg.get("name") or self.name)
-        try:
-            name_map = build_name_map(metrics_pdb_dir)
-        except Exception as exc:
-            print(
-                f"[{step_label}] WARN failed to scan metrics_pdbs at {metrics_pdb_dir}: {exc}",
-                flush=True,
-            )
-            name_map = {}
-        if not name_map:
-            print(
-                f"[{step_label}] WARN no PDBs found in {metrics_pdb_dir}; "
-                "AF3Score rows will have missing pdb_path values.",
-                flush=True,
-            )
+
+        # Consolidated metrics.csv (atomic write)
+        metrics_csv = out_dir / "metrics.csv"
+        tmp_metrics = metrics_csv.parent / f"{metrics_csv.name}.tmp"
+        df.to_csv(tmp_metrics, index=False)
+        os.replace(tmp_metrics, metrics_csv)
+
+        # Build mapping to upstream PDBs directly from configured input_dir (no metrics_pdbs staging).
+        cfg = self._af3score_config()
+        input_dir = self.cfg.get("input_dir") or (cfg.get("input_pdb_dir") if cfg else None)
+        input_root: Path | None = None
+        pdbs: list[Path] = []
+        if input_dir:
+            input_root = Path(str(input_dir))
+            if not input_root.is_absolute():
+                input_root = ctx.out_dir / input_root
+            if input_root.exists():
+                input_root = self._resolve_input_dir(input_root)
+                pdbs = collect_pdbs(input_root)
+
+        run_stem_to_pdb: dict[str, Path] = {}
+        stem_to_pdb: dict[str, Path] = {}
+        if input_root and pdbs:
+            try:
+                run_stems = compute_run_stems(pdbs, input_root)
+                for p in pdbs:
+                    run_stem_to_pdb[str(run_stems[p])] = p
+                    stem_to_pdb[p.stem.lower()] = p
+            except Exception:
+                run_stem_to_pdb = {}
+                stem_to_pdb = {p.stem.lower(): p for p in pdbs}
+        run_stem_to_pdb_lower = {k.lower(): v for k, v in run_stem_to_pdb.items()}
 
         def _get(row, *keys):
             for k in keys:
@@ -2371,7 +2440,6 @@ class AF3ScoreStep(ExternalCommandStep):
                 return row[col]
             return None
 
-
         rows: list[dict[str, Any]] = []
         iptm_global_col: list[float | None] = []
         iptm_binder_target_col: list[float | None] = []
@@ -2385,10 +2453,19 @@ class AF3ScoreStep(ExternalCommandStep):
                 target_chain = str(chains[0])
             elif isinstance(chains, str) and chains:
                 target_chain = str(chains)
+
+        step_label = str(self.cfg.get("name") or self.name)
         missing_pdbs: list[str] = []
         for _, row in df.iterrows():
             desc = _get(row, "description", "name", "model", "pdb_name")
             desc = str(desc) if desc is not None else ""
+            key = desc.strip().lower()
+            if key.endswith(".pdb"):
+                key = key[:-4]
+            pdb_path = run_stem_to_pdb_lower.get(key) or stem_to_pdb.get(key)
+            if desc and pdb_path is None:
+                missing_pdbs.append(desc)
+
             design_id = extract_design_id(desc)
             iptm_global = _get(row, "iptm", "ipTM", "AF3Score_interchain_iptm", "AF3Score_chain_iptm")
             iptm_binder_target = None
@@ -2405,14 +2482,14 @@ class AF3ScoreStep(ExternalCommandStep):
             else:
                 iptm = iptm_global
             ptm = _get(row, "ptm", "pTM", "ptm_A", "ptm_B")
-            pdb_path = name_map.get(desc)
-            if desc and pdb_path is None:
-                missing_pdbs.append(desc)
+
             iptm_global_col.append(float(iptm_global) if iptm_global is not None else None)
             iptm_binder_target_col.append(
                 float(iptm_binder_target) if iptm_binder_target is not None else None
             )
             rows.append({
+                # Internal-only (not written to the manifest CSV): used for filtered_pdbs naming.
+                "run_stem": desc,
                 "design_id": design_id,
                 "structure_id": structure_id_from_name(desc),
                 "iptm": float(iptm) if iptm is not None else None,
@@ -2427,26 +2504,25 @@ class AF3ScoreStep(ExternalCommandStep):
         if missing_pdbs:
             sample = ", ".join(missing_pdbs[:5])
             print(
-                f"[{step_label}] WARN missing {len(missing_pdbs)} PDBs in {metrics_pdb_dir} "
-                f"for AF3Score rows (examples: {sample}).",
+                f"[{step_label}] WARN missing {len(missing_pdbs)} upstream PDBs for AF3Score rows "
+                f"(examples: {sample}).",
                 flush=True,
             )
 
-        # Write derived metrics with binder-target ipTM if needed
-        df = df.copy()
-        df["iptm_global"] = iptm_global_col
-        df["iptm_binder_target"] = iptm_binder_target_col
+        # Write derived metrics with binder-target ipTM if needed (atomic write).
+        df_ppi = df.copy()
+        df_ppi["iptm_global"] = iptm_global_col
+        df_ppi["iptm_binder_target"] = iptm_binder_target_col
         metrics_ppiflow = out_dir / "metrics_ppiflow.csv"
-        try:
-            df.to_csv(metrics_ppiflow, index=False)
-        except Exception:
-            pass
+        tmp_ppi = metrics_ppiflow.parent / f"{metrics_ppiflow.name}.tmp"
+        df_ppi.to_csv(tmp_ppi, index=False)
+        os.replace(tmp_ppi, metrics_ppiflow)
 
         if not rows:
             return
 
         filters = (ctx.input_data.get("filters") or {}).get("af3score") or {}
-        if self.cfg.get("name") == "af3score2":
+        if self.name == "af3score2" or self.cfg.get("name") == "af3score2":
             iptm_min = float((filters.get("round2") or {}).get("iptm_min") or 0)
             ptm_min = float((filters.get("round2") or {}).get("ptm_min") or 0)
         else:
@@ -2462,7 +2538,7 @@ class AF3ScoreStep(ExternalCommandStep):
             r["passed_filter"] = bool(iptm_ok and ptm_ok)
 
         top_k = None
-        if self.cfg.get("name") == "af3score2":
+        if self.name == "af3score2" or self.cfg.get("name") == "af3score2":
             top_k = (filters.get("round2") or {}).get("top_k")
         else:
             top_k = (filters.get("round1") or {}).get("top_k")
@@ -2487,31 +2563,69 @@ class AF3ScoreStep(ExternalCommandStep):
             for r in rows:
                 r["passed_top_k"] = r.get("passed_filter")
 
-        # Write filtered PDBs for downstream steps
+        # Rebuild filtered_pdbs/ deterministically to avoid downstream picking up stale files.
         filtered_dir = out_dir / "filtered_pdbs"
+        if filtered_dir.exists():
+            shutil.rmtree(filtered_dir, ignore_errors=True)
         filtered_dir.mkdir(parents=True, exist_ok=True)
+        expected_passing = 0
+        missing_passing: list[str] = []
+        passing = 0
         for r in rows:
             if not r.get("passed_filter"):
                 continue
+            expected_passing += 1
             pdb_path = r.get("pdb_path")
+            run_stem = str(r.get("run_stem") or "").strip() or "<missing>"
             if not pdb_path:
+                missing_passing.append(run_stem)
                 continue
             src = Path(str(pdb_path))
             if not src.exists():
+                missing_passing.append(run_stem)
                 continue
-            dst = filtered_dir / src.name
-            if dst.exists():
-                continue
+            if run_stem == "<missing>":
+                run_stem = src.stem
+            if run_stem.lower().endswith(".pdb"):
+                run_stem = run_stem[:-4]
+            run_stem = run_stem.replace("/", "_").replace("\\", "_")
+            dst = filtered_dir / f"{run_stem}.pdb"
             try:
-                os.link(src, dst)
-            except Exception:
-                try:
-                    dst.write_bytes(src.read_bytes())
-                except Exception:
-                    pass
+                promote_file_atomic(src, dst, allow_reuse=True)
+            except Exception as exc:
+                raise StepError(f"Failed to materialize filtered_pdbs for {run_stem}: {exc}") from exc
+            passing += 1
 
+        if expected_passing == 0:
+            try:
+                payload = {
+                    "step": step_label,
+                    "reason": "no_passing_structures",
+                    "total_rows": int(len(rows)),
+                    "iptm_min": float(iptm_min),
+                    "ptm_min": float(ptm_min),
+                    "top_k": int(top_k) if top_k is not None else None,
+                }
+                (out_dir / "no_candidates.json").write_text(json.dumps(payload, indent=2) + "\n")
+            except Exception:
+                pass
+            raise StepError(
+                "AF3Score produced 0 passing structures after filtering; adjust thresholds or disable filtering."
+            )
+        if passing != expected_passing:
+            sample = ", ".join(missing_passing[:5])
+            msg = (
+                f"AF3Score expected {expected_passing} passing structures but only materialized "
+                f"{passing} into filtered_pdbs; missing PDBs for {len(missing_passing)} passing rows "
+                f"(examples: {sample})."
+            )
+            raise StepError(msg)
+
+        # Write manifest atomically.
+        manifest_path = self.manifest_path(ctx)
+        tmp_manifest = manifest_path.parent / f"{manifest_path.name}.tmp"
         write_csv(
-            self.manifest_path(ctx),
+            tmp_manifest,
             rows,
             [
                 "design_id",
@@ -2525,6 +2639,62 @@ class AF3ScoreStep(ExternalCommandStep):
                 "passed_top_k",
             ],
         )
+        os.replace(tmp_manifest, manifest_path)
+
+    def outputs_complete(self, ctx: StepContext) -> bool:
+        # Item outputs + metadata must be valid, and downstream-critical derived outputs must exist.
+        if not super().outputs_complete(ctx):
+            return False
+        out_dir = self._resolve_output_dir_path(ctx)
+        if not (out_dir / "metrics.csv").exists():
+            return False
+        if not (out_dir / "metrics_ppiflow.csv").exists():
+            return False
+        filtered_dir = out_dir / "filtered_pdbs"
+        if not filtered_dir.exists() or not list(filtered_dir.glob("*.pdb")):
+            return False
+        return True
+
+    def _finalize_work_queue_outputs(self, ctx: StepContext, wq, *, items: list[Any], allow_failures: bool) -> None:
+        # AF3 finalize must fail fast if derived outputs cannot be materialized; do not write metadata
+        # unless write_manifest() succeeds.
+        try:
+            counts = wq.counts()
+        except Exception:
+            counts = None
+        if counts and (counts.get("pending", 0) != 0 or counts.get("running", 0) != 0):
+            return
+        if not wq.acquire_leader():
+            return
+        try:
+            if self.cfg.get("manifest"):
+                # Strict: propagate exceptions (e.g. zero passing structures).
+                self.write_manifest(ctx)
+
+            if allow_failures:
+                failed_ids: list[str] = []
+                try:
+                    for work_item, status in wq.iter_items():
+                        if status in {"failed", "blocked"}:
+                            failed_ids.append(str(work_item.id))
+                except Exception:
+                    failed_ids = []
+
+                failed_path = self._failed_items_path(ctx)
+                if failed_path is not None:
+                    if failed_ids:
+                        self._write_failed_items(ctx, failed_ids)
+                    else:
+                        try:
+                            failed_path.unlink()
+                        except FileNotFoundError:
+                            pass
+                        except Exception:
+                            pass
+
+            self._write_output_meta(ctx, items=items)
+        finally:
+            wq.release_leader()
 
     def scan_done(self, ctx: StepContext) -> set[int]:
         done = super().scan_done(ctx)
@@ -2607,15 +2777,859 @@ class AF3RefoldStep(ExternalCommandStep):
     name = "af3_refold"
     stage = "score"
 
+    supports_work_queue = True
+    work_queue_mode = "items"
+    # Drain per-worker batches to avoid repeated model reloads.
+    per_worker_batch = True
+    # 0 means "claim all available items for this worker".
+    batch_size = 0
+
+    def _af3score_config(self) -> dict:
+        cfg = dict(self.cfg.get("af3score") or {})
+        if cfg:
+            return cfg
+        cmd = self.cfg.get("command") or []
+        if isinstance(cmd, str):
+            cmd = [cmd]
+        out: dict[str, object] = {}
+        for idx, token in enumerate(cmd):
+            if token in {
+                "--input_pdb_dir",
+                "--output_dir",
+                "--af3score_repo",
+                "--model_dir",
+                "--db_dir",
+                "--num_jobs",
+                "--num_workers",
+                "--bucket_default",
+                "--num_samples",
+                "--model_seeds",
+                "--write_cif_model",
+                "--export_pdb_dir",
+                "--export_cif_dir",
+                "--target_offsets_json",
+                "--target_chain",
+            }:
+                if idx + 1 < len(cmd):
+                    out[token.lstrip("-")] = cmd[idx + 1]
+            elif token == "--no_templates":
+                out["no_templates"] = True
+            elif token == "--write_best_model_root":
+                out["write_best_model_root"] = True
+            elif token == "--write_ranking_scores_csv":
+                out["write_ranking_scores_csv"] = True
+        return out
+
+    def _resolve_path(self, ctx: StepContext, value: str | None) -> Path | None:
+        if not value:
+            return None
+        p = Path(str(value))
+        if p.is_absolute():
+            return p
+        return ctx.out_dir / p
+
+    def _resolve_input_dir(self, input_dir: Path) -> Path:
+        if (input_dir / "run_1").exists():
+            return input_dir / "run_1"
+        return input_dir
+
+    def build_items(self, ctx: StepContext) -> list[WorkItem]:
+        return self.list_items(ctx, readonly=False)
+
+    def list_items(self, ctx: StepContext, *, readonly: bool = False) -> list[WorkItem]:
+        _ = readonly  # list_items must be read-only for rebuild/output checks.
+        cfg = self._af3score_config()
+        input_dir = self.cfg.get("input_dir") or (cfg.get("input_pdb_dir") if cfg else None)
+        if not input_dir:
+            raise StepError("af3_refold input_dir missing or invalid")
+        input_pdb_dir = Path(str(input_dir))
+        if not input_pdb_dir.is_absolute():
+            input_pdb_dir = ctx.out_dir / input_pdb_dir
+        if not input_pdb_dir.exists():
+            raise StepError(f"af3_refold input_dir missing or invalid: {input_pdb_dir}")
+        input_pdb_dir = self._resolve_input_dir(input_pdb_dir)
+
+        pdbs = collect_pdbs(input_pdb_dir)
+        if not pdbs:
+            raise StepError(f"No PDBs found for af3_refold in {input_pdb_dir}")
+        run_stems = compute_run_stems(pdbs, input_pdb_dir)
+
+        items: list[WorkItem] = []
+        for pdb_path in pdbs:
+            run_stem = run_stems[pdb_path]
+            items.append(
+                WorkItem(
+                    id=run_stem,
+                    payload={
+                        "pdb_path": str(pdb_path),
+                        "pdb_name": pdb_path.stem,
+                        "run_stem": run_stem,
+                    },
+                )
+            )
+        return items
+
+    def item_done(self, ctx: StepContext, item: WorkItem) -> bool:
+        out_dir = self.output_dir(ctx)
+        metrics_path = out_dir / "metrics_items" / f"{item.id}.csv"
+        cif_path = out_dir / "cif" / f"{item.id}.cif"
+        pdb_path = out_dir / "pdbs" / f"{item.id}.pdb"
+        return metrics_path.exists() and cif_path.exists() and pdb_path.exists()
+
+    def run_item(self, ctx: StepContext, item: WorkItem) -> None:
+        cfg = self._af3score_config()
+        af3_repo = self._resolve_path(ctx, cfg.get("af3score_repo")) if cfg else None
+        model_dir = self._resolve_path(ctx, cfg.get("model_dir")) if cfg else None
+        if not af3_repo or not af3_repo.exists():
+            raise StepError("af3score_repo missing or invalid")
+        if not model_dir or not model_dir.exists():
+            raise StepError("model_dir missing or invalid")
+
+        pdb_path = Path(str((item.payload or {}).get("pdb_path") or ""))
+        if not pdb_path.exists():
+            raise FileNotFoundError(f"PDB not found: {pdb_path}")
+
+        run_stem = str((item.payload or {}).get("run_stem") or pdb_path.stem)
+        try:
+            attempt = int((item.payload or {}).get("_attempt") or 1)
+        except Exception:
+            attempt = 1
+
+        scratch_root = step_scratch_dir(ctx, self.name) / f"attempt_{attempt}" / "items" / item.id
+        scratch_root.mkdir(parents=True, exist_ok=True)
+        tmp_pdb = scratch_root / f"{run_stem}.pdb"
+        if not tmp_pdb.exists():
+            try:
+                os.link(pdb_path, tmp_pdb)
+            except OSError:
+                shutil.copy2(pdb_path, tmp_pdb)
+
+        script = None
+        cmd_cfg = self.cfg.get("command") or []
+        if isinstance(cmd_cfg, str):
+            cmd_cfg = [cmd_cfg]
+        for tok in cmd_cfg:
+            if str(tok).endswith("run_af3score.py") and Path(str(tok)).exists():
+                script = Path(str(tok))
+                break
+        if script is None:
+            script = Path(__file__).resolve().parents[3] / "scripts" / "run_af3score.py"
+
+        cmd = [
+            sys.executable,
+            str(script),
+            "--input_pdb",
+            str(tmp_pdb),
+            "--output_dir",
+            str(scratch_root),
+            "--af3score_repo",
+            str(af3_repo),
+            "--model_dir",
+            str(model_dir),
+        ]
+        db_dir = cfg.get("db_dir")
+        if db_dir:
+            db_path = self._resolve_path(ctx, db_dir)
+            if db_path:
+                cmd.extend(["--db_dir", str(db_path)])
+        num_jobs = int(cfg.get("num_jobs") or 1)
+        cmd.extend(["--num_jobs", str(num_jobs)])
+        if cfg.get("num_workers") is not None:
+            cmd.extend(["--num_workers", str(cfg.get("num_workers"))])
+        if cfg.get("bucket_default") is not None:
+            cmd.extend(["--bucket_default", str(cfg.get("bucket_default"))])
+        if cfg.get("num_samples") is not None:
+            cmd.extend(["--num_samples", str(cfg.get("num_samples"))])
+        if cfg.get("model_seeds") is not None:
+            cmd.extend(["--model_seeds", str(cfg.get("model_seeds"))])
+        if cfg.get("no_templates"):
+            cmd.append("--no_templates")
+        if cfg.get("write_cif_model") is not None:
+            cmd.extend(["--write_cif_model", str(cfg.get("write_cif_model"))])
+        if cfg.get("write_best_model_root"):
+            cmd.append("--write_best_model_root")
+        if cfg.get("write_ranking_scores_csv"):
+            cmd.append("--write_ranking_scores_csv")
+
+        run_command(
+            cmd,
+            env=os.environ.copy(),
+            cwd=str(scratch_root),
+            log_file=self.cfg.get("_log_file"),
+            verbose=bool(self.cfg.get("_verbose")),
+        )
+
+        def _best_job_cif(job_dir: Path, job_name: str) -> Path | None:
+            cand = job_dir / f"{job_name}_model.cif"
+            if cand.exists():
+                return cand
+            seed_cifs = sorted(job_dir.glob("seed-*/*/model.cif"))
+            if not seed_cifs:
+                seed_cifs = sorted(job_dir.glob("seed-*/model.cif"))
+            if seed_cifs:
+                return seed_cifs[0]
+            return None
+
+        def _load_chain_offset_map(offsets_path: Path) -> list[int] | None:
+            try:
+                payload = json.loads(offsets_path.read_text())
+            except Exception:
+                return None
+            chains = payload.get("chains") if isinstance(payload, dict) else None
+            if not chains:
+                return None
+            mapping: list[int] = []
+            for seg in chains:
+                try:
+                    length = int(seg.get("length") or 0)
+                    start = int(seg.get("start_resseq_B") or 0)
+                except Exception:
+                    return None
+                if length <= 0 or start <= 0:
+                    return None
+                for i in range(length):
+                    mapping.append(start + i)
+            return mapping or None
+
+        def _convert_cif_to_pdb(cif_path: Path, pdb_path: Path) -> bool:
+            try:
+                from Bio.PDB import MMCIFParser, PDBIO
+            except Exception:
+                return False
+            try:
+                parser = MMCIFParser(QUIET=True)
+                structure = parser.get_structure("model", str(cif_path))
+                io = PDBIO()
+                io.set_structure(structure)
+                io.save(str(pdb_path))
+                return True
+            except Exception:
+                return False
+
+        def _renumber_chain_with_offsets(pdb_path: Path, chain_id: str, mapping: list[int]) -> bool:
+            try:
+                from Bio.PDB import PDBParser, PDBIO
+            except Exception:
+                return False
+            try:
+                parser = PDBParser(QUIET=True)
+                structure = parser.get_structure("model", str(pdb_path))
+                model = structure[0]
+                if chain_id not in model:
+                    return False
+                chain = model[chain_id]
+                residues = [r for r in chain if r.id[0] == " "]
+                if len(residues) != len(mapping):
+                    return False
+                for idx, res in enumerate(residues, start=1):
+                    res.id = (" ", int(mapping[idx - 1]), " ")
+                io = PDBIO()
+                io.set_structure(structure)
+                io.save(str(pdb_path))
+                return True
+            except Exception:
+                return False
+
+        allow_reuse = bool((ctx.work_queue or {}).get("allow_reuse", True))
+        out_dir = self.output_dir(ctx)
+        metrics_items = out_dir / "metrics_items"
+        metrics_items.mkdir(parents=True, exist_ok=True)
+        cif_dir = out_dir / "cif"
+        cif_dir.mkdir(parents=True, exist_ok=True)
+        pdbs_dir = out_dir / "pdbs"
+        pdbs_dir.mkdir(parents=True, exist_ok=True)
+
+        metrics_src = scratch_root / "metrics.csv"
+        if not metrics_src.exists():
+            raise StepError(f"Missing metrics.csv for {item.id} at {metrics_src}")
+        promote_file_atomic(metrics_src, metrics_items / f"{item.id}.csv", allow_reuse=allow_reuse)
+
+        job_dir = scratch_root / "af3score_outputs" / run_stem
+        cif_src = _best_job_cif(job_dir, run_stem)
+        if cif_src is None or not cif_src.exists():
+            raise StepError(f"Missing CIF output for {item.id} under {job_dir}")
+        promote_file_atomic(cif_src, cif_dir / f"{item.id}.cif", allow_reuse=allow_reuse)
+
+        # Convert CIF -> PDB in scratch, optionally renumber chain offsets, then promote.
+        cfg_target_chain = str(cfg.get("target_chain") or "B")
+        offset_map = None
+        offsets_val = cfg.get("target_offsets_json")
+        if offsets_val:
+            offsets_path = self._resolve_path(ctx, str(offsets_val))
+            if offsets_path and offsets_path.exists():
+                offset_map = _load_chain_offset_map(offsets_path)
+        scratch_pdb = scratch_root / f"{item.id}.pdb"
+        if not _convert_cif_to_pdb(cif_src, scratch_pdb):
+            raise StepError(f"Failed to convert CIF to PDB for {item.id}")
+        if offset_map:
+            _renumber_chain_with_offsets(scratch_pdb, cfg_target_chain, offset_map)
+        promote_file_atomic(scratch_pdb, pdbs_dir / f"{item.id}.pdb", allow_reuse=allow_reuse)
+
+        # Optional retention: copy heavy/raw runner outputs under output/_optional/... (never required for resume).
+        try:
+            keep_all = output_mode(ctx) == "full"
+        except Exception:
+            keep_all = False
+        if keep_all or any(should_keep(ctx, k) for k in ["af3score_outputs", "af3_input_batch", "single_chain_cif", "json", "af3score_subprocess_logs"]):
+            try:
+                opt_root = optional_dir(ctx) / out_dir.name
+                raw_root = opt_root / "raw"
+                logs_root = opt_root / "logs"
+                raw_keys = ["af3score_outputs", "af3_input_batch", "single_chain_cif", "json", "input_pdbs"]
+                log_keys = ["af3score_subprocess_logs"]
+                for key in raw_keys:
+                    if not (keep_all or should_keep(ctx, key)):
+                        continue
+                    try:
+                        promote_tree(scratch_root / key, raw_root / key, allow_reuse=True)
+                    except Exception:
+                        pass
+                for key in log_keys:
+                    if not (keep_all or should_keep(ctx, key)):
+                        continue
+                    try:
+                        promote_tree(scratch_root / key, logs_root / key, allow_reuse=True)
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+
+        shutil.rmtree(scratch_root, ignore_errors=True)
+
+    def run_batch(self, ctx: StepContext, items: list[WorkItem]) -> dict[str, tuple[str, str | None]]:
+        cfg = self._af3score_config()
+        af3_repo = self._resolve_path(ctx, cfg.get("af3score_repo")) if cfg else None
+        model_dir = self._resolve_path(ctx, cfg.get("model_dir")) if cfg else None
+        if not af3_repo or not af3_repo.exists():
+            raise StepError("af3score_repo missing or invalid")
+        if not model_dir or not model_dir.exists():
+            raise StepError("model_dir missing or invalid")
+
+        attempts: list[int] = []
+        for it in items:
+            try:
+                attempts.append(int((it.payload or {}).get("_attempt") or 1))
+            except Exception:
+                attempts.append(1)
+        batch_attempt = max(attempts) if attempts else 1
+        batch_id = items[0].id if items else "batch"
+        batch_dir = step_scratch_dir(ctx, self.name) / f"attempt_{batch_attempt}" / "batches" / f"batch_{batch_id}"
+        batch_dir.mkdir(parents=True, exist_ok=True)
+        input_dir = batch_dir / "input_pdbs"
+        input_dir.mkdir(parents=True, exist_ok=True)
+
+        results: dict[str, tuple[str, str | None]] = {}
+        valid_items: list[WorkItem] = []
+        for item in items:
+            pdb_path = Path(str((item.payload or {}).get("pdb_path") or ""))
+            if not pdb_path.exists():
+                if self.item_done(ctx, item):
+                    results[item.id] = ("done", None)
+                else:
+                    results[item.id] = ("blocked", f"PDB not found: {pdb_path}")
+                continue
+            run_stem = str((item.payload or {}).get("run_stem") or pdb_path.stem)
+            dst = input_dir / f"{run_stem}.pdb"
+            if not dst.exists():
+                try:
+                    os.link(pdb_path, dst)
+                except OSError:
+                    shutil.copy2(pdb_path, dst)
+            valid_items.append(item)
+        if not valid_items:
+            shutil.rmtree(batch_dir, ignore_errors=True)
+            return results
+
+        script = None
+        cmd_cfg = self.cfg.get("command") or []
+        if isinstance(cmd_cfg, str):
+            cmd_cfg = [cmd_cfg]
+        for tok in cmd_cfg:
+            if str(tok).endswith("run_af3score.py") and Path(str(tok)).exists():
+                script = Path(str(tok))
+                break
+        if script is None:
+            script = Path(__file__).resolve().parents[3] / "scripts" / "run_af3score.py"
+
+        cmd = [
+            sys.executable,
+            str(script),
+            "--input_pdb_dir",
+            str(input_dir),
+            "--output_dir",
+            str(batch_dir),
+            "--af3score_repo",
+            str(af3_repo),
+            "--model_dir",
+            str(model_dir),
+        ]
+        db_dir = cfg.get("db_dir")
+        if db_dir:
+            db_path = self._resolve_path(ctx, db_dir)
+            if db_path:
+                cmd.extend(["--db_dir", str(db_path)])
+        num_jobs = int(cfg.get("num_jobs") or 1)
+        cmd.extend(["--num_jobs", str(num_jobs)])
+        if cfg.get("num_workers") is not None:
+            cmd.extend(["--num_workers", str(cfg.get("num_workers"))])
+        if cfg.get("bucket_default") is not None:
+            cmd.extend(["--bucket_default", str(cfg.get("bucket_default"))])
+        if cfg.get("num_samples") is not None:
+            cmd.extend(["--num_samples", str(cfg.get("num_samples"))])
+        if cfg.get("model_seeds") is not None:
+            cmd.extend(["--model_seeds", str(cfg.get("model_seeds"))])
+        if cfg.get("no_templates"):
+            cmd.append("--no_templates")
+        if cfg.get("write_cif_model") is not None:
+            cmd.extend(["--write_cif_model", str(cfg.get("write_cif_model"))])
+        if cfg.get("write_best_model_root"):
+            cmd.append("--write_best_model_root")
+        if cfg.get("write_ranking_scores_csv"):
+            cmd.append("--write_ranking_scores_csv")
+
+        allow_reuse = bool((ctx.work_queue or {}).get("allow_reuse", True))
+        out_dir = self.output_dir(ctx)
+        metrics_items = out_dir / "metrics_items"
+        metrics_items.mkdir(parents=True, exist_ok=True)
+        cif_dir = out_dir / "cif"
+        cif_dir.mkdir(parents=True, exist_ok=True)
+        pdbs_dir = out_dir / "pdbs"
+        pdbs_dir.mkdir(parents=True, exist_ok=True)
+
+        def _norm_name(value: str) -> str:
+            norm = str(value).strip().lower()
+            if norm.endswith(".pdb"):
+                norm = norm[:-4]
+            return norm
+
+        item_by_stem: dict[str, WorkItem] = {}
+        item_by_norm: dict[str, WorkItem] = {}
+        attempt_by_id: dict[str, int] = {}
+        for item in valid_items:
+            run_stem = str((item.payload or {}).get("run_stem") or item.id)
+            item_by_stem[run_stem] = item
+            item_by_norm[_norm_name(run_stem)] = item
+            try:
+                attempt_by_id[item.id] = int((item.payload or {}).get("_attempt") or 1)
+            except Exception:
+                attempt_by_id[item.id] = 1
+
+        def _resolve_af3_python() -> list[str]:
+            override = os.environ.get("AF3SCORE_PYTHON")
+            if override:
+                return shlex.split(override)
+            env_name = os.environ.get("AF3SCORE_ENV", "ppiflow-af3score")
+            conda_exe = os.environ.get("CONDA_EXE") or shutil.which("conda")
+            if conda_exe and env_name:
+                return [conda_exe, "run", "-n", env_name, "python"]
+            return [sys.executable]
+
+        python_cmd = _resolve_af3_python()
+        get_metrics = af3_repo / "04_get_metrics.py"
+
+        def _best_job_cif(job_dir: Path, job_name: str) -> Path | None:
+            cand = job_dir / f"{job_name}_model.cif"
+            if cand.exists():
+                return cand
+            seed_cifs = sorted(job_dir.glob("seed-*/*/model.cif"))
+            if not seed_cifs:
+                seed_cifs = sorted(job_dir.glob("seed-*/model.cif"))
+            if seed_cifs:
+                return seed_cifs[0]
+            return None
+
+        def _job_complete(job_dir: Path, job_name: str) -> bool:
+            return _best_job_cif(job_dir, job_name) is not None
+
+        def _input_pdb_for_job(job_name: str, item: WorkItem) -> Path | None:
+            cand = input_dir / f"{job_name}.pdb"
+            if cand.exists():
+                return cand
+            raw_path = (item.payload or {}).get("pdb_path")
+            if raw_path:
+                path = Path(str(raw_path))
+                if path.exists():
+                    return path
+            return None
+
+        def _load_chain_offset_map(offsets_path: Path) -> list[int] | None:
+            try:
+                payload = json.loads(offsets_path.read_text())
+            except Exception:
+                return None
+            chains = payload.get("chains") if isinstance(payload, dict) else None
+            if not chains:
+                return None
+            mapping: list[int] = []
+            for seg in chains:
+                try:
+                    length = int(seg.get("length") or 0)
+                    start = int(seg.get("start_resseq_B") or 0)
+                except Exception:
+                    return None
+                if length <= 0 or start <= 0:
+                    return None
+                for i in range(length):
+                    mapping.append(start + i)
+            return mapping or None
+
+        def _convert_cif_to_pdb(cif_path: Path, pdb_path: Path) -> bool:
+            try:
+                from Bio.PDB import MMCIFParser, PDBIO
+            except Exception:
+                return False
+            try:
+                parser = MMCIFParser(QUIET=True)
+                structure = parser.get_structure("model", str(cif_path))
+                io = PDBIO()
+                io.set_structure(structure)
+                io.save(str(pdb_path))
+                return True
+            except Exception:
+                return False
+
+        def _renumber_chain_with_offsets(pdb_path: Path, chain_id: str, mapping: list[int]) -> bool:
+            try:
+                from Bio.PDB import PDBParser, PDBIO
+            except Exception:
+                return False
+            try:
+                parser = PDBParser(QUIET=True)
+                structure = parser.get_structure("model", str(pdb_path))
+                model = structure[0]
+                if chain_id not in model:
+                    return False
+                chain = model[chain_id]
+                residues = [r for r in chain if r.id[0] == " "]
+                if len(residues) != len(mapping):
+                    return False
+                for idx, res in enumerate(residues, start=1):
+                    res.id = (" ", int(mapping[idx - 1]), " ")
+                io = PDBIO()
+                io.set_structure(structure)
+                io.save(str(pdb_path))
+                return True
+            except Exception:
+                return False
+
+        cfg_target_chain = str(cfg.get("target_chain") or "B")
+        offset_map = None
+        offsets_val = cfg.get("target_offsets_json")
+        if offsets_val:
+            offsets_path = self._resolve_path(ctx, str(offsets_val))
+            if offsets_path and offsets_path.exists():
+                offset_map = _load_chain_offset_map(offsets_path)
+
+        def _promote_cif_for_job(job_name: str, job_dir: Path, item: WorkItem) -> bool:
+            dst = cif_dir / f"{item.id}.cif"
+            if dst.exists():
+                return True
+            cif_src = _best_job_cif(job_dir, job_name)
+            if cif_src is None or not cif_src.exists():
+                return False
+            try:
+                promote_file_atomic(cif_src, dst, allow_reuse=allow_reuse)
+            except Exception:
+                return False
+            return True
+
+        def _promote_pdb_for_job(job_name: str, job_dir: Path, item: WorkItem) -> bool:
+            dst = pdbs_dir / f"{item.id}.pdb"
+            if dst.exists():
+                return True
+            cif_src = _best_job_cif(job_dir, job_name)
+            if cif_src is None or not cif_src.exists():
+                return False
+            tmp_dir = batch_dir / ".pdb_tmp"
+            tmp_dir.mkdir(parents=True, exist_ok=True)
+            tmp_pdb = tmp_dir / f"{item.id}.pdb"
+            try:
+                if not _convert_cif_to_pdb(cif_src, tmp_pdb):
+                    return False
+                if offset_map:
+                    _renumber_chain_with_offsets(tmp_pdb, cfg_target_chain, offset_map)
+                promote_file_atomic(tmp_pdb, dst, allow_reuse=allow_reuse)
+                return True
+            finally:
+                try:
+                    tmp_pdb.unlink()
+                except Exception:
+                    pass
+
+        def _write_metrics_for_job(job_name: str, job_dir: Path, input_pdb: Path, item: WorkItem) -> bool:
+            if not get_metrics.exists():
+                return False
+            tmp_root = batch_dir / ".metrics_tmp" / job_name
+            shutil.rmtree(tmp_root, ignore_errors=True)
+            input_tmp = tmp_root / "input_pdbs"
+            af3_tmp = tmp_root / "af3score_outputs"
+            input_tmp.mkdir(parents=True, exist_ok=True)
+            af3_tmp.mkdir(parents=True, exist_ok=True)
+            job_link = af3_tmp / job_name
+            if not job_link.exists():
+                try:
+                    os.symlink(job_dir, job_link, target_is_directory=True)
+                except Exception:
+                    try:
+                        shutil.copytree(job_dir, job_link)
+                    except Exception:
+                        return False
+            pdb_dst = input_tmp / f"{job_name}.pdb"
+            if not pdb_dst.exists():
+                try:
+                    os.link(input_pdb, pdb_dst)
+                except Exception:
+                    shutil.copy2(input_pdb, pdb_dst)
+            metrics_csv = tmp_root / "metrics.csv"
+            try:
+                run_command(
+                    python_cmd
+                    + [
+                        str(get_metrics),
+                        "--input_pdb_dir",
+                        str(input_tmp),
+                        "--af3score_output_dir",
+                        str(af3_tmp),
+                        "--save_metric_csv",
+                        str(metrics_csv),
+                    ],
+                    env=os.environ.copy(),
+                    cwd=str(tmp_root),
+                    log_file=self.cfg.get("_log_file"),
+                    verbose=bool(self.cfg.get("_verbose")),
+                )
+            except Exception:
+                return False
+            if not metrics_csv.exists():
+                return False
+            try:
+                promote_file_atomic(metrics_csv, metrics_items / f"{item.id}.csv", allow_reuse=allow_reuse)
+            except Exception:
+                return False
+            shutil.rmtree(tmp_root, ignore_errors=True)
+            return True
+
+        committed: set[str] = set()
+        commit_lock = threading.Lock()
+
+        from ..work_queue import WorkQueue
+
+        wq = WorkQueue(ctx.out_dir, self.name, ctx.work_queue or {})
+
+        def _mark_done(item: WorkItem) -> None:
+            try:
+                attempt = attempt_by_id.get(item.id, 1)
+                wq.mark_done(item.id, attempt)
+            except Exception:
+                pass
+            if ctx.heartbeat:
+                try:
+                    prog = wq.progress()
+                    ctx.heartbeat.update(
+                        produced_total=int(prog.get("produced_total", 0)),
+                        expected_total=int(prog.get("expected_total", 0)),
+                        state=str(prog.get("status") or "running"),
+                    )
+                except Exception:
+                    pass
+
+        def _commit_job(job_name: str, job_dir: Path) -> bool:
+            item = item_by_stem.get(job_name) or item_by_norm.get(_norm_name(job_name))
+            if not item:
+                return False
+            if self.item_done(ctx, item):
+                committed.add(job_name)
+                _mark_done(item)
+                return True
+            if not _job_complete(job_dir, job_name):
+                return False
+            input_pdb = _input_pdb_for_job(job_name, item)
+            if input_pdb is None:
+                return False
+            with commit_lock:
+                if job_name in committed:
+                    return True
+                if not _promote_cif_for_job(job_name, job_dir, item):
+                    return False
+                if not _promote_pdb_for_job(job_name, job_dir, item):
+                    return False
+                if not _write_metrics_for_job(job_name, job_dir, input_pdb, item):
+                    return False
+                if self.item_done(ctx, item):
+                    committed.add(job_name)
+                    _mark_done(item)
+                    return True
+            return False
+
+        def _scan_batch_outputs(max_per_pass: int | None = None) -> None:
+            af3_dir = batch_dir / "af3score_outputs"
+            if not af3_dir.exists():
+                return
+            processed = 0
+            for job_dir in sorted(af3_dir.iterdir()):
+                if max_per_pass is not None and processed >= max_per_pass:
+                    break
+                if not job_dir.is_dir():
+                    continue
+                job_name = job_dir.name
+                if job_name not in item_by_stem and _norm_name(job_name) not in item_by_norm:
+                    continue
+                if job_name in committed:
+                    continue
+                if _commit_job(job_name, job_dir):
+                    processed += 1
+
+        commit_poll = float((ctx.work_queue or {}).get("af3score_commit_poll_s", 5.0) or 5.0)
+        commit_batch = int((ctx.work_queue or {}).get("af3score_commit_batch", 25) or 25)
+        stop_evt = threading.Event()
+
+        def _commit_loop() -> None:
+            while not stop_evt.wait(commit_poll):
+                try:
+                    _scan_batch_outputs(max_per_pass=commit_batch)
+                except Exception:
+                    pass
+
+        commit_thread = threading.Thread(target=_commit_loop, daemon=True)
+        commit_thread.start()
+
+        err: str | None = None
+        if valid_items:
+            try:
+                run_command(
+                    cmd,
+                    env=os.environ.copy(),
+                    cwd=str(batch_dir),
+                    log_file=self.cfg.get("_log_file"),
+                    verbose=bool(self.cfg.get("_verbose")),
+                )
+            except Exception as exc:
+                err = str(exc)
+
+        stop_evt.set()
+        commit_thread.join(timeout=2.0)
+        _scan_batch_outputs()
+
+        # Fallback: split wrapper metrics.csv into per-item shards if any are missing.
+        metrics_src = batch_dir / "metrics.csv"
+        if metrics_src.exists():
+            try:
+                import pandas as pd
+
+                df = pd.read_csv(metrics_src)
+                for item in valid_items:
+                    if (metrics_items / f"{item.id}.csv").exists():
+                        continue
+                    run_stem = str((item.payload or {}).get("run_stem") or item.id)
+                    run_stem_norm = run_stem.lower()
+                    if run_stem_norm.endswith(".pdb"):
+                        run_stem_norm = run_stem_norm[:-4]
+                    mask = None
+                    for col in ("description", "name", "model", "pdb_name"):
+                        if col in df.columns:
+                            series = df[col].astype(str)
+                            series_norm = series.str.lower()
+                            series_norm = series_norm.str.removesuffix(".pdb")
+                            mask = series_norm == run_stem_norm
+                            if mask.any():
+                                break
+                    if mask is not None and mask.any():
+                        tmp = batch_dir / f".metrics_item.{item.id}.csv"
+                        try:
+                            df.loc[mask].to_csv(tmp, index=False)
+                            promote_file_atomic(tmp, metrics_items / f"{item.id}.csv", allow_reuse=allow_reuse)
+                        finally:
+                            try:
+                                tmp.unlink()
+                            except Exception:
+                                pass
+                    elif len(valid_items) == 1:
+                        tmp = batch_dir / f".metrics_item.{item.id}.csv"
+                        try:
+                            df.to_csv(tmp, index=False)
+                            promote_file_atomic(tmp, metrics_items / f"{item.id}.csv", allow_reuse=allow_reuse)
+                        finally:
+                            try:
+                                tmp.unlink()
+                            except Exception:
+                                pass
+            except Exception:
+                pass
+
+        # Finalize CIF/PDB promotion for any remaining items.
+        af3_dir = batch_dir / "af3score_outputs"
+        if af3_dir.exists():
+            for item in valid_items:
+                run_stem = str((item.payload or {}).get("run_stem") or item.id)
+                job_dir = af3_dir / run_stem
+                if job_dir.exists():
+                    if not (cif_dir / f"{item.id}.cif").exists():
+                        _promote_cif_for_job(run_stem, job_dir, item)
+                    if not (pdbs_dir / f"{item.id}.pdb").exists():
+                        _promote_pdb_for_job(run_stem, job_dir, item)
+
+        all_done = all(self.item_done(ctx, item) for item in valid_items)
+        if all_done:
+            # Optional retention: copy heavy/raw runner outputs under output/_optional/... (never required for resume).
+            try:
+                keep_all = output_mode(ctx) == "full"
+            except Exception:
+                keep_all = False
+            if keep_all or any(should_keep(ctx, k) for k in ["af3score_outputs", "af3_input_batch", "single_chain_cif", "json", "af3score_subprocess_logs"]):
+                try:
+                    opt_root = optional_dir(ctx) / out_dir.name
+                    raw_root = opt_root / "raw"
+                    logs_root = opt_root / "logs"
+                    raw_keys = ["af3score_outputs", "af3_input_batch", "single_chain_cif", "json", "input_pdbs"]
+                    log_keys = ["af3score_subprocess_logs"]
+                    for key in raw_keys:
+                        if not (keep_all or should_keep(ctx, key)):
+                            continue
+                        try:
+                            promote_tree(batch_dir / key, raw_root / key, allow_reuse=True)
+                        except Exception:
+                            pass
+                    for key in log_keys:
+                        if not (keep_all or should_keep(ctx, key)):
+                            continue
+                        try:
+                            promote_tree(batch_dir / key, logs_root / key, allow_reuse=True)
+                        except Exception:
+                            pass
+                except Exception:
+                    pass
+            shutil.rmtree(batch_dir, ignore_errors=True)
+
+        for item in valid_items:
+            if self.item_done(ctx, item):
+                results[item.id] = ("done", None)
+            else:
+                results[item.id] = ("failed", err or "missing output")
+        return results
+
     def write_manifest(self, ctx: StepContext) -> None:
         out_dir = self.output_dir(ctx)
-        metrics_path = find_metrics_file(out_dir)
-        if not metrics_path:
-            return
-        try:
+        df = None
+        metrics_items = out_dir / "metrics_items"
+        if metrics_items.exists():
+            metrics_paths = sorted(p for p in metrics_items.glob("*.csv"))
+            if metrics_paths:
+                try:
+                    df = pd.concat([pd.read_csv(p) for p in metrics_paths], ignore_index=True)
+                except Exception:
+                    df = None
+        if df is None:
+            metrics_path = find_metrics_file(out_dir)
+            if not metrics_path:
+                return
             df = pd.read_csv(metrics_path)
-        except Exception:
-            return
+
+        # Consolidated metrics.csv (atomic write)
+        metrics_csv = out_dir / "metrics.csv"
+        tmp_metrics = metrics_csv.parent / f"{metrics_csv.name}.tmp"
+        df.to_csv(tmp_metrics, index=False)
+        os.replace(tmp_metrics, metrics_csv)
+
         name_map = build_name_map(out_dir / "pdbs")
 
         def _get(row, *keys):
@@ -2632,6 +3646,8 @@ class AF3RefoldStep(ExternalCommandStep):
             return None
 
         rows: list[dict[str, Any]] = []
+        iptm_global_col: list[float | None] = []
+        iptm_binder_target_col: list[float | None] = []
         protocol = ctx.input_data.get("protocol")
         is_antibody = protocol == "antibody"
         target_chain = "B"
@@ -2645,19 +3661,33 @@ class AF3RefoldStep(ExternalCommandStep):
         for _, row in df.iterrows():
             desc = _get(row, "description", "name", "model", "pdb_name")
             desc = str(desc) if desc is not None else ""
+
+            # Keep list lengths aligned with df rows for derived metrics_ppiflow.csv.
+            iptm_global = _get(row, "iptm", "ipTM", "AF3Score_interchain_iptm", "AF3Score_chain_iptm")
+            iptm_binder_target = None
+            iptm = iptm_global
+            if is_antibody:
+                if desc:
+                    chain_target_iptm = _get_ci(row, f"chain_{target_chain}_iptm")
+                    if chain_target_iptm is not None:
+                        iptm_binder_target = float(chain_target_iptm)
+                        iptm = iptm_binder_target
+                    else:
+                        raise StepError(
+                            "AF3Score metrics missing antibody binder-target iptm. "
+                            "Require chain_<target>_iptm (e.g., chain_B_iptm)."
+                        )
+                else:
+                    iptm = None
+            ptm = _get(row, "ptm", "pTM", "ptm_A", "ptm_B", "AF3Score_chain_ptm")
+
+            iptm_global_col.append(float(iptm_global) if iptm_global is not None else None)
+            iptm_binder_target_col.append(
+                float(iptm_binder_target) if iptm_binder_target is not None else None
+            )
+
             if not desc:
                 continue
-            iptm = _get(row, "iptm", "ipTM", "AF3Score_interchain_iptm", "AF3Score_chain_iptm")
-            ptm = _get(row, "ptm", "pTM", "ptm_A", "ptm_B", "AF3Score_chain_ptm")
-            if is_antibody:
-                chain_target_iptm = _get_ci(row, f"chain_{target_chain}_iptm")
-                if chain_target_iptm is not None:
-                    iptm = float(chain_target_iptm)
-                else:
-                    raise StepError(
-                        "AF3Score metrics missing antibody binder-target iptm. "
-                        "Require chain_<target>_iptm (e.g., chain_B_iptm)."
-                    )
             pdb_path = name_map.get(desc)
             rows.append({
                 "design_id": extract_design_id(desc),
@@ -2667,14 +3697,73 @@ class AF3RefoldStep(ExternalCommandStep):
                 "pdb_path": str(pdb_path) if pdb_path else None,
             })
 
-        if rows:
-            write_csv(self.manifest_path(ctx), rows, ["design_id", "structure_id", "iptm", "ptm", "pdb_path"])
+        # Write derived metrics_ppiflow.csv (atomic write).
+        df_ppi = df.copy()
+        df_ppi["iptm_global"] = iptm_global_col
+        df_ppi["iptm_binder_target"] = iptm_binder_target_col
+        metrics_ppiflow = out_dir / "metrics_ppiflow.csv"
+        tmp_ppi = metrics_ppiflow.parent / f"{metrics_ppiflow.name}.tmp"
+        df_ppi.to_csv(tmp_ppi, index=False)
+        os.replace(tmp_ppi, metrics_ppiflow)
 
-    def run_full(self, ctx: StepContext) -> None:
-        cmd = self.cfg.get("command")
-        if not cmd:
+        if rows:
+            manifest_path = self.manifest_path(ctx)
+            tmp_manifest = manifest_path.parent / f"{manifest_path.name}.tmp"
+            write_csv(tmp_manifest, rows, ["design_id", "structure_id", "iptm", "ptm", "pdb_path"])
+            os.replace(tmp_manifest, manifest_path)
+
+    def outputs_complete(self, ctx: StepContext) -> bool:
+        if not super().outputs_complete(ctx):
+            return False
+        out_dir = self._resolve_output_dir_path(ctx)
+        if not (out_dir / "metrics.csv").exists():
+            return False
+        if not (out_dir / "metrics_ppiflow.csv").exists():
+            return False
+        if not (out_dir / "pdbs").exists() or not list((out_dir / "pdbs").glob("*.pdb")):
+            return False
+        if not (out_dir / "cif").exists() or not list((out_dir / "cif").glob("*.cif")):
+            return False
+        return True
+
+    def _finalize_work_queue_outputs(self, ctx: StepContext, wq, *, items: list[Any], allow_failures: bool) -> None:
+        # Strict finalize: do not write metadata unless derived outputs are successfully materialized.
+        try:
+            counts = wq.counts()
+        except Exception:
+            counts = None
+        if counts and (counts.get("pending", 0) != 0 or counts.get("running", 0) != 0):
             return
-        return super().run_full(ctx)
+        if not wq.acquire_leader():
+            return
+        try:
+            if self.cfg.get("manifest"):
+                self.write_manifest(ctx)
+
+            if allow_failures:
+                failed_ids: list[str] = []
+                try:
+                    for work_item, status in wq.iter_items():
+                        if status in {"failed", "blocked"}:
+                            failed_ids.append(str(work_item.id))
+                except Exception:
+                    failed_ids = []
+
+                failed_path = self._failed_items_path(ctx)
+                if failed_path is not None:
+                    if failed_ids:
+                        self._write_failed_items(ctx, failed_ids)
+                    else:
+                        try:
+                            failed_path.unlink()
+                        except FileNotFoundError:
+                            pass
+                        except Exception:
+                            pass
+
+            self._write_output_meta(ctx, items=items)
+        finally:
+            wq.release_leader()
 
     def scan_done(self, ctx: StepContext) -> set[int]:
         done = super().scan_done(ctx)

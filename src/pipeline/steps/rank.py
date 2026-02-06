@@ -46,6 +46,57 @@ class RankStep(Step):
                 return p
         raise StepError("Too many results_v* directories; please clean up old results.")
 
+    def _latest_completed_results_dir(self, out_dir: Path) -> Path | None:
+        candidates: list[tuple[int, Path]] = []
+        for path in sorted(out_dir.glob("results*")):
+            if not path.is_dir():
+                continue
+            if path.name == "results":
+                version = 1
+            elif path.name.startswith("results_v"):
+                try:
+                    version = int(path.name.replace("results_v", ""))
+                except Exception:
+                    continue
+            else:
+                continue
+            manifest = path / "manifest.json"
+            summary = path / "summary.csv"
+            if not manifest.exists() or not summary.exists():
+                continue
+            try:
+                data = read_json(manifest) or {}
+            except Exception:
+                continue
+            if str(data.get("status") or "").lower() != "completed":
+                continue
+            candidates.append((version, path))
+        if not candidates:
+            return None
+        candidates.sort(key=lambda x: x[0])
+        return candidates[-1][1]
+
+    def _output_meta_dir(self, ctx: StepContext) -> Path | None:
+        results_dir = getattr(self, "_results_dir", None)
+        if isinstance(results_dir, Path):
+            return results_dir
+        return super()._output_meta_dir(ctx)
+
+    def outputs_complete(self, ctx: StepContext) -> bool:
+        results_dir = self._latest_completed_results_dir(ctx.out_dir)
+        if results_dir is None:
+            return False
+        self._results_dir = results_dir
+        meta = self._load_output_meta(ctx, meta_dir=results_dir)
+        if meta is None:
+            if not self._allow_legacy_outputs(ctx):
+                return False
+            self._warn("missing output metadata; accepting legacy outputs due to explicit reuse")
+        else:
+            if not self._validate_output_meta(ctx, meta, meta_dir=results_dir):
+                return False
+        return True
+
     def _find_metrics_csv(self, run_dir: Path) -> Path | None:
         for rel in [
             "af3_refold/metrics_ppiflow.csv",
@@ -371,6 +422,7 @@ class RankStep(Step):
     def run_full(self, ctx: StepContext) -> None:
         out_dir = ctx.out_dir
         results_dir = self._allocate_results_dir(out_dir)
+        self._results_dir = results_dir
         ensure_dir(results_dir)
         structures_dir = results_dir / "structures"
         top_dir = structures_dir / "top"
