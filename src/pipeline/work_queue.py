@@ -395,38 +395,49 @@ class WorkQueue:
 
             conn = self._connect()
             try:
-                count = conn.execute("SELECT COUNT(*) AS c FROM items").fetchone()["c"]
-                if count == 0:
-                    if not normalized:
-                        raise WorkQueueError(f"No work items provided for {self.step}")
-                    for item in normalized:
-                        payload = {
-                            "id": item.id,
-                            "payload": item.payload,
-                            "outputs": item.outputs or [],
-                        }
-                        conn.execute(
-                            """
-                            INSERT INTO items(id, payload_json, status, attempts, last_error, updated_at)
-                            VALUES (?, ?, 'pending', 0, NULL, ?)
-                            """,
-                            (item.id, json.dumps(payload, separators=(",", ":")), _iso()),
-                        )
-                else:
-                    if normalized:
-                        incoming_hash = self._items_fingerprint(normalized)
-                        existing_meta = self._read_meta()
-                        existing_hash = existing_meta.get("items_hash")
-                        if existing_hash and incoming_hash != existing_hash:
-                            if self.allow_reuse:
-                                _warn(
-                                    f"items hash mismatch for {self.step}: existing={existing_hash} incoming={incoming_hash}"
-                                )
-                            else:
-                                raise WorkQueueError(
-                                    "Work queue items hash mismatch for "
-                                    f"{self.step}: existing={existing_hash} incoming={incoming_hash}"
-                                )
+                # Serialize initial item insertion across ranks/workers. Without this, two workers can
+                # both observe COUNT(*) == 0 and concurrently INSERT, triggering UNIQUE violations.
+                conn.execute("BEGIN IMMEDIATE")
+                try:
+                    count = conn.execute("SELECT COUNT(*) AS c FROM items").fetchone()["c"]
+                    if count == 0:
+                        if not normalized:
+                            raise WorkQueueError(f"No work items provided for {self.step}")
+                        for item in normalized:
+                            payload = {
+                                "id": item.id,
+                                "payload": item.payload,
+                                "outputs": item.outputs or [],
+                            }
+                            conn.execute(
+                                """
+                                INSERT OR IGNORE INTO items(id, payload_json, status, attempts, last_error, updated_at)
+                                VALUES (?, ?, 'pending', 0, NULL, ?)
+                                """,
+                                (item.id, json.dumps(payload, separators=(",", ":")), _iso()),
+                            )
+                    else:
+                        if normalized:
+                            incoming_hash = self._items_fingerprint(normalized)
+                            existing_meta = self._read_meta()
+                            existing_hash = existing_meta.get("items_hash")
+                            if existing_hash and incoming_hash != existing_hash:
+                                if self.allow_reuse:
+                                    _warn(
+                                        f"items hash mismatch for {self.step}: existing={existing_hash} incoming={incoming_hash}"
+                                    )
+                                else:
+                                    raise WorkQueueError(
+                                        "Work queue items hash mismatch for "
+                                        f"{self.step}: existing={existing_hash} incoming={incoming_hash}"
+                                    )
+                    conn.execute("COMMIT")
+                except Exception:
+                    try:
+                        conn.execute("ROLLBACK")
+                    except Exception:
+                        pass
+                    raise
             finally:
                 conn.close()
 
