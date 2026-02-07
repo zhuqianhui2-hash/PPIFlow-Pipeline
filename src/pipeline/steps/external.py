@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import csv
+from dataclasses import dataclass
 import json
 import os
 import re
@@ -16,12 +17,154 @@ from typing import Any
 import pandas as pd
 
 from .base import Step, StepContext, StepError
-from ..direct_legacy import compute_run_stems, promote_file, promote_file_atomic, promote_tree
+from ..direct_legacy import compute_run_stems, files_identical, promote_file, promote_file_atomic, promote_tree
 from ..io import collect_pdbs, is_ignored_path
 from ..logging_utils import log_command_progress, run_command
 from ..manifests import build_name_map, extract_design_id, find_metrics_file, structure_id_from_name, write_csv
 from ..output_policy import is_minimal, mode as output_mode, optional_dir, should_keep, step_scratch_dir
 from ..work_queue import WorkItem
+
+
+def _norm_metrics_desc(value: str) -> str:
+    norm = str(value or "").strip().lower()
+    if norm.endswith(".pdb"):
+        norm = norm[:-4]
+    return norm
+
+
+def is_valid_metrics_shard(path: Path, *, expected_desc: str | None = None) -> bool:
+    """
+    Cheap per-item metrics CSV validity check.
+
+    We intentionally avoid pandas here to keep it fast and resilient to partially-written/empty files.
+    """
+    try:
+        if not path.exists():
+            return False
+        # Reject newline-only and other trivially broken files early.
+        if path.stat().st_size < 20:
+            return False
+        with path.open("r", newline="") as handle:
+            reader = csv.DictReader(handle)
+            if not reader.fieldnames:
+                return False
+            lower_map = {str(n).strip().lower(): n for n in reader.fieldnames}
+            desc_col = None
+            for key in ("description", "name", "model", "pdb_name"):
+                col = lower_map.get(key)
+                if col is not None:
+                    desc_col = col
+                    break
+            if desc_col is None:
+                return False
+            total_rows = 0
+            matched = 0
+            expected_norm = _norm_metrics_desc(expected_desc) if expected_desc is not None else None
+            # Per-item shards should contain exactly one row. We only scan a small prefix
+            # to keep this check cheap.
+            for row in reader:
+                total_rows += 1
+                if expected_norm is not None:
+                    if _norm_metrics_desc(row.get(desc_col) or "") == expected_norm:
+                        matched += 1
+                if total_rows >= 10:
+                    break
+            if total_rows == 0:
+                return False
+            if expected_norm is not None:
+                # Require exactly one matching row and no extra rows; this prevents
+                # accidentally accepting multi-item or corrupted shards.
+                if matched != 1 or total_rows != 1:
+                    return False
+        return True
+    except Exception:
+        return False
+
+
+@dataclass(frozen=True)
+class _AF3JobSource:
+    kind: str  # "seed" or "root"
+    cif_path: Path
+    summary_conf: Path
+    full_conf: Path
+
+
+def _parseable_json(path: Path) -> bool:
+    try:
+        payload = path.read_text()
+    except Exception:
+        return False
+    try:
+        json.loads(payload)
+    except Exception:
+        return False
+    return True
+
+
+def _best_seed_model_cif(seed_dir: Path) -> Path | None:
+    cand = seed_dir / "model.cif"
+    if cand.exists():
+        return cand
+    nested = sorted(seed_dir.glob("*/model.cif"))
+    if nested:
+        return nested[0]
+    return None
+
+
+_SEED_DIR_RE = re.compile(r"^seed-(?P<seed>\\d+)(?:_sample-(?P<sample>\\d+))?$")
+
+
+def _seed_sort_key(path: Path) -> tuple[int, int, str]:
+    m = _SEED_DIR_RE.match(path.name)
+    if not m:
+        return (10**9, 10**9, path.name)
+    seed = int(m.group("seed"))
+    sample = int(m.group("sample") or 0)
+    return (seed, sample, path.name)
+
+
+def _pick_af3_job_source(job_dir: Path, job_name: str, *, prefer_cif: Path | None = None) -> _AF3JobSource | None:
+    """
+    Pick a single canonical source for both promoted structure artifacts and metrics extraction.
+
+    Seed-only selection (Option A): only select a seed/sample directory that contains:
+    - model.cif (or nested */model.cif)
+    - summary_confidences.json (parseable)
+    - confidences.json (non-empty)
+
+    If prefer_cif is provided, only return sources whose model.cif is byte-identical to prefer_cif.
+    """
+    job_dir = Path(job_dir)
+    job_name = str(job_name)
+
+    # Prefer seed-*_{sample-*} first, then seed-* as a fallback.
+    seed_dirs = [p for p in job_dir.glob("seed-*_sample-*") if p.is_dir()]
+    if not seed_dirs:
+        seed_dirs = [p for p in job_dir.glob("seed-*") if p.is_dir()]
+    seed_dirs = sorted(seed_dirs, key=_seed_sort_key)
+    for seed_dir in seed_dirs:
+        summary = seed_dir / "summary_confidences.json"
+        full = seed_dir / "confidences.json"
+        if not summary.exists() or not full.exists():
+            continue
+        try:
+            if full.stat().st_size < 20:
+                continue
+        except Exception:
+            continue
+        if not _parseable_json(summary):
+            continue
+        cif = _best_seed_model_cif(seed_dir)
+        if cif is None or not cif.exists():
+            continue
+        if prefer_cif is not None:
+            try:
+                if not files_identical(cif, prefer_cif):
+                    continue
+            except Exception:
+                continue
+        return _AF3JobSource(kind="seed", cif_path=cif, summary_conf=summary, full_conf=full)
+    return None
 
 
 class ExternalCommandStep(Step):
@@ -1804,7 +1947,7 @@ class AF3ScoreStep(ExternalCommandStep):
         out_dir = self.output_dir(ctx)
         metrics_path = out_dir / "metrics_items" / f"{item.id}.csv"
         cif_path = out_dir / "cif" / f"{item.id}.cif"
-        return metrics_path.exists() and cif_path.exists()
+        return is_valid_metrics_shard(metrics_path, expected_desc=str(item.id)) and cif_path.exists()
 
     def run_item(self, ctx: StepContext, item: WorkItem) -> None:
         cfg = self._af3score_config()
@@ -1914,7 +2057,15 @@ class AF3ScoreStep(ExternalCommandStep):
         metrics_src = scratch_root / "metrics.csv"
         if not metrics_src.exists():
             raise StepError(f"Missing metrics.csv for {item.id} at {metrics_src}")
-        promote_file_atomic(metrics_src, metrics_items / f"{item.id}.csv", allow_reuse=allow_reuse)
+        if not is_valid_metrics_shard(metrics_src, expected_desc=str(run_stem)):
+            raise StepError(f"Invalid metrics.csv for {item.id} at {metrics_src}")
+        metrics_dst = metrics_items / f"{item.id}.csv"
+        if metrics_dst.exists() and not is_valid_metrics_shard(metrics_dst, expected_desc=str(item.id)):
+            try:
+                metrics_dst.unlink()
+            except Exception as exc:
+                raise StepError(f"Failed to remove invalid promoted metrics shard at {metrics_dst}: {exc}") from exc
+        promote_file_atomic(metrics_src, metrics_dst, allow_reuse=allow_reuse)
 
         job_dir = scratch_root / "af3score_outputs" / run_stem
         cif_src = _best_job_cif(job_dir, run_stem)
@@ -2091,19 +2242,8 @@ class AF3ScoreStep(ExternalCommandStep):
         python_cmd = _resolve_af3_python()
         get_metrics = af3_repo / "04_get_metrics.py"
 
-        def _best_job_cif(job_dir: Path, job_name: str) -> Path | None:
-            cand = job_dir / f"{job_name}_model.cif"
-            if cand.exists():
-                return cand
-            seed_cifs = sorted(job_dir.glob("seed-*/*/model.cif"))
-            if not seed_cifs:
-                seed_cifs = sorted(job_dir.glob("seed-*/model.cif"))
-            if seed_cifs:
-                return seed_cifs[0]
-            return None
-
-        def _job_complete(job_dir: Path, job_name: str) -> bool:
-            return _best_job_cif(job_dir, job_name) is not None
+        def _job_source(job_dir: Path, job_name: str, *, prefer_cif: Path | None = None) -> _AF3JobSource | None:
+            return _pick_af3_job_source(job_dir, job_name, prefer_cif=prefer_cif)
 
         def _input_pdb_for_job(job_name: str, item: WorkItem) -> Path | None:
             cand = input_dir / f"{job_name}.pdb"
@@ -2116,12 +2256,15 @@ class AF3ScoreStep(ExternalCommandStep):
                     return path
             return None
 
-        def _promote_cif_for_job(job_name: str, job_dir: Path, item: WorkItem) -> bool:
+        def _promote_cif_for_source(source: _AF3JobSource, item: WorkItem) -> bool:
             dst = cif_dir / f"{item.id}.cif"
             if dst.exists():
-                return True
-            cif_src = _best_job_cif(job_dir, job_name)
-            if cif_src is None or not cif_src.exists():
+                try:
+                    return files_identical(source.cif_path, dst)
+                except Exception:
+                    return False
+            cif_src = source.cif_path
+            if not cif_src.exists():
                 return False
             try:
                 promote_file_atomic(cif_src, dst, allow_reuse=allow_reuse)
@@ -2129,7 +2272,7 @@ class AF3ScoreStep(ExternalCommandStep):
                 return False
             return True
 
-        def _write_metrics_for_job(job_name: str, job_dir: Path, input_pdb: Path, item: WorkItem) -> bool:
+        def _write_metrics_for_source(job_name: str, source: _AF3JobSource, input_pdb: Path, item: WorkItem) -> bool:
             if not get_metrics.exists():
                 return False
             tmp_root = batch_dir / ".metrics_tmp" / job_name
@@ -2138,15 +2281,34 @@ class AF3ScoreStep(ExternalCommandStep):
             af3_tmp = tmp_root / "af3score_outputs"
             input_tmp.mkdir(parents=True, exist_ok=True)
             af3_tmp.mkdir(parents=True, exist_ok=True)
-            job_link = af3_tmp / job_name
-            if not job_link.exists():
+            seed10_dir = af3_tmp / job_name / "seed-10_sample-0"
+            seed10_dir.mkdir(parents=True, exist_ok=True)
+
+            def _link_or_copy(src: Path, dst: Path) -> bool:
+                if dst.exists():
+                    return True
                 try:
-                    os.symlink(job_dir, job_link, target_is_directory=True)
+                    os.symlink(src, dst)
+                    return True
                 except Exception:
-                    try:
-                        shutil.copytree(job_dir, job_link)
-                    except Exception:
-                        return False
+                    pass
+                try:
+                    os.link(src, dst)
+                    return True
+                except Exception:
+                    pass
+                try:
+                    shutil.copy2(src, dst)
+                    return True
+                except Exception:
+                    return False
+
+            if not _link_or_copy(source.summary_conf, seed10_dir / "summary_confidences.json"):
+                return False
+            if not _link_or_copy(source.full_conf, seed10_dir / "confidences.json"):
+                return False
+            # Optional but cheap: some metric extractors may read model.cif from the seed directory.
+            _link_or_copy(source.cif_path, seed10_dir / "model.cif")
             pdb_dst = input_tmp / f"{job_name}.pdb"
             if not pdb_dst.exists():
                 try:
@@ -2173,10 +2335,16 @@ class AF3ScoreStep(ExternalCommandStep):
                 )
             except Exception:
                 return False
-            if not metrics_csv.exists():
+            if not is_valid_metrics_shard(metrics_csv, expected_desc=str(job_name)):
                 return False
             try:
-                promote_file_atomic(metrics_csv, metrics_items / f"{item.id}.csv", allow_reuse=allow_reuse)
+                dst = metrics_items / f"{item.id}.csv"
+                if dst.exists() and not is_valid_metrics_shard(dst, expected_desc=str(item.id)):
+                    try:
+                        dst.unlink()
+                    except Exception:
+                        return False
+                promote_file_atomic(metrics_csv, dst, allow_reuse=allow_reuse)
             except Exception:
                 return False
             shutil.rmtree(tmp_root, ignore_errors=True)
@@ -2188,6 +2356,7 @@ class AF3ScoreStep(ExternalCommandStep):
         from ..work_queue import WorkQueue
 
         wq = WorkQueue(ctx.out_dir, self.name, ctx.work_queue or {})
+        forced_failed: dict[str, str] = {}
 
         def _mark_done(item: WorkItem) -> None:
             try:
@@ -2210,22 +2379,62 @@ class AF3ScoreStep(ExternalCommandStep):
             item = item_by_stem.get(job_name) or item_by_norm.get(_norm_name(job_name))
             if not item:
                 return False
-            if (metrics_items / f"{item.id}.csv").exists() and (cif_dir / f"{item.id}.cif").exists():
+            if self.item_done(ctx, item):
                 committed.add(job_name)
                 _mark_done(item)
                 return True
-            if not _job_complete(job_dir, job_name):
-                return False
             input_pdb = _input_pdb_for_job(job_name, item)
             if input_pdb is None:
+                return False
+            dst_cif = cif_dir / f"{item.id}.cif"
+            prefer = dst_cif if dst_cif.exists() else None
+            source = _job_source(job_dir, job_name, prefer_cif=prefer)
+            if source is None:
+                # If a CIF is already promoted but no seed source matches it byte-identically, we
+                # cannot safely recompute/repair metrics without risking model/metrics divergence.
+                if prefer is not None:
+                    with commit_lock:
+                        if job_name in committed:
+                            return True
+                        attempt = attempt_by_id.get(item.id, 1)
+                        msg = (
+                            f"AF3Score cannot select a seed source matching existing promoted CIF for {item.id}: "
+                            f"{prefer}. (seed-only canonical source selection)"
+                        )
+                        forced_failed[item.id] = msg
+                        wq.mark_failed(item.id, attempt, msg)
+                        committed.add(job_name)
+                        return True
                 return False
             with commit_lock:
                 if job_name in committed:
                     return True
-                if not _promote_cif_for_job(job_name, job_dir, item):
+                if dst_cif.exists():
+                    try:
+                        if not files_identical(source.cif_path, dst_cif):
+                            attempt = attempt_by_id.get(item.id, 1)
+                            msg = (
+                                f"AF3Score CIF mismatch for {item.id}: existing {dst_cif} differs from "
+                                f"selected seed source {source.cif_path}"
+                            )
+                            forced_failed[item.id] = msg
+                            wq.mark_failed(item.id, attempt, msg)
+                            committed.add(job_name)
+                            return True
+                    except Exception as exc:
+                        attempt = attempt_by_id.get(item.id, 1)
+                        msg = f"AF3Score CIF compare failed for {item.id}: {exc}"
+                        forced_failed[item.id] = msg
+                        wq.mark_failed(item.id, attempt, msg)
+                        committed.add(job_name)
+                        return True
+                if not _promote_cif_for_source(source, item):
                     return False
-                if not _write_metrics_for_job(job_name, job_dir, input_pdb, item):
-                    return False
+                # Avoid rerunning metrics if a valid shard is already promoted.
+                metrics_dst = metrics_items / f"{item.id}.csv"
+                if not is_valid_metrics_shard(metrics_dst, expected_desc=str(item.id)):
+                    if not _write_metrics_for_source(job_name, source, input_pdb, item):
+                        return False
                 if self.item_done(ctx, item):
                     committed.add(job_name)
                     _mark_done(item)
@@ -2289,9 +2498,16 @@ class AF3ScoreStep(ExternalCommandStep):
 
                 df = pd.read_csv(metrics_src)
                 for item in valid_items:
-                    if (metrics_items / f"{item.id}.csv").exists():
-                        continue
                     run_stem = str((item.payload or {}).get("run_stem") or item.id)
+                    dst_metrics = metrics_items / f"{item.id}.csv"
+                    if dst_metrics.exists():
+                        # Repair known-bad promoted shards so retries can recover.
+                        if is_valid_metrics_shard(dst_metrics, expected_desc=run_stem):
+                            continue
+                        try:
+                            dst_metrics.unlink()
+                        except Exception:
+                            continue
                     run_stem_norm = run_stem.lower()
                     if run_stem_norm.endswith(".pdb"):
                         run_stem_norm = run_stem_norm[:-4]
@@ -2308,7 +2524,7 @@ class AF3ScoreStep(ExternalCommandStep):
                         tmp = batch_dir / f".metrics_item.{item.id}.csv"
                         try:
                             df.loc[mask].to_csv(tmp, index=False)
-                            promote_file_atomic(tmp, metrics_items / f"{item.id}.csv", allow_reuse=allow_reuse)
+                            promote_file_atomic(tmp, dst_metrics, allow_reuse=allow_reuse)
                         finally:
                             try:
                                 tmp.unlink()
@@ -2318,7 +2534,7 @@ class AF3ScoreStep(ExternalCommandStep):
                         tmp = batch_dir / f".metrics_item.{item.id}.csv"
                         try:
                             df.to_csv(tmp, index=False)
-                            promote_file_atomic(tmp, metrics_items / f"{item.id}.csv", allow_reuse=allow_reuse)
+                            promote_file_atomic(tmp, dst_metrics, allow_reuse=allow_reuse)
                         finally:
                             try:
                                 tmp.unlink()
@@ -2336,7 +2552,9 @@ class AF3ScoreStep(ExternalCommandStep):
                 run_stem = str((item.payload or {}).get("run_stem") or item.id)
                 job_dir = af3_dir / run_stem
                 if job_dir.exists():
-                    _promote_cif_for_job(run_stem, job_dir, item)
+                    source = _job_source(job_dir, run_stem)
+                    if source is not None:
+                        _promote_cif_for_source(source, item)
 
         all_done = all(self.item_done(ctx, item) for item in valid_items)
         if all_done:
@@ -2371,7 +2589,9 @@ class AF3ScoreStep(ExternalCommandStep):
             shutil.rmtree(batch_dir, ignore_errors=True)
 
         for item in valid_items:
-            if self.item_done(ctx, item):
+            if item.id in forced_failed:
+                results[item.id] = ("failed", forced_failed.get(item.id))
+            elif self.item_done(ctx, item):
                 results[item.id] = ("done", None)
             else:
                 results[item.id] = ("failed", err or "missing output")
@@ -2874,7 +3094,11 @@ class AF3RefoldStep(ExternalCommandStep):
         metrics_path = out_dir / "metrics_items" / f"{item.id}.csv"
         cif_path = out_dir / "cif" / f"{item.id}.cif"
         pdb_path = out_dir / "pdbs" / f"{item.id}.pdb"
-        return metrics_path.exists() and cif_path.exists() and pdb_path.exists()
+        return (
+            is_valid_metrics_shard(metrics_path, expected_desc=str(item.id))
+            and cif_path.exists()
+            and pdb_path.exists()
+        )
 
     def run_item(self, ctx: StepContext, item: WorkItem) -> None:
         cfg = self._af3score_config()
@@ -3042,7 +3266,15 @@ class AF3RefoldStep(ExternalCommandStep):
         metrics_src = scratch_root / "metrics.csv"
         if not metrics_src.exists():
             raise StepError(f"Missing metrics.csv for {item.id} at {metrics_src}")
-        promote_file_atomic(metrics_src, metrics_items / f"{item.id}.csv", allow_reuse=allow_reuse)
+        if not is_valid_metrics_shard(metrics_src, expected_desc=str(run_stem)):
+            raise StepError(f"Invalid metrics.csv for {item.id} at {metrics_src}")
+        metrics_dst = metrics_items / f"{item.id}.csv"
+        if metrics_dst.exists() and not is_valid_metrics_shard(metrics_dst, expected_desc=str(item.id)):
+            try:
+                metrics_dst.unlink()
+            except Exception as exc:
+                raise StepError(f"Failed to remove invalid promoted metrics shard at {metrics_dst}: {exc}") from exc
+        promote_file_atomic(metrics_src, metrics_dst, allow_reuse=allow_reuse)
 
         job_dir = scratch_root / "af3score_outputs" / run_stem
         cif_src = _best_job_cif(job_dir, run_stem)
@@ -3227,19 +3459,8 @@ class AF3RefoldStep(ExternalCommandStep):
         python_cmd = _resolve_af3_python()
         get_metrics = af3_repo / "04_get_metrics.py"
 
-        def _best_job_cif(job_dir: Path, job_name: str) -> Path | None:
-            cand = job_dir / f"{job_name}_model.cif"
-            if cand.exists():
-                return cand
-            seed_cifs = sorted(job_dir.glob("seed-*/*/model.cif"))
-            if not seed_cifs:
-                seed_cifs = sorted(job_dir.glob("seed-*/model.cif"))
-            if seed_cifs:
-                return seed_cifs[0]
-            return None
-
-        def _job_complete(job_dir: Path, job_name: str) -> bool:
-            return _best_job_cif(job_dir, job_name) is not None
+        def _job_source(job_dir: Path, job_name: str, *, prefer_cif: Path | None = None) -> _AF3JobSource | None:
+            return _pick_af3_job_source(job_dir, job_name, prefer_cif=prefer_cif)
 
         def _input_pdb_for_job(job_name: str, item: WorkItem) -> Path | None:
             cand = input_dir / f"{job_name}.pdb"
@@ -3320,12 +3541,15 @@ class AF3RefoldStep(ExternalCommandStep):
             if offsets_path and offsets_path.exists():
                 offset_map = _load_chain_offset_map(offsets_path)
 
-        def _promote_cif_for_job(job_name: str, job_dir: Path, item: WorkItem) -> bool:
+        def _promote_cif_for_source(source: _AF3JobSource, item: WorkItem) -> bool:
             dst = cif_dir / f"{item.id}.cif"
             if dst.exists():
-                return True
-            cif_src = _best_job_cif(job_dir, job_name)
-            if cif_src is None or not cif_src.exists():
+                try:
+                    return files_identical(source.cif_path, dst)
+                except Exception:
+                    return False
+            cif_src = source.cif_path
+            if not cif_src.exists():
                 return False
             try:
                 promote_file_atomic(cif_src, dst, allow_reuse=allow_reuse)
@@ -3333,12 +3557,10 @@ class AF3RefoldStep(ExternalCommandStep):
                 return False
             return True
 
-        def _promote_pdb_for_job(job_name: str, job_dir: Path, item: WorkItem) -> bool:
+        def _promote_pdb_for_source(source: _AF3JobSource, item: WorkItem) -> bool:
             dst = pdbs_dir / f"{item.id}.pdb"
-            if dst.exists():
-                return True
-            cif_src = _best_job_cif(job_dir, job_name)
-            if cif_src is None or not cif_src.exists():
+            cif_src = source.cif_path
+            if not cif_src.exists():
                 return False
             tmp_dir = batch_dir / ".pdb_tmp"
             tmp_dir.mkdir(parents=True, exist_ok=True)
@@ -3348,7 +3570,27 @@ class AF3RefoldStep(ExternalCommandStep):
                     return False
                 if offset_map:
                     _renumber_chain_with_offsets(tmp_pdb, cfg_target_chain, offset_map)
-                promote_file_atomic(tmp_pdb, dst, allow_reuse=allow_reuse)
+                # If a PDB already exists, verify it matches the canonical CIF-derived PDB. If not,
+                # treat it as a repairable derived artifact and replace it.
+                if dst.exists():
+                    try:
+                        if files_identical(tmp_pdb, dst):
+                            return True
+                    except Exception:
+                        # Fall through to repair attempt below.
+                        pass
+                    try:
+                        dst.unlink()
+                    except Exception:
+                        return False
+                try:
+                    promote_file_atomic(tmp_pdb, dst, allow_reuse=allow_reuse)
+                except Exception:
+                    # Another worker may have raced to install a matching file.
+                    try:
+                        return dst.exists() and files_identical(tmp_pdb, dst)
+                    except Exception:
+                        return False
                 return True
             finally:
                 try:
@@ -3356,7 +3598,7 @@ class AF3RefoldStep(ExternalCommandStep):
                 except Exception:
                     pass
 
-        def _write_metrics_for_job(job_name: str, job_dir: Path, input_pdb: Path, item: WorkItem) -> bool:
+        def _write_metrics_for_source(job_name: str, source: _AF3JobSource, input_pdb: Path, item: WorkItem) -> bool:
             if not get_metrics.exists():
                 return False
             tmp_root = batch_dir / ".metrics_tmp" / job_name
@@ -3365,15 +3607,34 @@ class AF3RefoldStep(ExternalCommandStep):
             af3_tmp = tmp_root / "af3score_outputs"
             input_tmp.mkdir(parents=True, exist_ok=True)
             af3_tmp.mkdir(parents=True, exist_ok=True)
-            job_link = af3_tmp / job_name
-            if not job_link.exists():
+            seed10_dir = af3_tmp / job_name / "seed-10_sample-0"
+            seed10_dir.mkdir(parents=True, exist_ok=True)
+
+            def _link_or_copy(src: Path, dst: Path) -> bool:
+                if dst.exists():
+                    return True
                 try:
-                    os.symlink(job_dir, job_link, target_is_directory=True)
+                    os.symlink(src, dst)
+                    return True
                 except Exception:
-                    try:
-                        shutil.copytree(job_dir, job_link)
-                    except Exception:
-                        return False
+                    pass
+                try:
+                    os.link(src, dst)
+                    return True
+                except Exception:
+                    pass
+                try:
+                    shutil.copy2(src, dst)
+                    return True
+                except Exception:
+                    return False
+
+            if not _link_or_copy(source.summary_conf, seed10_dir / "summary_confidences.json"):
+                return False
+            if not _link_or_copy(source.full_conf, seed10_dir / "confidences.json"):
+                return False
+            # Optional but cheap: some metric extractors may read model.cif from the seed directory.
+            _link_or_copy(source.cif_path, seed10_dir / "model.cif")
             pdb_dst = input_tmp / f"{job_name}.pdb"
             if not pdb_dst.exists():
                 try:
@@ -3400,10 +3661,16 @@ class AF3RefoldStep(ExternalCommandStep):
                 )
             except Exception:
                 return False
-            if not metrics_csv.exists():
+            if not is_valid_metrics_shard(metrics_csv, expected_desc=str(job_name)):
                 return False
             try:
-                promote_file_atomic(metrics_csv, metrics_items / f"{item.id}.csv", allow_reuse=allow_reuse)
+                dst = metrics_items / f"{item.id}.csv"
+                if dst.exists() and not is_valid_metrics_shard(dst, expected_desc=str(item.id)):
+                    try:
+                        dst.unlink()
+                    except Exception:
+                        return False
+                promote_file_atomic(metrics_csv, dst, allow_reuse=allow_reuse)
             except Exception:
                 return False
             shutil.rmtree(tmp_root, ignore_errors=True)
@@ -3415,6 +3682,7 @@ class AF3RefoldStep(ExternalCommandStep):
         from ..work_queue import WorkQueue
 
         wq = WorkQueue(ctx.out_dir, self.name, ctx.work_queue or {})
+        forced_failed: dict[str, str] = {}
 
         def _mark_done(item: WorkItem) -> None:
             try:
@@ -3441,20 +3709,58 @@ class AF3RefoldStep(ExternalCommandStep):
                 committed.add(job_name)
                 _mark_done(item)
                 return True
-            if not _job_complete(job_dir, job_name):
-                return False
             input_pdb = _input_pdb_for_job(job_name, item)
             if input_pdb is None:
+                return False
+            dst_cif = cif_dir / f"{item.id}.cif"
+            prefer = dst_cif if dst_cif.exists() else None
+            source = _job_source(job_dir, job_name, prefer_cif=prefer)
+            if source is None:
+                if prefer is not None:
+                    with commit_lock:
+                        if job_name in committed:
+                            return True
+                        attempt = attempt_by_id.get(item.id, 1)
+                        msg = (
+                            f"AF3Refold cannot select a seed source matching existing promoted CIF for {item.id}: "
+                            f"{prefer}. (seed-only canonical source selection)"
+                        )
+                        forced_failed[item.id] = msg
+                        wq.mark_failed(item.id, attempt, msg)
+                        committed.add(job_name)
+                        return True
                 return False
             with commit_lock:
                 if job_name in committed:
                     return True
-                if not _promote_cif_for_job(job_name, job_dir, item):
+                if dst_cif.exists():
+                    try:
+                        if not files_identical(source.cif_path, dst_cif):
+                            attempt = attempt_by_id.get(item.id, 1)
+                            msg = (
+                                f"AF3Refold CIF mismatch for {item.id}: existing {dst_cif} differs from "
+                                f"selected seed source {source.cif_path}"
+                            )
+                            forced_failed[item.id] = msg
+                            wq.mark_failed(item.id, attempt, msg)
+                            committed.add(job_name)
+                            return True
+                    except Exception as exc:
+                        attempt = attempt_by_id.get(item.id, 1)
+                        msg = f"AF3Refold CIF compare failed for {item.id}: {exc}"
+                        forced_failed[item.id] = msg
+                        wq.mark_failed(item.id, attempt, msg)
+                        committed.add(job_name)
+                        return True
+                if not _promote_cif_for_source(source, item):
                     return False
-                if not _promote_pdb_for_job(job_name, job_dir, item):
+                if not _promote_pdb_for_source(source, item):
                     return False
-                if not _write_metrics_for_job(job_name, job_dir, input_pdb, item):
-                    return False
+                # Avoid rerunning metrics if a valid shard is already promoted.
+                metrics_dst = metrics_items / f"{item.id}.csv"
+                if not is_valid_metrics_shard(metrics_dst, expected_desc=str(item.id)):
+                    if not _write_metrics_for_source(job_name, source, input_pdb, item):
+                        return False
                 if self.item_done(ctx, item):
                     committed.add(job_name)
                     _mark_done(item)
@@ -3518,9 +3824,16 @@ class AF3RefoldStep(ExternalCommandStep):
 
                 df = pd.read_csv(metrics_src)
                 for item in valid_items:
-                    if (metrics_items / f"{item.id}.csv").exists():
-                        continue
                     run_stem = str((item.payload or {}).get("run_stem") or item.id)
+                    dst_metrics = metrics_items / f"{item.id}.csv"
+                    if dst_metrics.exists():
+                        # Repair known-bad promoted shards so retries can recover.
+                        if is_valid_metrics_shard(dst_metrics, expected_desc=run_stem):
+                            continue
+                        try:
+                            dst_metrics.unlink()
+                        except Exception:
+                            continue
                     run_stem_norm = run_stem.lower()
                     if run_stem_norm.endswith(".pdb"):
                         run_stem_norm = run_stem_norm[:-4]
@@ -3537,7 +3850,7 @@ class AF3RefoldStep(ExternalCommandStep):
                         tmp = batch_dir / f".metrics_item.{item.id}.csv"
                         try:
                             df.loc[mask].to_csv(tmp, index=False)
-                            promote_file_atomic(tmp, metrics_items / f"{item.id}.csv", allow_reuse=allow_reuse)
+                            promote_file_atomic(tmp, dst_metrics, allow_reuse=allow_reuse)
                         finally:
                             try:
                                 tmp.unlink()
@@ -3547,7 +3860,7 @@ class AF3RefoldStep(ExternalCommandStep):
                         tmp = batch_dir / f".metrics_item.{item.id}.csv"
                         try:
                             df.to_csv(tmp, index=False)
-                            promote_file_atomic(tmp, metrics_items / f"{item.id}.csv", allow_reuse=allow_reuse)
+                            promote_file_atomic(tmp, dst_metrics, allow_reuse=allow_reuse)
                         finally:
                             try:
                                 tmp.unlink()
@@ -3563,10 +3876,13 @@ class AF3RefoldStep(ExternalCommandStep):
                 run_stem = str((item.payload or {}).get("run_stem") or item.id)
                 job_dir = af3_dir / run_stem
                 if job_dir.exists():
+                    source = _job_source(job_dir, run_stem)
+                    if source is None:
+                        continue
                     if not (cif_dir / f"{item.id}.cif").exists():
-                        _promote_cif_for_job(run_stem, job_dir, item)
+                        _promote_cif_for_source(source, item)
                     if not (pdbs_dir / f"{item.id}.pdb").exists():
-                        _promote_pdb_for_job(run_stem, job_dir, item)
+                        _promote_pdb_for_source(source, item)
 
         all_done = all(self.item_done(ctx, item) for item in valid_items)
         if all_done:
@@ -3601,7 +3917,9 @@ class AF3RefoldStep(ExternalCommandStep):
             shutil.rmtree(batch_dir, ignore_errors=True)
 
         for item in valid_items:
-            if self.item_done(ctx, item):
+            if item.id in forced_failed:
+                results[item.id] = ("failed", forced_failed.get(item.id))
+            elif self.item_done(ctx, item):
                 results[item.id] = ("done", None)
             else:
                 results[item.id] = ("failed", err or "missing output")
