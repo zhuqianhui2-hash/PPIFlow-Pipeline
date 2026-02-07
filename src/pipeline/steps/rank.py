@@ -525,6 +525,12 @@ class RankFeaturesStep(RankStep):
     supports_work_queue = True
     work_queue_mode = "items"
 
+    def outputs_complete(self, ctx: StepContext) -> bool:
+        # This step produces per-item feature JSONs under results/features/.
+        # It must *not* inherit RankStep.outputs_complete(), which is the
+        # rank_finalize contract (requires results/summary.csv + manifest.json).
+        return self._outputs_complete_items(ctx)
+
     def expected_total(self, ctx: StepContext) -> int:
         return 1
 

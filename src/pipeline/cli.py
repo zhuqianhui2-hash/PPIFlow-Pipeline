@@ -55,6 +55,17 @@ def _add_work_queue_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--work-queue-rebuild", action="store_true", help="Drop/rebuild queue.db from outputs")
 
 
+def _add_run_lock_args(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--no-run-lock", action="store_true", help="Disable output run lock (debug only)")
+    parser.add_argument(
+        "--run-lock-stale-seconds",
+        type=int,
+        default=None,
+        help="Consider an existing lock stale after this many seconds (default: derived from heartbeat interval)",
+    )
+    parser.add_argument("--steal-lock", action="store_true", help="Take over a lock even if it looks active")
+
+
 def _add_cli_input_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--name", type=str, help="Design name")
     parser.add_argument("--target_pdb", type=str, help="Target PDB path")
@@ -157,6 +168,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="Always regenerate configs before running",
     )
     _add_work_queue_args(p_pipeline)
+    _add_run_lock_args(p_pipeline)
     _add_cli_input_args(p_pipeline)
 
     p_configure = sub.add_parser("configure", help="Write step configs and steps.yaml")
@@ -173,6 +185,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_execute.add_argument("--num-devices", type=str, default=None, help="Number of GPUs/workers (e.g. 4 or 'all')")
     p_execute.add_argument("--devices", type=str, default=None, help="Comma-separated GPU list or 'all'")
     _add_work_queue_args(p_execute)
+    _add_run_lock_args(p_execute)
 
     p_rank = sub.add_parser("rank", help="Run rank step only")
     p_rank.add_argument("--output", type=str, required=True)
@@ -182,6 +195,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_rank.add_argument("--num-devices", type=str, default=None, help="Number of GPUs/workers (e.g. 4 or 'all')")
     p_rank.add_argument("--devices", type=str, default=None, help="Comma-separated GPU list or 'all'")
     _add_work_queue_args(p_rank)
+    _add_run_lock_args(p_rank)
 
     p_orch = sub.add_parser("orchestrate", help="Run per-step work-queue pools")
     p_orch.add_argument("--output", type=str, required=True)
@@ -208,6 +222,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_orch.add_argument("--no-bind", action="store_true", help="Do not set CUDA_VISIBLE_DEVICES or rank env vars")
     p_orch.add_argument("--devices", type=str, default=None, help="Comma-separated GPU list or 'all'")
+    _add_run_lock_args(p_orch)
 
     sub.add_parser("wizard", help="Interactive setup wizard")
 

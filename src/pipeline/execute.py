@@ -17,6 +17,8 @@ from .steps import STEP_ORDER, STEP_REGISTRY
 from .steps.base import StepContext, StepError
 from .output_policy import mode as output_mode
 from . import prune as prune_outputs
+from .run_lock import RunLock, RunLockError, ensure_expected_lock_id, run_lock_disabled, validate_expected_lock_id
+from .work_queue import reset_all_claims_and_leaders
 
 
 def _resolve_steps(steps_arg: str | None) -> list[str]:
@@ -180,6 +182,61 @@ def execute_pipeline(args) -> None:
     sampling = input_data.get("sampling") or {}
     target_n = int(sampling.get("samples_per_target", 0) or 0)
 
+    # Run lock + claim reset (controller-only). If we're running under orchestrate, the controller
+    # passes PPIFLOW_RUN_LOCK_ID and we behave as a worker.
+    import atexit
+
+    run_lock = None
+    no_run_lock = bool(getattr(args, "no_run_lock", False)) or run_lock_disabled()
+    if no_run_lock:
+        os.environ["PPIFLOW_NO_RUN_LOCK"] = "1"
+
+    if not os.environ.get("PPIFLOW_RUN_LOCK_ID") and rank == 0 and not no_run_lock:
+        try:
+            run_lock = RunLock.acquire(
+                out_dir,
+                stale_after_seconds=getattr(args, "run_lock_stale_seconds", None),
+                heartbeat_interval_seconds=5.0,
+                steal=bool(getattr(args, "steal_lock", False)),
+                disabled=no_run_lock,
+                owner_extra={"input_sha256": input_sha},
+            )
+        except RunLockError as exc:
+            raise StepError(str(exc)) from exc
+        if run_lock is not None:
+            atexit.register(run_lock.release)
+            try:
+                reset_summary = reset_all_claims_and_leaders(out_dir)
+                deleted = 0
+                for info in (reset_summary.get("steps") or []):
+                    try:
+                        deleted += int(info.get("claims_deleted") or 0)
+                        deleted += int(info.get("leader_deleted") or 0)
+                    except Exception:
+                        pass
+                if deleted:
+                    _console(f"run_lock reset: cleared {deleted} stale claims/leader rows across queue.db files")
+            except Exception:
+                pass
+    else:
+        # Worker mode (or external multi-rank): snapshot expected lock id from disk if present.
+        try:
+            if (
+                not os.environ.get("PPIFLOW_RUN_LOCK_ID")
+                and not no_run_lock
+                and world_size > 1
+                and rank != 0
+            ):
+                # External launchers may start all ranks concurrently; wait briefly for rank0 to
+                # create the lock + owner.json so we get a stable fencing token.
+                start = time.time()
+                while (time.time() - start) < 5.0 and not (out_dir / ".ppiflow_lock").exists():
+                    time.sleep(0.1)
+            if not no_run_lock:
+                ensure_expected_lock_id(out_dir, wait_seconds=5.0)
+        except Exception:
+            pass
+
     state = None
     state_path = out_dir / "pipeline_state.json"
     if rank == 0:
@@ -219,8 +276,8 @@ def execute_pipeline(args) -> None:
     def _resolve_work_queue_cfg() -> dict:
         cfg = dict(input_data.get("work_queue") or {})
         cfg.setdefault("enabled", True)
-        cfg.setdefault("lease_seconds", 1800)
-        cfg.setdefault("max_attempts", 1)
+        cfg.setdefault("lease_seconds", 300)
+        cfg.setdefault("max_attempts", 2)
         cfg.setdefault("retry_failed", False)
         cfg.setdefault("batch_size", 1)
         cfg.setdefault("leader_timeout", 600)
@@ -293,6 +350,8 @@ def execute_pipeline(args) -> None:
     manifest_counts: dict[str, int] = {}
 
     for idx, step_info in enumerate(ordered_steps, start=1):
+        # If the controller has been taken over, stop before starting more work.
+        validate_expected_lock_id(out_dir)
         step_name = step_info.get("name")
         config_rel = step_info.get("config_file")
         if not step_name or not config_rel:
@@ -428,3 +487,6 @@ def execute_pipeline(args) -> None:
     _console("=" * 78)
     if hb:
         hb.complete(extra={"message": "pipeline complete"})
+
+    if run_lock is not None:
+        run_lock.release()

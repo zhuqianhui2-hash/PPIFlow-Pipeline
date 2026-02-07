@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, Optional
 
 from .io import ensure_dir
+from .run_lock import RunLockError, ensure_expected_lock_id, fence_process, read_active_lock_id, run_lock_disabled
 
 
 class WorkQueueError(RuntimeError):
@@ -78,8 +79,8 @@ class WorkQueue:
         self.base_dir = self.out_dir / ".work" / self.step
         self.db_path = self.base_dir / "queue.db"
 
-        self.lease_seconds = int(self.cfg.get("lease_seconds") or 1800)
-        self.max_attempts = int(self.cfg.get("max_attempts") or 1)
+        self.lease_seconds = int(self.cfg.get("lease_seconds") or 300)
+        self.max_attempts = int(self.cfg.get("max_attempts") or 2)
         self.retry_failed = bool(self.cfg.get("retry_failed"))
         batch_val = self.cfg.get("batch_size")
         self.batch_size = 1 if batch_val is None else int(batch_val)
@@ -98,6 +99,34 @@ class WorkQueue:
         self.busy_timeout_ms = int(self.cfg.get("busy_timeout_ms") or 5000)
 
         self.worker_id = worker_id or self._default_worker_id()
+        # Snapshot expected lock id if provided; otherwise resolve lazily on first DB mutation.
+        self._expected_run_lock_id: str | None = os.environ.get("PPIFLOW_RUN_LOCK_ID")
+
+    def _validate_run_lock(self) -> None:
+        """
+        Fencing token validation.
+
+        Any DB write that affects correctness must ensure this worker is still operating under
+        the active run lock. If the lock id changes (takeover), we should stop mutating state.
+        """
+        if run_lock_disabled():
+            return
+        expected = self._expected_run_lock_id
+        if not expected:
+            try:
+                expected = ensure_expected_lock_id(self.out_dir, wait_seconds=5.0)
+            except RunLockError as exc:
+                raise WorkQueueError(str(exc)) from exc
+            self._expected_run_lock_id = expected
+        if not expected:
+            return
+        active = read_active_lock_id(self.out_dir)
+        if not active:
+            fence_process("[work_queue] run lock missing; exiting")
+        if str(active) != str(expected):
+            fence_process(
+                f"[work_queue] run lock changed (expected={expected} active={active}); exiting",
+            )
 
     @classmethod
     def from_step_dir(cls, step_dir: Path) -> "WorkQueue":
@@ -355,6 +384,7 @@ class WorkQueue:
         }
 
     def init_leader(self, meta: Dict[str, Any]) -> None:
+        self._validate_run_lock()
         self._ensure_db()
         meta = dict(meta)
         meta.setdefault("schema_version", 1)
@@ -369,6 +399,7 @@ class WorkQueue:
         rebuild: bool = False,
         item_done_fn: Optional[callable] = None,
     ) -> None:
+        self._validate_run_lock()
         lock_acquired = False
         if rebuild:
             if self._acquire_rebuild_lock():
@@ -477,6 +508,7 @@ class WorkQueue:
     def claim_next(self) -> Optional[ClaimedItem]:
         if not self.db_path.exists():
             return None
+        self._validate_run_lock()
         conn = self._connect()
         now = time.time()
         try:
@@ -573,6 +605,7 @@ class WorkQueue:
     def heartbeat(self, item_id: str) -> None:
         if not self.db_path.exists():
             return
+        self._validate_run_lock()
         conn = self._connect()
         try:
             conn.execute(
@@ -585,6 +618,7 @@ class WorkQueue:
     def touch_items(self, item_ids: Iterable[str]) -> None:
         if not self.db_path.exists():
             return
+        self._validate_run_lock()
         ids = [str(i) for i in item_ids if i]
         if not ids:
             return
@@ -604,6 +638,7 @@ class WorkQueue:
     def mark_done(self, item_id: str, attempt: int, *, note: Optional[str] = None) -> None:
         if not self.db_path.exists():
             return
+        self._validate_run_lock()
         conn = self._connect()
         try:
             conn.execute(
@@ -621,6 +656,7 @@ class WorkQueue:
     def mark_failed(self, item_id: str, attempt: int, error: str) -> None:
         if not self.db_path.exists():
             return
+        self._validate_run_lock()
         conn = self._connect()
         try:
             conn.execute(
@@ -638,6 +674,7 @@ class WorkQueue:
     def mark_failed_items(self, item_ids: Iterable[str], *, reason: str = "prior failure") -> None:
         if not self.db_path.exists():
             return
+        self._validate_run_lock()
         ids = [str(i) for i in item_ids if i]
         if not ids:
             return
@@ -657,6 +694,7 @@ class WorkQueue:
     def mark_blocked(self, item_id: str, attempt: int, reason: str) -> None:
         if not self.db_path.exists():
             return
+        self._validate_run_lock()
         conn = self._connect()
         try:
             conn.execute(
@@ -668,6 +706,46 @@ class WorkQueue:
                 (str(item_id), int(attempt), "blocked", str(reason), _iso(), self.worker_id),
             )
             conn.execute("DELETE FROM claims WHERE id=?", (str(item_id),))
+        finally:
+            conn.close()
+
+    def release_worker_claims(self) -> int:
+        """
+        Best-effort cleanup for graceful shutdowns.
+
+        When a worker process exits (SIGTERM/SIGINT, preemption, timeout), any in-flight items it
+        previously claimed can otherwise remain stuck as status='running' until the lease expires.
+        Releasing those claims allows immediate resume without waiting for lease_seconds.
+
+        Returns number of claims released.
+        """
+        if not self.db_path.exists():
+            return 0
+        self._validate_run_lock()
+        conn = self._connect()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            rows = conn.execute(
+                "SELECT id FROM claims WHERE worker_id=?",
+                (self.worker_id,),
+            ).fetchall()
+            item_ids = [str(r["id"]) for r in rows]
+            if not item_ids:
+                conn.execute("COMMIT")
+                return 0
+            # Do not flip running -> pending here: pending items are only claimable when
+            # attempts < max_attempts, so this can wedge resume if an interrupted claim
+            # consumed the final attempt. Deleting claims is sufficient to make running
+            # items immediately reclaimable (NULL claim heartbeat is treated as stale).
+            conn.execute("DELETE FROM claims WHERE worker_id=?", (self.worker_id,))
+            conn.execute("COMMIT")
+            return len(item_ids)
+        except Exception:
+            try:
+                conn.execute("ROLLBACK")
+            except Exception:
+                pass
+            return 0
         finally:
             conn.close()
 
@@ -751,6 +829,7 @@ class WorkQueue:
             conn.close()
 
     def acquire_leader(self) -> bool:
+        self._validate_run_lock()
         self._ensure_db()
         conn = self._connect()
         now = time.time()
@@ -788,6 +867,7 @@ class WorkQueue:
     def leader_heartbeat(self) -> None:
         if not self.db_path.exists():
             return
+        self._validate_run_lock()
         conn = self._connect()
         try:
             conn.execute(
@@ -800,6 +880,7 @@ class WorkQueue:
     def write_complete(self) -> None:
         if not self.db_path.exists():
             return
+        self._validate_run_lock()
         conn = self._connect()
         try:
             conn.execute(
@@ -812,6 +893,7 @@ class WorkQueue:
     def write_failed(self, *, error: str | None = None) -> None:
         if not self.db_path.exists():
             return
+        self._validate_run_lock()
         conn = self._connect()
         try:
             conn.execute(
@@ -824,6 +906,7 @@ class WorkQueue:
     def release_leader(self) -> None:
         if not self.db_path.exists():
             return
+        self._validate_run_lock()
         conn = self._connect()
         try:
             row = conn.execute("SELECT status FROM leader WHERE id=1").fetchone()
@@ -837,6 +920,7 @@ class WorkQueue:
     def reset_items_for_retry(self) -> None:
         if not self.db_path.exists():
             return
+        self._validate_run_lock()
         conn = self._connect()
         try:
             conn.execute(
@@ -850,6 +934,7 @@ class WorkQueue:
     def reset_leader_for_retry(self) -> None:
         if not self.db_path.exists():
             return
+        self._validate_run_lock()
         conn = self._connect()
         try:
             conn.execute("DELETE FROM leader WHERE id=1")
@@ -860,6 +945,77 @@ class WorkQueue:
         # Per-worker log file (prefixed lines handled by caller).
         fname = f"worker-{socket.gethostname()}_{os.getpid()}_{os.environ.get('RANK', '0')}.log"
         return self.base_dir / fname
+
+
+def reset_all_claims_and_leaders(out_dir: str | Path) -> Dict[str, Any]:
+    """
+    Controller-only recovery: clear claims + leader rows across all step queue.db files.
+
+    This enables immediate resume after hard-kill without waiting for lease_seconds/leader_timeout
+    to expire. It intentionally does NOT change items.status or attempts.
+
+    Returns a small summary for logging/debugging.
+    """
+    out_dir = Path(out_dir)
+    work_root = out_dir / ".work"
+    summary: Dict[str, Any] = {"steps": []}
+    if not work_root.exists():
+        return summary
+
+    for step_dir in sorted([p for p in work_root.iterdir() if p.is_dir()], key=lambda p: p.name):
+        db_path = step_dir / "queue.db"
+        if not db_path.exists():
+            continue
+        step_name = step_dir.name
+        step_info: Dict[str, Any] = {"step": step_name, "db": str(db_path), "claims_deleted": 0, "leader_deleted": 0}
+        last_exc: Exception | None = None
+        for _attempt in range(10):
+            try:
+                conn = sqlite3.connect(db_path, timeout=1.0, isolation_level=None)
+                conn.row_factory = sqlite3.Row
+                try:
+                    conn.execute("PRAGMA busy_timeout = 1000")
+                    conn.execute("BEGIN IMMEDIATE")
+                    try:
+                        try:
+                            row = conn.execute("SELECT COUNT(*) AS c FROM claims").fetchone()
+                            step_info["claims_deleted"] = int(row["c"] or 0) if row else 0
+                            conn.execute("DELETE FROM claims")
+                        except sqlite3.OperationalError:
+                            # Table missing or corrupted schema; best-effort.
+                            pass
+                        try:
+                            # leader is a single-row table (id=1); delete unconditionally.
+                            row = conn.execute("SELECT COUNT(*) AS c FROM leader").fetchone()
+                            step_info["leader_deleted"] = int(row["c"] or 0) if row else 0
+                            conn.execute("DELETE FROM leader")
+                        except sqlite3.OperationalError:
+                            pass
+                        conn.execute("COMMIT")
+                        last_exc = None
+                        break
+                    except Exception:
+                        try:
+                            conn.execute("ROLLBACK")
+                        except Exception:
+                            pass
+                        raise
+                finally:
+                    conn.close()
+            except sqlite3.OperationalError as exc:
+                last_exc = exc
+                msg = str(exc).lower()
+                if "locked" in msg or "busy" in msg:
+                    time.sleep(0.25)
+                    continue
+                break
+            except Exception as exc:
+                last_exc = exc
+                break
+        if last_exc is not None:
+            step_info["error"] = str(last_exc)
+        summary["steps"].append(step_info)
+    return summary
 
 
 def load_progress(work_dir: Path) -> Optional[Dict[str, Any]]:

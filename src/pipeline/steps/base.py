@@ -6,6 +6,7 @@ import json
 import math
 import os
 import re
+import signal
 import sys
 import threading
 import socket
@@ -495,6 +496,22 @@ class Step:
 
         worker_id = f"{socket.gethostname()}:{os.getpid()}:{ctx.rank}"
         wq = WorkQueue(ctx.out_dir, self.name, wq_cfg, worker_id=worker_id)
+        prev_sig_handlers: dict[int, Any] = {}
+
+        def _term_handler(signum: int, _frame: Any) -> None:
+            # Unwind into finally blocks; we will release our claims there.
+            raise KeyboardInterrupt(f"signal {signum}")
+
+        # Best-effort: handle common “job is ending” signals so we can release claims and avoid
+        # waiting lease_seconds on resume.
+        for sig in (getattr(signal, "SIGTERM", None), getattr(signal, "SIGINT", None)):
+            if sig is None:
+                continue
+            try:
+                prev_sig_handlers[int(sig)] = signal.getsignal(sig)
+                signal.signal(sig, _term_handler)
+            except Exception:
+                pass
         rebuild = bool(wq_cfg.get("rebuild_from_outputs"))
         if not wq.db_path.exists():
             rebuild = True
@@ -877,6 +894,16 @@ class Step:
                     error_reason = f"{self.name} work queue failed"
             os.environ.pop("PPIFLOW_WORK_QUEUE_DIR", None)
             os.environ.pop("PPIFLOW_WORK_QUEUE_MODE", None)
+            if not success:
+                try:
+                    wq.release_worker_claims()
+                except Exception:
+                    pass
+            for sig, prev in prev_sig_handlers.items():
+                try:
+                    signal.signal(sig, prev)
+                except Exception:
+                    pass
 
         if success and counts.get("pending", 0) == 0 and counts.get("running", 0) == 0:
             self._finalize_work_queue_outputs(ctx, wq, items=items, allow_failures=allow_failures)

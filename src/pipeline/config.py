@@ -285,8 +285,11 @@ def normalize_input(
 
     work_queue = out.get("work_queue") or {}
     work_queue.setdefault("enabled", True)
-    work_queue.setdefault("lease_seconds", 1800)
-    work_queue.setdefault("max_attempts", 1)
+    work_queue.setdefault("lease_seconds", 300)
+    # max_attempts=1 is too brittle under real-world preemption/timeout: a single SIGTERM can
+    # consume the only attempt and wedge plain resume until a rebuild. Default to 2 so we have
+    # headroom for one lost in-flight attempt.
+    work_queue.setdefault("max_attempts", 2)
     work_queue.setdefault("retry_failed", False)
     work_queue.setdefault("batch_size", 1)
     work_queue.setdefault("leader_timeout", 600)

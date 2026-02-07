@@ -12,9 +12,10 @@ from typing import Any, Dict, Iterable, List, Optional
 
 from .configure import configure_pipeline
 from .io import ensure_dir, read_json, read_yaml, repo_root, write_json
+from .run_lock import RunLock, RunLockError, run_lock_disabled
 from .steps import STEP_REGISTRY
 from .steps.base import StepContext
-from .work_queue import WaitResult, wait_for_step, WorkQueue
+from .work_queue import WaitResult, reset_all_claims_and_leaders, wait_for_step, WorkQueue
 
 
 class OrchestratorError(RuntimeError):
@@ -319,10 +320,14 @@ def _build_worker_cmd(
     continue_on_error: bool,
     wait_timeout: Optional[int],
     work_queue_rebuild: bool = False,
+    no_run_lock: bool = False,
 ) -> list[str]:
     root = repo_root(out_dir)
     ppiflow = root / "ppiflow.py"
     cmd = [sys.executable, str(ppiflow), "execute", "--output", str(out_dir), "--steps", ",".join(steps), "--work-queue"]
+    if no_run_lock:
+        # Pass through for transparency/debugging (env-based disable is still the source of truth).
+        cmd.append("--no-run-lock")
     if continue_on_error:
         cmd.append("--continue-on-error")
     if wait_timeout is not None:
@@ -346,6 +351,7 @@ def _spawn_workers(
     progress_log_path: Path | None = None,
     work_queue_rebuild: bool = False,
     retry_failed_override: Optional[bool] = None,
+    no_run_lock: bool = False,
 ) -> tuple[list[subprocess.Popen], list[dict]]:
     procs: list[subprocess.Popen] = []
     workers: list[dict] = []
@@ -375,6 +381,7 @@ def _spawn_workers(
             continue_on_error=continue_on_error,
             wait_timeout=wait_timeout,
             work_queue_rebuild=work_queue_rebuild,
+            no_run_lock=no_run_lock,
         )
         stdout_path = run_dir / f"stdout_rank{rank}.log"
         stderr_path = run_dir / f"stderr_rank{rank}.log"
@@ -570,333 +577,370 @@ def _wait_for_step_with_process_check(
 def orchestrate_pipeline(args) -> None:
     out_dir = Path(args.output).resolve()
     ensure_dir(out_dir)
-    log_dir = out_dir / "logs"
-    ensure_dir(log_dir)
+    if bool(getattr(args, "no_run_lock", False)):
+        os.environ["PPIFLOW_NO_RUN_LOCK"] = "1"
+    try:
+        run_lock = RunLock.acquire(
+            out_dir,
+            stale_after_seconds=getattr(args, "run_lock_stale_seconds", None),
+            heartbeat_interval_seconds=5.0,
+            steal=bool(getattr(args, "steal_lock", False)),
+            disabled=bool(getattr(args, "no_run_lock", False)) or run_lock_disabled(),
+        )
+    except RunLockError as exc:
+        raise OrchestratorError(str(exc)) from exc
+    try:
+        # Controller recovery pass: clear claims/leader rows so resume doesn't wait for leases.
+        if run_lock is not None:
+            try:
+                reset_summary = reset_all_claims_and_leaders(out_dir)
+                deleted = 0
+                for info in (reset_summary.get("steps") or []):
+                    try:
+                        deleted += int(info.get("claims_deleted") or 0)
+                        deleted += int(info.get("leader_deleted") or 0)
+                    except Exception:
+                        pass
+                if deleted:
+                    print(
+                        f"[orchestrator] reset: cleared {deleted} stale claims/leader rows across queue.db files",
+                        file=sys.__stdout__,
+                        flush=True,
+                    )
+            except Exception:
+                pass
 
-    steps_yaml = out_dir / "steps.yaml"
-    input_json = out_dir / "pipeline_input.json"
+        log_dir = out_dir / "logs"
+        ensure_dir(log_dir)
 
-    if not steps_yaml.exists() or not input_json.exists():
-        if getattr(args, "configure", False):
-            if not getattr(args, "input", None):
-                raise OrchestratorError("--configure requires --input")
-            configure_pipeline(args)
-        else:
-            missing = "steps.yaml" if not steps_yaml.exists() else "pipeline_input.json"
-            raise OrchestratorError(f"{missing} missing; run configure first or pass --configure")
+        steps_yaml = out_dir / "steps.yaml"
+        input_json = out_dir / "pipeline_input.json"
 
-    input_data = read_json(input_json)
-    orch_cfg = dict(input_data.get("orchestrator") or {})
-    if orch_cfg.get("groups"):
-        raise OrchestratorError("orchestrator groups are not supported; use per-step pools only")
-    work_queue_cfg = dict(input_data.get("work_queue") or {})
-    work_queue_cfg.setdefault("enabled", True)
-    work_queue_cfg.setdefault("lease_seconds", 1800)
-    work_queue_cfg.setdefault("max_attempts", 1)
-    work_queue_cfg.setdefault("retry_failed", False)
-    work_queue_cfg.setdefault("batch_size", 1)
-    work_queue_cfg.setdefault("leader_timeout", 600)
-    work_queue_cfg.setdefault("wait_timeout", None)
-    work_queue_cfg.setdefault("allow_reuse", True)
-    work_queue_cfg.setdefault("rebuild_from_outputs", False)
-    work_queue_cfg.setdefault("explicit_reuse", False)
-    if getattr(args, "work_queue_reuse", False):
-        work_queue_cfg["allow_reuse"] = True
-        work_queue_cfg["explicit_reuse"] = True
-    if getattr(args, "work_queue_strict", False):
-        work_queue_cfg["allow_reuse"] = False
-    if getattr(args, "work_queue_rebuild", False):
-        work_queue_cfg["rebuild_from_outputs"] = True
-    retry_failed_configured = bool(work_queue_cfg.get("retry_failed"))
-    explicit_retry = bool(getattr(args, "retry_failed", False))
-    if retry_failed_configured and not explicit_retry:
-        print(
-            "[orchestrator] note: disabling item-level retry_failed for worker runs",
-            file=sys.__stdout__,
-            flush=True,
+        if not steps_yaml.exists() or not input_json.exists():
+            if getattr(args, "configure", False):
+                if not getattr(args, "input", None):
+                    raise OrchestratorError("--configure requires --input")
+                configure_pipeline(args)
+            else:
+                missing = "steps.yaml" if not steps_yaml.exists() else "pipeline_input.json"
+                raise OrchestratorError(f"{missing} missing; run configure first or pass --configure")
+
+        input_data = read_json(input_json)
+        orch_cfg = dict(input_data.get("orchestrator") or {})
+        if orch_cfg.get("groups"):
+            raise OrchestratorError("orchestrator groups are not supported; use per-step pools only")
+        work_queue_cfg = dict(input_data.get("work_queue") or {})
+        work_queue_cfg.setdefault("enabled", True)
+        work_queue_cfg.setdefault("lease_seconds", 300)
+        work_queue_cfg.setdefault("max_attempts", 2)
+        work_queue_cfg.setdefault("retry_failed", False)
+        work_queue_cfg.setdefault("batch_size", 1)
+        work_queue_cfg.setdefault("leader_timeout", 600)
+        work_queue_cfg.setdefault("wait_timeout", None)
+        work_queue_cfg.setdefault("allow_reuse", True)
+        work_queue_cfg.setdefault("rebuild_from_outputs", False)
+        work_queue_cfg.setdefault("explicit_reuse", False)
+        if getattr(args, "work_queue_reuse", False):
+            work_queue_cfg["allow_reuse"] = True
+            work_queue_cfg["explicit_reuse"] = True
+        if getattr(args, "work_queue_strict", False):
+            work_queue_cfg["allow_reuse"] = False
+        if getattr(args, "work_queue_rebuild", False):
+            work_queue_cfg["rebuild_from_outputs"] = True
+        retry_failed_configured = bool(work_queue_cfg.get("retry_failed"))
+        explicit_retry = bool(getattr(args, "retry_failed", False))
+        if retry_failed_configured and not explicit_retry:
+            print(
+                "[orchestrator] note: disabling item-level retry_failed for worker runs",
+                file=sys.__stdout__,
+                flush=True,
+            )
+
+        failure_policy = _normalize_failure_policy(
+            orch_cfg.get("failure_policy") or {},
+            getattr(args, "failure_policy", None),
         )
 
-    failure_policy = _normalize_failure_policy(
-        orch_cfg.get("failure_policy") or {},
-        getattr(args, "failure_policy", None),
-    )
+        continue_on_error = failure_policy.mode in {"allow", "threshold"}
+        if continue_on_error:
+            # Keep ready_ctx consistent with worker behavior when we spawn with --continue-on-error.
+            options = input_data.setdefault("options", {})
+            options.setdefault("continue_on_item_error", True)
 
-    continue_on_error = failure_policy.mode in {"allow", "threshold"}
-    if continue_on_error:
-        # Keep ready_ctx consistent with worker behavior when we spawn with --continue-on-error.
-        options = input_data.setdefault("options", {})
-        options.setdefault("continue_on_item_error", True)
+        if getattr(args, "max_retries", None) is not None:
+            orch_cfg.setdefault("retries", {})["max_step_attempts"] = int(args.max_retries)
 
-    if getattr(args, "max_retries", None) is not None:
-        orch_cfg.setdefault("retries", {})["max_step_attempts"] = int(args.max_retries)
+        available_steps = _load_steps(out_dir)
+        step_cfgs = _load_step_configs(out_dir)
+        ready_ctx = _build_ready_context(out_dir, input_data, work_queue_cfg)
 
-    available_steps = _load_steps(out_dir)
-    step_cfgs = _load_step_configs(out_dir)
-    ready_ctx = _build_ready_context(out_dir, input_data, work_queue_cfg)
-
-    step_arg = getattr(args, "steps", None)
-    if step_arg and step_arg not in {"", "all"}:
-        if "," in step_arg:
-            raise OrchestratorError("--steps accepts a single step only")
-        single_step = step_arg.strip()
-    else:
-        single_step = None
-
-    num_devices_raw = _parse_num_devices(getattr(args, "num_devices", None))
-    devices_arg = getattr(args, "devices", None)
-    pool_override = getattr(args, "pool_size", None)
-
-    if num_devices_raw is not None and getattr(args, "no_bind", False):
-        raise OrchestratorError("--num-devices requires GPU binding (remove --no-bind)")
-
-    if num_devices_raw is not None:
-        explicit_devices = _parse_devices(devices_arg)
-        if explicit_devices is not None and len(explicit_devices) == 0:
-            explicit_devices = None
-
-        if num_devices_raw.lower() == "all":
-            devices = explicit_devices or _detect_visible_devices()
-            if not devices:
-                raise OrchestratorError("No GPUs detected for --num-devices all")
-            if explicit_devices is not None and len(explicit_devices) != len(devices):
-                raise OrchestratorError("--devices and --num-devices all conflict")
+        step_arg = getattr(args, "steps", None)
+        if step_arg and step_arg not in {"", "all"}:
+            if "," in step_arg:
+                raise OrchestratorError("--steps accepts a single step only")
+            single_step = step_arg.strip()
         else:
-            try:
-                num_devices = int(num_devices_raw)
-            except Exception as exc:
-                raise OrchestratorError(f"Invalid --num-devices value: {num_devices_raw}") from exc
-            if num_devices < 1:
-                raise OrchestratorError("--num-devices must be >= 1")
-            if explicit_devices is not None:
-                if len(explicit_devices) != num_devices:
-                    raise OrchestratorError("--devices count must match --num-devices")
-                devices = explicit_devices
+            single_step = None
+
+        num_devices_raw = _parse_num_devices(getattr(args, "num_devices", None))
+        devices_arg = getattr(args, "devices", None)
+        pool_override = getattr(args, "pool_size", None)
+
+        if num_devices_raw is not None and getattr(args, "no_bind", False):
+            raise OrchestratorError("--num-devices requires GPU binding (remove --no-bind)")
+
+        if num_devices_raw is not None:
+            explicit_devices = _parse_devices(devices_arg)
+            if explicit_devices is not None and len(explicit_devices) == 0:
+                explicit_devices = None
+
+            if num_devices_raw.lower() == "all":
+                devices = explicit_devices or _detect_visible_devices()
+                if not devices:
+                    raise OrchestratorError("No GPUs detected for --num-devices all")
+                if explicit_devices is not None and len(explicit_devices) != len(devices):
+                    raise OrchestratorError("--devices and --num-devices all conflict")
             else:
-                visible = _detect_visible_devices()
-                if len(visible) < num_devices:
-                    raise OrchestratorError(
-                        f"--num-devices {num_devices} requested but only {len(visible)} visible GPUs"
-                    )
-                devices = visible[:num_devices]
+                try:
+                    num_devices = int(num_devices_raw)
+                except Exception as exc:
+                    raise OrchestratorError(f"Invalid --num-devices value: {num_devices_raw}") from exc
+                if num_devices < 1:
+                    raise OrchestratorError("--num-devices must be >= 1")
+                if explicit_devices is not None:
+                    if len(explicit_devices) != num_devices:
+                        raise OrchestratorError("--devices count must match --num-devices")
+                    devices = explicit_devices
+                else:
+                    visible = _detect_visible_devices()
+                    if len(visible) < num_devices:
+                        raise OrchestratorError(
+                            f"--num-devices {num_devices} requested but only {len(visible)} visible GPUs"
+                        )
+                    devices = visible[:num_devices]
 
-        if pool_override is not None and int(pool_override) != len(devices):
-            raise OrchestratorError("--pool-size must match --num-devices")
-        pool_override = len(devices)
-    else:
-        devices = _resolve_device_list(orch_cfg, devices_arg)
+            if pool_override is not None and int(pool_override) != len(devices):
+                raise OrchestratorError("--pool-size must match --num-devices")
+            pool_override = len(devices)
+        else:
+            devices = _resolve_device_list(orch_cfg, devices_arg)
 
-    plan = _build_plan(
-        available_steps,
-        orch_cfg,
-        single_step=single_step,
-        pool_override=pool_override,
-    )
+        plan = _build_plan(
+            available_steps,
+            orch_cfg,
+            single_step=single_step,
+            pool_override=pool_override,
+        )
 
-    orch_dir = out_dir / ".orchestrator"
-    ensure_dir(orch_dir)
-    plan_payload = {
-        "output": str(out_dir),
-        "plan": [
-            {
-                "name": entry.name,
-                "steps": entry.steps,
-                "pool_size": entry.pool_size,
-            }
-            for entry in plan
-        ],
-        "failure_policy": {
-            "mode": failure_policy.mode,
-            "max_failed": failure_policy.max_failed,
-            "max_failed_ratio": failure_policy.max_failed_ratio,
-        },
-    }
-    write_json(orch_dir / "plan.json", plan_payload, indent=2)
-
-    retries = orch_cfg.get("retries") or {}
-    max_attempts = int(retries.get("max_step_attempts") or 1)
-    timeouts = orch_cfg.get("timeouts") or {}
-    step_wait_timeout = timeouts.get("step_wait_timeout")
-    if step_wait_timeout is not None:
-        try:
-            step_wait_timeout = int(step_wait_timeout)
-        except Exception:
-            step_wait_timeout = None
-
-    bind = bool((orch_cfg.get("gpu_binding") or {}).get("enabled", True))
-    if getattr(args, "no_bind", False):
-        bind = False
-
-    if bind:
-        if not devices:
-            pool_sizes = {entry.pool_size for entry in plan}
-            if len(pool_sizes) != 1:
-                raise OrchestratorError(
-                    "GPU binding requires a single pool size (use --num-devices or --pool-size)"
-                )
-            pool_size = next(iter(pool_sizes))
-            visible = _detect_visible_devices()
-            if len(visible) < pool_size:
-                raise OrchestratorError(
-                    f"Pool size {pool_size} requires {pool_size} GPUs but only {len(visible)} visible"
-                )
-            devices = visible[:pool_size]
-        device_count = len(devices)
-        for entry in plan:
-            if entry.pool_size != device_count:
-                raise OrchestratorError(
-                    f"Pool size {entry.pool_size} must match device count {device_count} "
-                    "(use --num-devices or --pool-size to align)"
-                )
-
-    summary: dict[str, Any] = {"status": "running", "steps": []}
-
-    rebuild_requested = bool(getattr(args, "work_queue_rebuild", False))
-
-    for entry in plan:
-        entry_complete = True
-        for step_name in entry.steps:
-            step_cfg = step_cfgs.get(step_name) or {"name": step_name}
-            if not _outputs_complete(step_name=step_name, step_cfg=step_cfg, ctx=ready_ctx):
-                entry_complete = False
-                break
-        if entry_complete:
-            summary["steps"].append({"name": entry.name, "status": "ok", "attempt": 0, "skipped": True})
-            continue
-
-        attempt = 0
-        step_success = False
-        while attempt < max_attempts and not step_success:
-            attempt += 1
-            if attempt > 1:
-                for step_name in entry.steps:
-                    _clear_failure_markers(out_dir / ".work" / step_name)
-            run_dir = orch_dir / "runs" / entry.name
-            ensure_dir(run_dir)
-            attempt_idx = _next_attempt(run_dir)
-            attempt_path = run_dir / f"attempt_{attempt_idx:04d}.json"
-            _reset_attempt_logs(run_dir)
-            run_log_path = log_dir / "run.log"
-            progress_log_path = log_dir / f"{entry.name}.progress.log"
-            log_ctx = _open_log_context(
-                run_dir,
-                run_log_path=run_log_path,
-                step_name=entry.name,
-                attempt=attempt,
-            )
-
-            procs, workers = _spawn_workers(
-                out_dir=out_dir,
-                steps=entry.steps,
-                pool_size=entry.pool_size,
-                bind=bind,
-                devices=devices,
-                continue_on_error=continue_on_error,
-                wait_timeout=step_wait_timeout,
-                run_dir=run_dir,
-                log_ctx=log_ctx,
-                progress_log_path=progress_log_path,
-                work_queue_rebuild=(rebuild_requested and attempt == 1),
-                retry_failed_override=True if explicit_retry else False,
-            )
-            write_json(run_dir / "workers.json", {"workers": workers}, indent=2)
-
-            start_ts = time.time()
-            step_results: list[dict] = []
-            failed_reason = None
-            step_ok = True
-            for step_name in entry.steps:
-                step_dir = out_dir / ".work" / step_name
-                result = _wait_for_step_with_process_check(
-                    step_dir=step_dir,
-                    step_name=step_name,
-                    step_cfg=step_cfgs.get(step_name) or {"name": step_name},
-                    ctx=ready_ctx,
-                    procs=procs,
-                    timeout=step_wait_timeout,
-                )
-                step_info = {
-                    "step": step_name,
-                    "status": result.status,
-                    "reason": result.reason,
-                    "counts": result.counts,
-                }
-                step_results.append(step_info)
-                if result.status == "failed":
-                    step_ok = False
-                    failed_reason = result.reason or "failed"
-                    break
-                if result.status == "timeout":
-                    step_ok = False
-                    failed_reason = "timeout"
-                    break
-                if result.status == "completed":
-                    if not _policy_allows(failure_policy, result.counts):
-                        step_ok = False
-                        failed_reason = "failure_policy"
-                        break
-                    step_cfg = step_cfgs.get(step_name) or {"name": step_name}
-                    if not _wait_for_ready_outputs(
-                        step_name=step_name,
-                        step_cfg=step_cfg,
-                        ctx=ready_ctx,
-                        timeout=step_wait_timeout,
-                    ):
-                        step_ok = False
-                        failed_reason = "outputs_not_ready"
-                        step_info["status"] = "failed"
-                        step_info["reason"] = failed_reason
-                        break
-            if not step_ok:
-                _terminate_workers(procs)
-            else:
-                for proc in procs:
-                    try:
-                        proc.wait(timeout=10)
-                    except Exception:
-                        _terminate_workers([proc])
-            _close_log_context(log_ctx)
-
-            for idx, proc in enumerate(procs):
-                workers[idx]["exit_code"] = proc.poll()
-            write_json(run_dir / "workers.json", {"workers": workers}, indent=2)
-
-            elapsed = time.time() - start_ts
-            attempt_payload = {
-                "entry": {
+        orch_dir = out_dir / ".orchestrator"
+        ensure_dir(orch_dir)
+        plan_payload = {
+            "output": str(out_dir),
+            "plan": [
+                {
                     "name": entry.name,
                     "steps": entry.steps,
                     "pool_size": entry.pool_size,
-                },
-                "attempt": attempt,
-                "started_at": start_ts,
-                "elapsed_seconds": elapsed,
-                "status": "ok" if step_ok else "failed",
-                "reason": failed_reason,
-                "steps": step_results,
-                "workers": workers,
-                "logs": {
-                    "stdout": log_ctx["stdout_path"],
-                    "stderr": log_ctx["stderr_path"],
-                    "run": str(run_log_path),
-                    "progress": str(progress_log_path),
-                },
-            }
-            write_json(attempt_path, attempt_payload, indent=2)
+                }
+                for entry in plan
+            ],
+            "failure_policy": {
+                "mode": failure_policy.mode,
+                "max_failed": failure_policy.max_failed,
+                "max_failed_ratio": failure_policy.max_failed_ratio,
+            },
+        }
+        write_json(orch_dir / "plan.json", plan_payload, indent=2)
 
-            if step_ok:
-                summary["steps"].append({"name": entry.name, "status": "ok", "attempt": attempt})
-                step_success = True
-            else:
-                summary["steps"].append({"name": entry.name, "status": "failed", "attempt": attempt})
-                if attempt >= max_attempts:
-                    summary["status"] = "failed"
-                    summary["reason"] = failed_reason
-                    write_json(orch_dir / "orchestrator.json", summary, indent=2)
-                    raise OrchestratorError(f"Step {entry.name} failed: {failed_reason}")
+        retries = orch_cfg.get("retries") or {}
+        max_attempts = int(retries.get("max_step_attempts") or 1)
+        timeouts = orch_cfg.get("timeouts") or {}
+        step_wait_timeout = timeouts.get("step_wait_timeout")
+        if step_wait_timeout is not None:
+            try:
+                step_wait_timeout = int(step_wait_timeout)
+            except Exception:
+                step_wait_timeout = None
 
-        if not step_success:
-            break
+        bind = bool((orch_cfg.get("gpu_binding") or {}).get("enabled", True))
+        if getattr(args, "no_bind", False):
+            bind = False
 
-    if summary.get("status") != "failed":
-        summary["status"] = "completed"
-    write_json(orch_dir / "orchestrator.json", summary, indent=2)
+        if bind:
+            if not devices:
+                pool_sizes = {entry.pool_size for entry in plan}
+                if len(pool_sizes) != 1:
+                    raise OrchestratorError(
+                        "GPU binding requires a single pool size (use --num-devices or --pool-size)"
+                    )
+                pool_size = next(iter(pool_sizes))
+                visible = _detect_visible_devices()
+                if len(visible) < pool_size:
+                    raise OrchestratorError(
+                        f"Pool size {pool_size} requires {pool_size} GPUs but only {len(visible)} visible"
+                    )
+                devices = visible[:pool_size]
+            device_count = len(devices)
+            for entry in plan:
+                if entry.pool_size != device_count:
+                    raise OrchestratorError(
+                        f"Pool size {entry.pool_size} must match device count {device_count} "
+                        "(use --num-devices or --pool-size to align)"
+                    )
+
+        summary: dict[str, Any] = {"status": "running", "steps": []}
+
+        rebuild_requested = bool(getattr(args, "work_queue_rebuild", False))
+
+        for entry in plan:
+            entry_complete = True
+            for step_name in entry.steps:
+                step_cfg = step_cfgs.get(step_name) or {"name": step_name}
+                if not _outputs_complete(step_name=step_name, step_cfg=step_cfg, ctx=ready_ctx):
+                    entry_complete = False
+                    break
+            if entry_complete:
+                summary["steps"].append({"name": entry.name, "status": "ok", "attempt": 0, "skipped": True})
+                continue
+
+            attempt = 0
+            step_success = False
+            while attempt < max_attempts and not step_success:
+                attempt += 1
+                if attempt > 1:
+                    for step_name in entry.steps:
+                        _clear_failure_markers(out_dir / ".work" / step_name)
+                run_dir = orch_dir / "runs" / entry.name
+                ensure_dir(run_dir)
+                attempt_idx = _next_attempt(run_dir)
+                attempt_path = run_dir / f"attempt_{attempt_idx:04d}.json"
+                _reset_attempt_logs(run_dir)
+                run_log_path = log_dir / "run.log"
+                progress_log_path = log_dir / f"{entry.name}.progress.log"
+                log_ctx = _open_log_context(
+                    run_dir,
+                    run_log_path=run_log_path,
+                    step_name=entry.name,
+                    attempt=attempt,
+                )
+
+                procs, workers = _spawn_workers(
+                    out_dir=out_dir,
+                    steps=entry.steps,
+                    pool_size=entry.pool_size,
+                    bind=bind,
+                    devices=devices,
+                    continue_on_error=continue_on_error,
+                    wait_timeout=step_wait_timeout,
+                    run_dir=run_dir,
+                    log_ctx=log_ctx,
+                    progress_log_path=progress_log_path,
+                    work_queue_rebuild=(rebuild_requested and attempt == 1),
+                    retry_failed_override=True if explicit_retry else False,
+                    no_run_lock=bool(getattr(args, "no_run_lock", False)) or run_lock_disabled(),
+                )
+                write_json(run_dir / "workers.json", {"workers": workers}, indent=2)
+
+                start_ts = time.time()
+                step_results: list[dict] = []
+                failed_reason = None
+                step_ok = True
+                for step_name in entry.steps:
+                    step_dir = out_dir / ".work" / step_name
+                    result = _wait_for_step_with_process_check(
+                        step_dir=step_dir,
+                        step_name=step_name,
+                        step_cfg=step_cfgs.get(step_name) or {"name": step_name},
+                        ctx=ready_ctx,
+                        procs=procs,
+                        timeout=step_wait_timeout,
+                    )
+                    step_info = {
+                        "step": step_name,
+                        "status": result.status,
+                        "reason": result.reason,
+                        "counts": result.counts,
+                    }
+                    step_results.append(step_info)
+                    if result.status == "failed":
+                        step_ok = False
+                        failed_reason = result.reason or "failed"
+                        break
+                    if result.status == "timeout":
+                        step_ok = False
+                        failed_reason = "timeout"
+                        break
+                    if result.status == "completed":
+                        if not _policy_allows(failure_policy, result.counts):
+                            step_ok = False
+                            failed_reason = "failure_policy"
+                            break
+                        step_cfg = step_cfgs.get(step_name) or {"name": step_name}
+                        if not _wait_for_ready_outputs(
+                            step_name=step_name,
+                            step_cfg=step_cfg,
+                            ctx=ready_ctx,
+                            timeout=step_wait_timeout,
+                        ):
+                            step_ok = False
+                            failed_reason = "outputs_not_ready"
+                            step_info["status"] = "failed"
+                            step_info["reason"] = failed_reason
+                            break
+                if not step_ok:
+                    _terminate_workers(procs)
+                else:
+                    for proc in procs:
+                        try:
+                            proc.wait(timeout=10)
+                        except Exception:
+                            _terminate_workers([proc])
+                _close_log_context(log_ctx)
+
+                for idx, proc in enumerate(procs):
+                    workers[idx]["exit_code"] = proc.poll()
+                write_json(run_dir / "workers.json", {"workers": workers}, indent=2)
+
+                elapsed = time.time() - start_ts
+                attempt_payload = {
+                    "entry": {
+                        "name": entry.name,
+                        "steps": entry.steps,
+                        "pool_size": entry.pool_size,
+                    },
+                    "attempt": attempt,
+                    "started_at": start_ts,
+                    "elapsed_seconds": elapsed,
+                    "status": "ok" if step_ok else "failed",
+                    "reason": failed_reason,
+                    "steps": step_results,
+                    "workers": workers,
+                    "logs": {
+                        "stdout": log_ctx["stdout_path"],
+                        "stderr": log_ctx["stderr_path"],
+                        "run": str(run_log_path),
+                        "progress": str(progress_log_path),
+                    },
+                }
+                write_json(attempt_path, attempt_payload, indent=2)
+
+                if step_ok:
+                    summary["steps"].append({"name": entry.name, "status": "ok", "attempt": attempt})
+                    step_success = True
+                else:
+                    summary["steps"].append({"name": entry.name, "status": "failed", "attempt": attempt})
+                    if attempt >= max_attempts:
+                        summary["status"] = "failed"
+                        summary["reason"] = failed_reason
+                        write_json(orch_dir / "orchestrator.json", summary, indent=2)
+                        raise OrchestratorError(f"Step {entry.name} failed: {failed_reason}")
+
+            if not step_success:
+                break
+
+        if summary.get("status") != "failed":
+            summary["status"] = "completed"
+        write_json(orch_dir / "orchestrator.json", summary, indent=2)
+    finally:
+        if run_lock is not None:
+            run_lock.release()
