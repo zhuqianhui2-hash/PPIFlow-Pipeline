@@ -16,7 +16,8 @@ from .base import Step, StepContext, StepError
 from ..work_queue import WorkItem
 from ..logging_utils import log_command_progress, run_command
 from ..io import repo_root, is_ignored_path
-from ..manifests import extract_design_id, structure_id_from_name, write_csv
+from ..direct_legacy import safe_id_from_relpath
+from ..manifests import extract_design_id, write_csv
 from ..output_policy import is_minimal, scratch_dir
 
 
@@ -478,9 +479,16 @@ class PartialFlowStep(Step):
                 continue
             stem = fp.stem
             did = extract_design_id(stem) or extract_design_id(fp.parent.name)
+            try:
+                rel = fp.relative_to(out_dir).with_suffix("").as_posix()
+            except Exception:
+                # Conservative fallback if the path isn't under out_dir for some reason.
+                parent2 = fp.parent.parent.name if fp.parent.parent else fp.parent.name
+                rel = f"{parent2}/{fp.parent.name}/{fp.stem}"
             rows.append({
                 "design_id": did,
-                "structure_id": structure_id_from_name(fp.parent.name),
+                # Use the full relative path for uniqueness; do not strip numeric suffixes.
+                "structure_id": safe_id_from_relpath(rel),
                 "pdb_path": str(fp),
             })
         if not rows:

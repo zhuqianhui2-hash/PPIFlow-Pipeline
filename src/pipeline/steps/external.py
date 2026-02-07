@@ -576,7 +576,7 @@ class SeqDesignStep(ExternalCommandStep):
             return filtered
         return pdbs
 
-    def _stage_pdbs(self, pdbs: list[Path], out_dir: Path) -> list[Path]:
+    def _stage_pdbs(self, pdbs: list[Path], out_dir: Path, *, input_root: Path) -> list[Path]:
         if not pdbs:
             return []
         stems = [p.stem for p in pdbs]
@@ -585,16 +585,16 @@ class SeqDesignStep(ExternalCommandStep):
             return pdbs
         stage_dir = out_dir / "pdbs"
         stage_dir.mkdir(parents=True, exist_ok=True)
+        run_stems = compute_run_stems(pdbs, input_root)
         staged: list[Path] = []
         for pdb_path in pdbs:
-            parent = pdb_path.parent.name
-            unique_stem = f"{parent}__{pdb_path.stem}" if should_stage else pdb_path.stem
-            dst = stage_dir / f"{unique_stem}.pdb"
-            if not dst.exists():
-                try:
-                    os.link(pdb_path, dst)
-                except OSError:
-                    shutil.copy2(pdb_path, dst)
+            run_stem = run_stems[pdb_path]
+            dst = stage_dir / f"{run_stem}.pdb"
+            try:
+                # Make staging idempotent and refuse silent aliasing (exists-but-different).
+                promote_file_atomic(pdb_path, dst, allow_reuse=True)
+            except RuntimeError as exc:
+                raise StepError(str(exc)) from exc
             staged.append(dst)
         return staged
 
@@ -1083,7 +1083,7 @@ class SeqDesignStep(ExternalCommandStep):
         input_dir = str((ctx.out_dir / input_dir) if not Path(input_dir).is_absolute() else input_dir)
         if not Path(input_dir).exists():
             raise StepError(f"Input dir not found: {input_dir}")
-        out_dir = str(self.output_dir(ctx))
+        out_dir = self.output_dir(ctx)
 
         mpnn_run = self._default_mpnn_run(ctx)
         if not mpnn_run or not mpnn_run.exists():
@@ -1144,35 +1144,19 @@ class SeqDesignStep(ExternalCommandStep):
 
         step_label = str(self.cfg.get("name") or self.name)
 
-        pdbs = collect_pdbs(Path(input_dir))
+        input_root = Path(input_dir)
+        pdbs = collect_pdbs(input_root)
         if not pdbs:
             raise StepError(f"No PDBs found for sequence design in {input_dir}")
 
         # If PDB basenames collide (e.g., partial flow sample0.pdb in multiple subdirs),
         # stage unique names and use those for MPNN to avoid seq output collisions.
-        staged_pdbs = pdbs
-        stems = [p.stem for p in pdbs]
-        should_stage = self.cfg.get("name") == "seq2" or len(set(stems)) != len(stems)
-        if should_stage:
-            stage_dir = Path(out_dir) / "pdbs"
-            stage_dir.mkdir(parents=True, exist_ok=True)
-            staged_pdbs = []
-            for pdb_path in pdbs:
-                parent = pdb_path.parent.name
-                unique_stem = f"{parent}__{pdb_path.stem}" if should_stage else pdb_path.stem
-                dst = stage_dir / f"{unique_stem}.pdb"
-                if not dst.exists():
-                    try:
-                        os.link(pdb_path, dst)
-                    except OSError:
-                        shutil.copy2(pdb_path, dst)
-                staged_pdbs.append(dst)
-            pdbs = staged_pdbs
+        pdbs = self._stage_pdbs(pdbs, out_dir, input_root=input_root)
 
         fixed_positions_jsonl = None
         if position_list:
             fixed_positions_jsonl = self._write_fixed_positions_jsonl(
-                Path(out_dir),
+                out_dir,
                 pdbs,
                 position_list,
                 str(chain_list).split(",")[0].strip() or "A",
@@ -1188,7 +1172,7 @@ class SeqDesignStep(ExternalCommandStep):
                     continue
                 lines.append(json.dumps({"name": pdb_path.stem, "fixed_positions": mapping}))
             if lines:
-                fixed_positions_jsonl = Path(out_dir) / "fixed_positions.jsonl"
+                fixed_positions_jsonl = out_dir / "fixed_positions.jsonl"
                 fixed_positions_jsonl.write_text("\n".join(lines) + "\n")
 
         env = os.environ.copy()
@@ -1272,10 +1256,10 @@ class SeqDesignStep(ExternalCommandStep):
                         log_file=self.cfg.get("_log_file"),
                     )
 
-            self._merge_fastas(vanilla_dir, bias_dir, Path(out_dir))
+            self._merge_fastas(vanilla_dir, bias_dir, out_dir)
             shutil.rmtree(tmp_base, ignore_errors=True)
         else:
-            base_cmd = build_base_cmd(Path(out_dir), num_seq, sampling_temp, use_soluble)
+            base_cmd = build_base_cmd(out_dir, num_seq, sampling_temp, use_soluble)
             total = len(pdbs)
             for idx, pdb_path in enumerate(pdbs, start=1):
                 cmd = base_cmd + ["--pdb_path", str(pdb_path)]
@@ -1480,11 +1464,11 @@ class FlowPackerStep(ExternalCommandStep):
                             for pdb_path in alt_pdbs:
                                 run_stem = run_stems[pdb_path]
                                 dst = stage_dir / f"{run_stem}.pdb"
-                                if not dst.exists():
-                                    try:
-                                        os.link(pdb_path, dst)
-                                    except OSError:
-                                        shutil.copy2(pdb_path, dst)
+                                try:
+                                    # Idempotent staging; refuse silent aliasing on collision.
+                                    promote_file_atomic(pdb_path, dst, allow_reuse=True)
+                                except RuntimeError as exc:
+                                    raise StepError(str(exc)) from exc
                             input_pdb_dir = stage_dir
             if not input_pdb_dir or not input_pdb_dir.exists():
                 raise StepError("flowpacker input_pdb_dir missing or invalid")
@@ -1498,8 +1482,13 @@ class FlowPackerStep(ExternalCommandStep):
 
         items: list[WorkItem] = []
         for pdb_path in pdbs:
-            fasta_path = self._find_fasta(seq_fasta_dir, pdb_path.stem)
             run_stem = run_stems[pdb_path]
+            fasta_path = self._find_fasta(seq_fasta_dir, run_stem)
+            if fasta_path is None and run_stem == pdb_path.stem:
+                # Only fall back to pdb_path.stem when there was no de-dup renaming.
+                # If run_stem != pdb_path.stem, using the fallback can silently attach
+                # an ambiguous FASTA to multiple distinct PDBs.
+                fasta_path = self._find_fasta(seq_fasta_dir, pdb_path.stem)
             items.append(
                 WorkItem(
                     id=run_stem,
