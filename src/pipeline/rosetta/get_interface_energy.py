@@ -3,8 +3,6 @@ from glob import glob
 from functools import partial
 from multiprocessing import Pool, cpu_count
 from tqdm import tqdm
-import matplotlib.pyplot as plt
-import seaborn as sns
 import pandas as pd
 import numpy as np
 from Bio import PDB
@@ -96,6 +94,12 @@ def get_residue_pairs_within_distance(pdb_file, binder_id, target_id, distance_t
 
 
 def plot_score(df, plot_path):
+    try:
+        import matplotlib.pyplot as plt
+        import seaborn as sns
+    except Exception as exc:
+        raise ImportError("Plotting requires matplotlib+seaborn (install deps or pass --no-plot).") from exc
+
     if "target_key" in df.columns and "binder_key" in df.columns:
         heatmap_data = df.pivot(index="target_key", columns="binder_key", values="total")
     else:
@@ -109,9 +113,10 @@ def plot_score(df, plot_path):
     plt.ylabel("target")
     plt.tight_layout()
     plt.savefig(plot_path, dpi=100)
+    plt.close()
 
 
-def get_interface_energy(interchain_score_df, interface_pair, binder_id, target_id, plot_path):
+def get_interface_energy(interchain_score_df, interface_pair, binder_id, target_id, plot_path, *, plot=True):
     if interchain_score_df is None or len(interchain_score_df) == 0:
         return {}
 
@@ -141,9 +146,8 @@ def get_interface_energy(interchain_score_df, interface_pair, binder_id, target_
 
     summed_df = interface_score_df.groupby('binder_key')['total'].sum().reset_index()
     summed_dict = summed_df.set_index('binder_key')['total'].to_dict()
-    print(interface_score_df.head(2))
-    print(interface_score_df.columns)
-    plot_score(df, plot_path)
+    if plot and plot_path:
+        plot_score(df, plot_path)
     return summed_dict
 
 
@@ -172,7 +176,7 @@ def get_input_df(args):
     return df
 
 
-def main(row, output_dir="", distance_threshold=10):
+def main(row, output_dir="", distance_threshold=10, plot=True):
     logfile = row['rosetta_path']
     pdb_file = row['pdbpath']
     binder_id = row['binder_id']
@@ -183,13 +187,17 @@ def main(row, output_dir="", distance_threshold=10):
             print('logfile does not exist')
         interchain_score_path = get_interchain_score(logfile)
         interface_pair = get_residue_pairs_within_distance(pdb_file, binder_id, target_id, distance_threshold=distance_threshold)
-        print(os.path.join(output_dir, os.path.basename(pdb_file).split('.pdb')[0] + ".png"))
+        plot_path = None
+        if plot:
+            plot_path = os.path.join(output_dir, os.path.basename(pdb_file).split('.pdb')[0] + ".png")
+            print(plot_path)
         summed_dict = get_interface_energy(
             interchain_score_path,
             interface_pair,
             binder_id,
             target_id,
-            os.path.join(output_dir, os.path.basename(pdb_file).split('.pdb')[0] + ".png"),
+            plot_path,
+            plot=plot,
         )
     except Exception as e:
         print(e)
@@ -199,6 +207,12 @@ def main(row, output_dir="", distance_threshold=10):
 
 
 def plot_binder_score(df_path, title, fontsize=15, savepath=None):
+    try:
+        import matplotlib.pyplot as plt
+        import seaborn as sns
+    except Exception as exc:
+        raise ImportError("Plotting requires matplotlib+seaborn (install deps or pass --no-plot).") from exc
+
     df = pd.read_csv(df_path)
     df['binder_energy'] = df['binder_energy'].apply(lambda x: ast.literal_eval(x))
     binder_energy = [value for dictionary in df['binder_energy'] for value in dictionary.values()]
@@ -216,11 +230,23 @@ def plot_binder_score(df_path, title, fontsize=15, savepath=None):
     plt.tight_layout()
     if savepath is not None:
         plt.savefig(savepath)
-
-    plt.show()
+        plt.close()
+    else:
+        plt.show()
 
 
 if __name__ == '__main__':
+    def _cpu_allocation() -> int:
+        # Prefer Linux CPU affinity (often matches scheduler allocation) over raw cpu_count().
+        try:
+            return max(len(os.sched_getaffinity(0)), 1)  # type: ignore[attr-defined]
+        except Exception:
+            pass
+        try:
+            return max(int(cpu_count()), 1)
+        except Exception:
+            return max(int(os.cpu_count() or 1), 1)
+
     parser = argparse.ArgumentParser()
     parser.add_argument('--input_csv', type=str, help='csv file contains pdb pdbpath. When the input_pdbdir is not provided, input_csv must be provided!')
     parser.add_argument('--input_pdbdir', type=str, help='The pdb folder contains pdb files. When the input_csv is not provided, input_pdbdir must be provided!')
@@ -229,26 +255,57 @@ if __name__ == '__main__':
     parser.add_argument('--target_id', type=str, help='target chain id', required=True)
     parser.add_argument('--output_dir', type=str, help='output csv file of all pdb results', required=True)
     parser.add_argument("--interface_dist", type=float, default=12.0, help="interface distance between target and binder")
+    parser.add_argument(
+        "--num-workers",
+        type=int,
+        default=None,
+        help="Parallel workers for parsing interface energies (default: min(cpu_allocation, len(df)))",
+    )
+    parser.add_argument(
+        "--plot",
+        dest="plot",
+        action="store_true",
+        help="Enable plotting (off by default; requires matplotlib+seaborn)",
+    )
+    # Back-compat: existing callers may pass --no-plot. Plotting is already off by default.
+    parser.add_argument(
+        "--no-plot",
+        dest="plot",
+        action="store_false",
+        help="Disable plotting (default)",
+    )
+    parser.set_defaults(plot=False)
 
     args = parser.parse_args()
 
     output_dir = args.output_dir
     interface_dist = args.interface_dist
-    os.makedirs(os.path.dirname(output_dir), exist_ok=True)
+    # output_dir is treated as a directory path throughout this script.
+    os.makedirs(output_dir, exist_ok=True)
 
     df = get_input_df(args)
 
-    print("start Pool")
-    func = partial(main, output_dir=output_dir, distance_threshold=interface_dist)
-    with Pool(processes=cpu_count()) as pool:
-        results = list(tqdm(pool.imap(func, [row for _, row in df.iterrows()]), total=len(df)))
+    func = partial(main, output_dir=output_dir, distance_threshold=interface_dist, plot=bool(args.plot))
+    if args.num_workers is not None:
+        workers = int(args.num_workers)
+    else:
+        workers = min(_cpu_allocation(), len(df))
+    workers = max(workers, 1)
+    if workers <= 1 or len(df) <= 1:
+        results = [func(row) for _, row in df.iterrows()]
+    else:
+        print(f"start Pool workers={workers}")
+        with Pool(processes=workers) as pool:
+            results = list(tqdm(pool.imap(func, [row for _, row in df.iterrows()]), total=len(df)))
 
     df['binder_energy'] = results
 
-    df.drop(columns=['pdbpath', 'pdbname'])
+    # Keep pdbpath/pdbname in residue_energy.csv; downstream steps (e.g. interface_enrich)
+    # rely on them to locate structures and derive stable IDs.
     df.to_csv(os.path.join(output_dir, "residue_energy.csv"), index=False)
     print(output_dir)
 
-    title = "interface_binder_residues_energy_sum"
-    savepath = os.path.join(output_dir, 'residue_energy_interface_binder_residues_energy_sum.png')
-    plot_binder_score(os.path.join(output_dir, "residue_energy.csv"), title=title, savepath=savepath)
+    if args.plot:
+        title = "interface_binder_residues_energy_sum"
+        savepath = os.path.join(output_dir, 'residue_energy_interface_binder_residues_energy_sum.png')
+        plot_binder_score(os.path.join(output_dir, "residue_energy.csv"), title=title, savepath=savepath)

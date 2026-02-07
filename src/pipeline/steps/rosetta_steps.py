@@ -246,7 +246,15 @@ class RosettaInterfaceStep(Step):
             ]
             if rosetta_db:
                 cmd.extend(["-database", str(rosetta_db)])
-            _run(cmd, job_dir, out_path, os.environ.copy(), bool(self.cfg.get("_verbose")))
+            env = os.environ.copy()
+            # Keep per-process threading low; scale via more workers instead.
+            env["OMP_NUM_THREADS"] = "1"
+            env["MKL_NUM_THREADS"] = "1"
+            env["OPENBLAS_NUM_THREADS"] = "1"
+            env["NUMEXPR_NUM_THREADS"] = "1"
+            env["VECLIB_MAXIMUM_THREADS"] = "1"
+            env["BLIS_NUM_THREADS"] = "1"
+            _run(cmd, job_dir, out_path, env, bool(self.cfg.get("_verbose")))
 
         script = _find_rosetta_resource("get_interface_energy.py")
         binder_id = _resolve_binder_chain(ctx.input_data)
@@ -268,9 +276,18 @@ class RosettaInterfaceStep(Step):
             str(item_out),
             "--interface_dist",
             str(interface_dist),
+            "--num-workers",
+            "1",
+            "--no-plot",
         ]
         env = os.environ.copy()
         env.setdefault("MPLBACKEND", "Agg")
+        env["OMP_NUM_THREADS"] = "1"
+        env["MKL_NUM_THREADS"] = "1"
+        env["OPENBLAS_NUM_THREADS"] = "1"
+        env["NUMEXPR_NUM_THREADS"] = "1"
+        env["VECLIB_MAXIMUM_THREADS"] = "1"
+        env["BLIS_NUM_THREADS"] = "1"
         run_command(
             cmd,
             env=env,
@@ -364,8 +381,12 @@ class RosettaInterfaceStep(Step):
 
         if jobs:
             env = os.environ.copy()
-            env.setdefault("OMP_NUM_THREADS", "1")
-            env.setdefault("MKL_NUM_THREADS", "1")
+            env["OMP_NUM_THREADS"] = "1"
+            env["MKL_NUM_THREADS"] = "1"
+            env["OPENBLAS_NUM_THREADS"] = "1"
+            env["NUMEXPR_NUM_THREADS"] = "1"
+            env["VECLIB_MAXIMUM_THREADS"] = "1"
+            env["BLIS_NUM_THREADS"] = "1"
             workers = min(len(jobs), os.cpu_count() or 1)
             total = len(jobs)
             failures: list[str] = []
@@ -418,9 +439,16 @@ class RosettaInterfaceStep(Step):
             str(out_dir),
             "--interface_dist",
             str(interface_dist),
+            "--no-plot",
         ]
         env = os.environ.copy()
         env.setdefault("MPLBACKEND", "Agg")
+        env["OMP_NUM_THREADS"] = "1"
+        env["MKL_NUM_THREADS"] = "1"
+        env["OPENBLAS_NUM_THREADS"] = "1"
+        env["NUMEXPR_NUM_THREADS"] = "1"
+        env["VECLIB_MAXIMUM_THREADS"] = "1"
+        env["BLIS_NUM_THREADS"] = "1"
         start = time.time()
         status = "OK"
         try:
@@ -700,7 +728,15 @@ class RosettaRelaxStep(Step):
             ]
             if rosetta_db:
                 cmd.extend(["-database", str(rosetta_db)])
-            _run(cmd, job_dir, log_path, os.environ.copy(), bool(self.cfg.get("_verbose")))
+            env = os.environ.copy()
+            # Keep per-process threading low; scale via more workers instead.
+            env["OMP_NUM_THREADS"] = "1"
+            env["MKL_NUM_THREADS"] = "1"
+            env["OPENBLAS_NUM_THREADS"] = "1"
+            env["NUMEXPR_NUM_THREADS"] = "1"
+            env["VECLIB_MAXIMUM_THREADS"] = "1"
+            env["BLIS_NUM_THREADS"] = "1"
+            _run(cmd, job_dir, log_path, env, bool(self.cfg.get("_verbose")))
 
         # Collect relaxed PDB (rosetta_scripts writes *_0001.pdb by default)
         relaxed = None
@@ -782,8 +818,12 @@ class RosettaRelaxStep(Step):
 
         if jobs:
             env = os.environ.copy()
-            env.setdefault("OMP_NUM_THREADS", "1")
-            env.setdefault("MKL_NUM_THREADS", "1")
+            env["OMP_NUM_THREADS"] = "1"
+            env["MKL_NUM_THREADS"] = "1"
+            env["OPENBLAS_NUM_THREADS"] = "1"
+            env["NUMEXPR_NUM_THREADS"] = "1"
+            env["VECLIB_MAXIMUM_THREADS"] = "1"
+            env["BLIS_NUM_THREADS"] = "1"
             workers = min(len(jobs), os.cpu_count() or 1)
             total = len(jobs)
             failures: list[str] = []

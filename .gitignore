@@ -11,3 +11,4 @@ docs/
 *.ckpt
 
 tests/
+pytest.ini

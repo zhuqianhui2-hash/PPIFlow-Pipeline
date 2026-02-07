@@ -36,6 +36,18 @@ class PlanEntry:
     pool_size: int
 
 
+DIRECT_LOG_POOL_SIZE_THRESHOLD = 64
+
+
+def _is_rosetta_items_step(step_name: str) -> bool:
+    step_cls = STEP_REGISTRY.get(step_name)
+    if not step_cls:
+        return False
+    stage = str(getattr(step_cls, "stage", "") or "")
+    mode = str(getattr(step_cls, "work_queue_mode", "items") or "items")
+    return stage == "rosetta" and mode == "items"
+
+
 def _load_steps(out_dir: Path) -> list[str]:
     steps_yaml = out_dir / "steps.yaml"
     if not steps_yaml.exists():
@@ -342,7 +354,9 @@ def _spawn_workers(
     out_dir: Path,
     steps: list[str],
     pool_size: int,
-    bind: bool,
+    identity_env: bool,
+    cuda_bind: bool,
+    clear_cuda_visible_devices: bool,
     devices: list[str],
     continue_on_error: bool,
     wait_timeout: Optional[int],
@@ -352,6 +366,8 @@ def _spawn_workers(
     work_queue_rebuild: bool = False,
     retry_failed_override: Optional[bool] = None,
     no_run_lock: bool = False,
+    direct_logs: bool = False,
+    extra_env: dict[str, str] | None = None,
 ) -> tuple[list[subprocess.Popen], list[dict]]:
     procs: list[subprocess.Popen] = []
     workers: list[dict] = []
@@ -359,18 +375,37 @@ def _spawn_workers(
         pool_size = 1
     device_count = max(len(devices), 0)
 
+    if direct_logs:
+        try:
+            with log_ctx["lock"]:
+                log_ctx["stdout_handle"].write(
+                    "[orchestrator] direct log mode enabled; worker output is in stdout_rank*.log / stderr_rank*.log\n"
+                )
+                log_ctx["stdout_handle"].flush()
+        except Exception:
+            pass
+
     for rank in range(pool_size):
         env = os.environ.copy()
         device = None
-        if bind:
+        if identity_env:
             env["WORLD_SIZE"] = str(pool_size)
             env["RANK"] = str(rank)
-            env["LOCAL_RANK"] = str(rank % max(device_count, 1))
+            env["LOCAL_RANK"] = str(rank if device_count <= 0 else (rank % device_count))
+        if clear_cuda_visible_devices and identity_env:
+            # Hide GPUs from CPU-only pools even if the parent job exported CUDA_VISIBLE_DEVICES.
+            env["CUDA_VISIBLE_DEVICES"] = ""
+        if cuda_bind and identity_env:
             if devices:
                 device = devices[rank % len(devices)]
                 env["CUDA_VISIBLE_DEVICES"] = str(device)
-        else:
+        if device is None:
             device = env.get("CUDA_VISIBLE_DEVICES")
+        if extra_env:
+            for k, v in extra_env.items():
+                if k and v is not None:
+                    # Force override: we want a consistent worker runtime regardless of scheduler defaults.
+                    env[str(k)] = str(v)
         if retry_failed_override is not None:
             env["PPIFLOW_WORK_QUEUE_RETRY_FAILED"] = "1" if retry_failed_override else "0"
         if progress_log_path is not None:
@@ -385,7 +420,18 @@ def _spawn_workers(
         )
         stdout_path = run_dir / f"stdout_rank{rank}.log"
         stderr_path = run_dir / f"stderr_rank{rank}.log"
-        proc = subprocess.Popen(cmd, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        if direct_logs:
+            stdout_path.parent.mkdir(parents=True, exist_ok=True)
+            stderr_path.parent.mkdir(parents=True, exist_ok=True)
+            stdout_handle = stdout_path.open("a")
+            stderr_handle = stderr_path.open("a")
+            try:
+                proc = subprocess.Popen(cmd, env=env, stdout=stdout_handle, stderr=stderr_handle)
+            finally:
+                stdout_handle.close()
+                stderr_handle.close()
+        else:
+            proc = subprocess.Popen(cmd, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         procs.append(proc)
         workers.append(
             {
@@ -398,13 +444,14 @@ def _spawn_workers(
                 "stderr": str(stderr_path),
             }
         )
-        _start_log_threads(
-            proc,
-            rank=rank,
-            stdout_path=stdout_path,
-            stderr_path=stderr_path,
-            log_ctx=log_ctx,
-        )
+        if not direct_logs:
+            _start_log_threads(
+                proc,
+                rank=rank,
+                stdout_path=stdout_path,
+                stderr_path=stderr_path,
+                log_ctx=log_ctx,
+            )
     return procs, workers
 
 
@@ -682,9 +729,51 @@ def orchestrate_pipeline(args) -> None:
         else:
             single_step = None
 
+        rosetta_cli = getattr(args, "num_rosetta_workers", None)
+        rosetta_cli_alias = getattr(args, "num_cpu_workers", None)
+        if rosetta_cli is not None and rosetta_cli_alias is not None and int(rosetta_cli) != int(rosetta_cli_alias):
+            raise OrchestratorError("--num-rosetta-workers and --num-cpu-workers conflict")
+        rosetta_workers_override = rosetta_cli if rosetta_cli is not None else rosetta_cli_alias
+        if rosetta_workers_override is not None:
+            try:
+                rosetta_workers_override = int(rosetta_workers_override)
+            except Exception as exc:
+                raise OrchestratorError(f"Invalid --num-rosetta-workers value: {rosetta_workers_override}") from exc
+            if int(rosetta_workers_override) < 1:
+                raise OrchestratorError("--num-rosetta-workers must be >= 1")
+
+        rosetta_workers_yaml = orch_cfg.get("rosetta_workers")
+        if rosetta_workers_yaml is not None:
+            try:
+                rosetta_workers_yaml = int(rosetta_workers_yaml)
+            except Exception as exc:
+                raise OrchestratorError(f"Invalid orchestrator.rosetta_workers value: {rosetta_workers_yaml}") from exc
+            if int(rosetta_workers_yaml) < 1:
+                raise OrchestratorError("orchestrator.rosetta_workers must be >= 1")
+
+        # Track explicit per-step pools so rosetta_workers acts as a default only.
+        explicit_step_pools: dict[str, int] = {}
+        steps_cfg = orch_cfg.get("steps")
+        if isinstance(steps_cfg, list):
+            for entry in steps_cfg:
+                if not isinstance(entry, dict):
+                    continue
+                name = str(entry.get("name") or "").strip()
+                if not name:
+                    continue
+                if "pool_size" in entry and entry.get("pool_size") is not None:
+                    raw_pool = entry.get("pool_size")
+                    try:
+                        pool_val = int(raw_pool)
+                    except Exception as exc:
+                        raise OrchestratorError(f"Invalid pool_size for step {name}: {raw_pool}") from exc
+                    if pool_val < 1:
+                        raise OrchestratorError(f"pool_size for step {name} must be >= 1")
+                    explicit_step_pools[name] = pool_val
+
         num_devices_raw = _parse_num_devices(getattr(args, "num_devices", None))
         devices_arg = getattr(args, "devices", None)
-        pool_override = getattr(args, "pool_size", None)
+        gpu_pool_override = getattr(args, "pool_size", None)
 
         if num_devices_raw is not None and getattr(args, "no_bind", False):
             raise OrchestratorError("--num-devices requires GPU binding (remove --no-bind)")
@@ -719,9 +808,9 @@ def orchestrate_pipeline(args) -> None:
                         )
                     devices = visible[:num_devices]
 
-            if pool_override is not None and int(pool_override) != len(devices):
+            if gpu_pool_override is not None and int(gpu_pool_override) != len(devices):
                 raise OrchestratorError("--pool-size must match --num-devices")
-            pool_override = len(devices)
+            gpu_pool_override = len(devices)
         else:
             devices = _resolve_device_list(orch_cfg, devices_arg)
 
@@ -729,8 +818,28 @@ def orchestrate_pipeline(args) -> None:
             available_steps,
             orch_cfg,
             single_step=single_step,
-            pool_override=pool_override,
+            pool_override=None,
         )
+
+        # Apply pool overrides.
+        for entry in plan:
+            # Only support single-step entries today; entry.steps is kept for future grouping.
+            step_name = entry.steps[0] if entry.steps else entry.name
+            has_explicit_pool = step_name in explicit_step_pools
+            if has_explicit_pool:
+                entry.pool_size = int(explicit_step_pools[step_name])
+            if _is_rosetta_items_step(step_name):
+                if not has_explicit_pool:
+                    if rosetta_workers_override is not None:
+                        entry.pool_size = int(rosetta_workers_override)
+                    elif rosetta_workers_yaml is not None:
+                        entry.pool_size = int(rosetta_workers_yaml)
+                    elif gpu_pool_override is not None:
+                        # Back-compat default: Rosetta pool matches GPU pool unless configured.
+                        entry.pool_size = int(gpu_pool_override)
+            else:
+                if gpu_pool_override is not None and not has_explicit_pool:
+                    entry.pool_size = int(gpu_pool_override)
 
         orch_dir = out_dir / ".orchestrator"
         ensure_dir(orch_dir)
@@ -762,30 +871,47 @@ def orchestrate_pipeline(args) -> None:
             except Exception:
                 step_wait_timeout = None
 
-        bind = bool((orch_cfg.get("gpu_binding") or {}).get("enabled", True))
-        if getattr(args, "no_bind", False):
-            bind = False
+        no_bind = bool(getattr(args, "no_bind", False))
+        identity_env = not no_bind
+        cuda_bind = bool((orch_cfg.get("gpu_binding") or {}).get("enabled", True))
+        if no_bind:
+            cuda_bind = False
 
-        if bind:
+        if cuda_bind:
             if not devices:
-                pool_sizes = {entry.pool_size for entry in plan}
-                if len(pool_sizes) != 1:
-                    raise OrchestratorError(
-                        "GPU binding requires a single pool size (use --num-devices or --pool-size)"
-                    )
-                pool_size = next(iter(pool_sizes))
-                visible = _detect_visible_devices()
-                if len(visible) < pool_size:
-                    raise OrchestratorError(
-                        f"Pool size {pool_size} requires {pool_size} GPUs but only {len(visible)} visible"
-                    )
-                devices = visible[:pool_size]
+                gpu_pool_sizes: set[int] = set()
+                for entry in plan:
+                    step_name = entry.steps[0] if entry.steps else entry.name
+                    if _is_rosetta_items_step(step_name):
+                        continue
+                    gpu_pool_sizes.add(int(entry.pool_size))
+
+                if gpu_pool_sizes:
+                    if len(gpu_pool_sizes) != 1:
+                        raise OrchestratorError(
+                            "GPU binding requires a single GPU pool size (use --num-devices/--pool-size "
+                            "and avoid per-step GPU pool_size overrides)"
+                        )
+                    pool_size = next(iter(gpu_pool_sizes))
+                    visible = _detect_visible_devices()
+                    if len(visible) < pool_size:
+                        raise OrchestratorError(
+                            f"Pool size {pool_size} requires {pool_size} GPUs but only {len(visible)} visible"
+                        )
+                    devices = visible[:pool_size]
+                else:
+                    # No GPU-pool steps in the plan (e.g., rosetta-only); do not require GPUs.
+                    devices = []
+
             device_count = len(devices)
             for entry in plan:
+                step_name = entry.steps[0] if entry.steps else entry.name
+                if _is_rosetta_items_step(step_name):
+                    continue
                 if entry.pool_size != device_count:
                     raise OrchestratorError(
                         f"Pool size {entry.pool_size} must match device count {device_count} "
-                        "(use --num-devices or --pool-size to align)"
+                        "(use --num-devices/--pool-size to align GPU pool steps)"
                     )
 
         summary: dict[str, Any] = {"status": "running", "steps": []}
@@ -824,11 +950,27 @@ def orchestrate_pipeline(args) -> None:
                     attempt=attempt,
                 )
 
+                entry_step = entry.steps[0] if entry.steps else entry.name
+                rosetta_pool = _is_rosetta_items_step(entry_step)
+                direct_logs = int(entry.pool_size) >= int(DIRECT_LOG_POOL_SIZE_THRESHOLD)
+                rosetta_env = None
+                if rosetta_pool:
+                    rosetta_env = {
+                        # Keep per-process threading low; scale via more workers instead.
+                        "OMP_NUM_THREADS": "1",
+                        "MKL_NUM_THREADS": "1",
+                        "OPENBLAS_NUM_THREADS": "1",
+                        "NUMEXPR_NUM_THREADS": "1",
+                        "VECLIB_MAXIMUM_THREADS": "1",
+                        "BLIS_NUM_THREADS": "1",
+                    }
                 procs, workers = _spawn_workers(
                     out_dir=out_dir,
                     steps=entry.steps,
                     pool_size=entry.pool_size,
-                    bind=bind,
+                    identity_env=identity_env,
+                    cuda_bind=(cuda_bind and not rosetta_pool),
+                    clear_cuda_visible_devices=(rosetta_pool and identity_env),
                     devices=devices,
                     continue_on_error=continue_on_error,
                     wait_timeout=step_wait_timeout,
@@ -838,6 +980,8 @@ def orchestrate_pipeline(args) -> None:
                     work_queue_rebuild=(rebuild_requested and attempt == 1),
                     retry_failed_override=True if explicit_retry else False,
                     no_run_lock=bool(getattr(args, "no_run_lock", False)) or run_lock_disabled(),
+                    direct_logs=direct_logs,
+                    extra_env=rosetta_env,
                 )
                 write_json(run_dir / "workers.json", {"workers": workers}, indent=2)
 

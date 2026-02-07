@@ -55,6 +55,21 @@ def _add_work_queue_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--work-queue-rebuild", action="store_true", help="Drop/rebuild queue.db from outputs")
 
 
+def _add_orchestrator_pool_args(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--num-rosetta-workers",
+        type=int,
+        default=None,
+        help="Orchestrator: pool size override for Rosetta (CPU) items steps (advanced)",
+    )
+    parser.add_argument(
+        "--num-cpu-workers",
+        type=int,
+        default=None,
+        help="Alias for --num-rosetta-workers",
+    )
+
+
 def _add_run_lock_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--no-run-lock", action="store_true", help="Disable output run lock (debug only)")
     parser.add_argument(
@@ -157,6 +172,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     p_pipeline = sub.add_parser("pipeline", help="Configure then execute")
     _add_common_args(p_pipeline)
+    _add_orchestrator_pool_args(p_pipeline)
     p_pipeline.add_argument(
         "--skip-config",
         action="store_true",
@@ -184,6 +200,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_execute.add_argument("--verbose", action="store_true")
     p_execute.add_argument("--num-devices", type=str, default=None, help="Number of GPUs/workers (e.g. 4 or 'all')")
     p_execute.add_argument("--devices", type=str, default=None, help="Comma-separated GPU list or 'all'")
+    _add_orchestrator_pool_args(p_execute)
     _add_work_queue_args(p_execute)
     _add_run_lock_args(p_execute)
 
@@ -212,6 +229,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_orch.add_argument("--steps", type=str, default=None, help="Run a single step only")
     p_orch.add_argument("--pool-size", type=int, default=None, help="Override pool size (advanced)")
     p_orch.add_argument("--num-devices", type=str, default=None, help="Number of GPUs/workers (e.g. 4 or 'all')")
+    _add_orchestrator_pool_args(p_orch)
     p_orch.add_argument("--max-retries", type=int, default=None, help="Max attempts per step")
     p_orch.add_argument(
         "--failure-policy",
@@ -250,20 +268,40 @@ def main(argv: list[str] | None = None) -> None:
             if getattr(args, "input", None) and not getattr(args, "skip_config", False):
                 print("[pipeline] using existing config; use --force-config to regenerate.")
 
-        if getattr(args, "num_devices", None):
+        wants_orchestrator = bool(getattr(args, "num_devices", None)) or (
+            getattr(args, "num_rosetta_workers", None) is not None or getattr(args, "num_cpu_workers", None) is not None
+        )
+        if wants_orchestrator:
             step_arg = getattr(args, "steps", None)
             if step_arg and "," in step_arg and step_arg not in {"all", ""}:
-                raise SystemExit("--num-devices requires a single step or --steps all")
+                flags = []
+                if getattr(args, "num_devices", None):
+                    flags.append("--num-devices")
+                if getattr(args, "num_rosetta_workers", None) is not None or getattr(args, "num_cpu_workers", None) is not None:
+                    flags.append("--num-rosetta-workers")
+                if flags:
+                    raise SystemExit(f"{'/'.join(flags)} requires a single step or --steps all")
+                raise SystemExit("orchestrate mode requires a single step or --steps all")
             orchestrate_pipeline(args)
         else:
             execute_pipeline(args)
     elif args.command == "configure":
         configure_pipeline(args)
     elif args.command == "execute":
-        if getattr(args, "num_devices", None):
+        wants_orchestrator = bool(getattr(args, "num_devices", None)) or (
+            getattr(args, "num_rosetta_workers", None) is not None or getattr(args, "num_cpu_workers", None) is not None
+        )
+        if wants_orchestrator:
             step_arg = getattr(args, "steps", None)
             if step_arg and "," in step_arg and step_arg not in {"all", ""}:
-                raise SystemExit("--num-devices requires a single step or --steps all")
+                flags = []
+                if getattr(args, "num_devices", None):
+                    flags.append("--num-devices")
+                if getattr(args, "num_rosetta_workers", None) is not None or getattr(args, "num_cpu_workers", None) is not None:
+                    flags.append("--num-rosetta-workers")
+                if flags:
+                    raise SystemExit(f"{'/'.join(flags)} requires a single step or --steps all")
+                raise SystemExit("orchestrate mode requires a single step or --steps all")
             orchestrate_pipeline(args)
         else:
             execute_pipeline(args)
