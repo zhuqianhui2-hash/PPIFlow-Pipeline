@@ -17,7 +17,7 @@ install_af3score=true
 install_dockq=true
 skip_gpu_check=false
 install_os_deps=false
-write_env=false
+write_env=true
 no_af3_data_pipeline=true
 install_conda=false
 conda_prefix=""
@@ -52,14 +52,14 @@ Options:
   --abmpnn-weights-path <dir>      AbMPNN weights dir (override; default: assets/weights/abmpnn)
   --af3score-env-name <name>       AF3Score conda env name (default: ppiflow-af3score)
   --rosetta-env-name <name>        Rosetta conda env name (default: ppiflow-rosetta)
-  --no-af3-data-pipeline           Skip AF3 database download/build (default: true)
+  --no-af3-data-pipeline           Deprecated (default behavior): do not download/build AF3 DB; provide --af3-db-path to use a real DB
   --af3-db-path <dir>              AlphaFold3 database directory (required for AF3Score inference)
   --rosetta-db-path <path>         Optional Rosetta database dir (defaults to ppiflow env database)
   --install-os-deps                Install OS deps (apt-get)
   --install-conda                  Install Miniforge if conda is missing
   --conda-prefix <dir>             Miniforge install prefix (default: <prefix>/.miniforge3)
   --skip-gpu-check                 Skip nvidia-smi check
-  --write-env                      Write env.sh with paths/exports
+  --no-write-env                   Do not write env.sh (default: write)
   -h, --help                       Show this help
 EOF
 }
@@ -104,7 +104,8 @@ parse_args() {
       --install-conda) install_conda=true; shift ;;
       --conda-prefix) conda_prefix="$2"; shift 2 ;;
       --skip-gpu-check) skip_gpu_check=true; shift ;;
-      --write-env) write_env=true; shift ;;
+      --write-env) log "Note: --write-env is deprecated (env.sh is written by default)."; write_env=true; shift ;;
+      --no-write-env) write_env=false; shift ;;
       --af3-weights-path) af3_weights_path="$2"; shift 2 ;;
       --ppiflow-checkpoints-path) ppiflow_ckpt_path="$2"; shift 2 ;;
       --rosetta-db-path) rosetta_db_path="$2"; shift 2 ;;
@@ -465,6 +466,11 @@ main() {
   place_mpnn_weights
   write_env_file
   log "Install complete."
+  if $write_env; then
+    log "Activate:"
+    log "  source \"$prefix/env.sh\""
+    log "  conda activate ppiflow"
+  fi
 }
 
 main "$@"

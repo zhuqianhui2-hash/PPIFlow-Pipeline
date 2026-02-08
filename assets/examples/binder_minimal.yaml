@@ -3,21 +3,11 @@ name: example_binder_001
 
 target:
   pdb: /path/to/target.pdb
-  chains: ["B"]
-  hotspots: ["B119", "B141", "B200"]
+  chains: ["A"]
+  hotspots: ["A119", "A141", "A200"]
 
 binder:
   length: "75-90"
 
 sampling:
   samples_per_target: 100
-
-tools:
-  ppiflow_ckpt: /path/to/binder.ckpt
-  mpnn_ckpt: /path/to/proteinmpnn
-  mpnn_run: /path/to/protein_mpnn_run.py
-  af3score_repo: /path/to/af3score
-  flowpacker_repo: /path/to/flowpacker
-  af3_weights: /path/to/af3/weights/dir
-  rosetta_bin: /path/to/rosetta_scripts
-  rosetta_db: /path/to/rosetta/database

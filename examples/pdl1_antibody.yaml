@@ -1,0 +1,16 @@
+protocol: antibody
+name: pdl1_antibody_example
+
+target:
+  pdb: targets/PDL1.pdb
+  chains: ["A"]
+  hotspots: ["A56"]
+
+framework:
+  pdb: ../assets/frameworks/6nou_scfv_framework.pdb
+  heavy_chain: A
+  light_chain: B
+  cdr_length: "CDRH1,8-8,CDRH2,8-8,CDRH3,12-12,CDRL1,11-11,CDRL2,3-3,CDRL3,9-9"
+
+sampling:
+  samples_per_target: 10

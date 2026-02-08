@@ -7,19 +7,9 @@ target:
   hotspots: ["C11", "C14", "C15"]
 
 framework:
-  pdb: /path/to/framework.pdb
+  pdb: ../frameworks/7eow_nanobody_framework.pdb
   heavy_chain: A
-  cdr_length: "CDRH1,8-8,CDRH2,8-8,CDRH3,10-20"
+  cdr_length: "CDRH1,8-8,CDRH2,8-8,CDRH3,20-20"
 
 sampling:
   samples_per_target: 100
-
-tools:
-  ppiflow_ckpt: /path/to/nanobody.ckpt
-  abmpnn_ckpt: /path/to/abmpnn
-  abmpnn_run: /path/to/protein_mpnn_run.py
-  af3score_repo: /path/to/af3score
-  flowpacker_repo: /path/to/flowpacker
-  af3_weights: /path/to/af3/weights/dir
-  rosetta_bin: /path/to/rosetta_scripts
-  rosetta_db: /path/to/rosetta/database

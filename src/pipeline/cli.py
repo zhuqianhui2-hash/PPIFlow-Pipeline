@@ -209,8 +209,6 @@ def build_parser() -> argparse.ArgumentParser:
     p_rank.add_argument("--reuse", action="store_true")
     p_rank.add_argument("--continue-on-error", action="store_true")
     p_rank.add_argument("--verbose", action="store_true")
-    p_rank.add_argument("--num-devices", type=str, default=None, help="Number of GPUs/workers (e.g. 4 or 'all')")
-    p_rank.add_argument("--devices", type=str, default=None, help="Comma-separated GPU list or 'all'")
     _add_work_queue_args(p_rank)
     _add_run_lock_args(p_rank)
 

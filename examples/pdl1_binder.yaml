@@ -1,0 +1,13 @@
+protocol: binder
+name: pdl1_binder_example
+
+target:
+  pdb: targets/PDL1.pdb
+  chains: ["A"]
+  hotspots: ["A56"]
+
+binder:
+  length: "65-150"
+
+sampling:
+  samples_per_target: 10

@@ -171,6 +171,67 @@ def normalize_input(
     for key in list(tools.keys()):
         tools[key] = resolve_optional_path(tools[key], base_dir=base_dir)
     out["tools"] = tools
+
+    # External tool wiring defaults.
+    #
+    # Goal: a YAML with no `tools:` block should still work after the installer
+    # clones tools into `assets/external/` and places weights under `assets/`.
+    def _env_fallback_path(*keys: str) -> str | None:
+        for k in keys:
+            v = os.environ.get(k)
+            if v:
+                return str(v)
+        return None
+
+    if not tools.get("mpnn_repo"):
+        candidate = _env_fallback_path("PROTEINMPNN_REPO", "PPIFLOW_MPNN_REPO")
+        if candidate:
+            tools["mpnn_repo"] = resolve_optional_path(candidate, base_dir=base_dir)
+        else:
+            local = _ROOT / "assets" / "external" / "ProteinMPNN"
+            if local.exists():
+                tools["mpnn_repo"] = str(local)
+    if not tools.get("abmpnn_repo"):
+        # AbMPNN runner lives inside the same ProteinMPNN repo in this pipeline.
+        candidate = _env_fallback_path("PROTEINMPNN_REPO", "PPIFLOW_ABMPNN_REPO")
+        if candidate:
+            tools["abmpnn_repo"] = resolve_optional_path(candidate, base_dir=base_dir)
+        elif tools.get("mpnn_repo"):
+            tools["abmpnn_repo"] = tools["mpnn_repo"]
+
+    if not tools.get("flowpacker_repo"):
+        candidate = _env_fallback_path("FLOWPACKER_REPO", "PPIFLOW_FLOWPACKER_REPO")
+        if candidate:
+            tools["flowpacker_repo"] = resolve_optional_path(candidate, base_dir=base_dir)
+        else:
+            local = _ROOT / "assets" / "external" / "flowpacker"
+            if local.exists():
+                tools["flowpacker_repo"] = str(local)
+    if not tools.get("af3score_repo"):
+        candidate = _env_fallback_path("AF3SCORE_REPO", "PPIFLOW_AF3SCORE_REPO")
+        if candidate:
+            tools["af3score_repo"] = resolve_optional_path(candidate, base_dir=base_dir)
+        else:
+            local = _ROOT / "assets" / "external" / "AF3Score"
+            if local.exists():
+                tools["af3score_repo"] = str(local)
+    if not tools.get("af3_weights"):
+        candidate = _env_fallback_path("AF3_WEIGHTS", "PPIFLOW_AF3_WEIGHTS")
+        if candidate:
+            tools["af3_weights"] = resolve_optional_path(candidate, base_dir=base_dir)
+        else:
+            local = _ROOT / "assets" / "weights" / "af3"
+            if local.exists():
+                tools["af3_weights"] = str(local)
+    if not tools.get("dockq_bin"):
+        candidate = _env_fallback_path("DOCKQ_BIN", "PPIFLOW_DOCKQ_BIN")
+        if candidate:
+            tools["dockq_bin"] = resolve_optional_path(candidate, base_dir=base_dir)
+        else:
+            local = _ROOT / "assets" / "external" / "DockQ" / "DockQ.py"
+            if local.exists():
+                tools["dockq_bin"] = str(local)
+
     if not tools.get("rosetta_bin"):
         candidate = _ROOT / "assets" / "tools" / "rosetta_scripts"
         if candidate.exists():
@@ -192,11 +253,38 @@ def normalize_input(
         if candidate:
             tools["af3_db"] = resolve_optional_path(candidate, base_dir=base_dir)
     if not tools.get("mpnn_ckpt"):
-        mpnn_repo = tools.get("mpnn_repo")
-        if mpnn_repo:
-            candidate = Path(mpnn_repo) / "model_weights"
-            if candidate.exists():
-                tools["mpnn_ckpt"] = str(candidate)
+        # Binder sequence design uses ProteinMPNN weights. Prefer env.sh exports,
+        # then repo-local assets, then fall back to common ProteinMPNN layouts.
+        candidate = _env_fallback_path("MPNN_WEIGHTS", "PPIFLOW_MPNN_WEIGHTS")
+        if candidate:
+            tools["mpnn_ckpt"] = resolve_optional_path(candidate, base_dir=base_dir)
+        else:
+            local = _ROOT / "assets" / "weights" / "mpnn" / "weights"
+            if local.exists():
+                tools["mpnn_ckpt"] = str(local)
+            else:
+                mpnn_repo = tools.get("mpnn_repo")
+                if mpnn_repo:
+                    repo = Path(mpnn_repo)
+                    for rel in ("vanilla_model_weights", "model_weights"):
+                        path = repo / rel
+                        if path.exists():
+                            tools["mpnn_ckpt"] = str(path)
+                            break
+    if not tools.get("mpnn_ckpt_soluble"):
+        candidate = _env_fallback_path("MPNN_SOLUBLE_WEIGHTS", "PPIFLOW_MPNN_SOLUBLE_WEIGHTS")
+        if candidate:
+            tools["mpnn_ckpt_soluble"] = resolve_optional_path(candidate, base_dir=base_dir)
+        else:
+            local = _ROOT / "assets" / "weights" / "mpnn" / "soluble"
+            if local.exists():
+                tools["mpnn_ckpt_soluble"] = str(local)
+            else:
+                mpnn_repo = tools.get("mpnn_repo")
+                if mpnn_repo:
+                    path = Path(mpnn_repo) / "soluble_model_weights"
+                    if path.exists():
+                        tools["mpnn_ckpt_soluble"] = str(path)
     if not tools.get("abmpnn_ckpt"):
         candidate = _ROOT / "assets" / "weights" / "abmpnn" / "abmpnn.pt"
         if candidate.exists():
