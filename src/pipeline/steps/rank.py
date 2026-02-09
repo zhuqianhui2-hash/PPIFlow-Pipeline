@@ -11,6 +11,7 @@ from typing import Any
 
 from .base import Step, StepContext, StepError
 from ..io import ensure_dir, read_json, write_json
+from ..pdb_sequences import chain_sequences_from_pdb
 from ..work_queue import WorkItem
 
 
@@ -264,9 +265,12 @@ class RankStep(Step):
         if not dockq_dir.exists():
             return mapping
         for fp in dockq_dir.glob("*_dockq_score"):
-            name = fp.stem
-            if name.endswith("_dockq_score"):
-                name = name[: -len("_dockq_score")]
+            # DockQ score files are named from model_path.stem where the model path is a PDB like:
+            #   <id>.pdb__sampleX_-1_Y.pdb
+            # so the score filename contains an internal ".pdb__..." segment. Using Path.stem would
+            # truncate at that dot and break ID matching. Use the literal filename instead.
+            fname = fp.name
+            name = fname[: -len("_dockq_score")] if fname.endswith("_dockq_score") else fname
             score = None
             try:
                 for line in fp.read_text().splitlines():
@@ -453,6 +457,51 @@ class RankStep(Step):
             reverse=True,
         )
 
+        protocol = ctx.input_data.get("protocol")
+        is_antibody = protocol == "antibody"
+        binder_chain = str(ctx.input_data.get("binder_chain") or "A")
+        framework = ctx.input_data.get("framework") or {}
+        heavy_chain = str(framework.get("heavy_chain") or "A")
+        light_chain = str(framework.get("light_chain") or "").strip()
+        seq_cache: dict[str, dict[str, str]] = {}
+
+        def _resolve_pdb_path(raw: str | None) -> Path | None:
+            if not raw:
+                return None
+            p = Path(str(raw))
+            # Try as-written first (container paths during pipeline execution).
+            if p.exists():
+                return p
+            # Try relative to the run dir.
+            if not p.is_absolute():
+                cand = ctx.out_dir / p
+                if cand.exists():
+                    return cand
+            # Fallback for host-visible paths when source_path is container-style (/root/...).
+            name = p.name
+            for cand in [
+                ctx.out_dir / "output" / "af3_refold" / "pdbs" / name,
+                ctx.out_dir / "output" / "af3_refold" / "filtered_pdbs" / name,
+            ]:
+                if cand.exists():
+                    return cand
+            return None
+
+        def _seqs_for(raw_path: str | None) -> dict[str, str]:
+            path = _resolve_pdb_path(raw_path)
+            if path is None:
+                return {}
+            key = str(path)
+            cached = seq_cache.get(key)
+            if cached is not None:
+                return cached
+            try:
+                seqs = chain_sequences_from_pdb(path)
+            except Exception:
+                seqs = {}
+            seq_cache[key] = seqs
+            return seqs
+
         summary_path = results_dir / "summary.csv"
         tmp_path = summary_path.with_suffix(".csv.tmp")
         with open(tmp_path, "w", newline="") as f:
@@ -468,10 +517,22 @@ class RankStep(Step):
                     "composite_score",
                     "passed_filter",
                     "source_path",
+                    "binder_seq",
+                    "ab_heavy_seq",
+                    "ab_light_seq",
                 ],
             )
             writer.writeheader()
             for r in rows:
+                seqs = _seqs_for(r.get("source_path"))
+                binder_seq = None
+                ab_heavy_seq = None
+                ab_light_seq = None
+                if is_antibody:
+                    ab_heavy_seq = seqs.get(heavy_chain) if heavy_chain else None
+                    ab_light_seq = seqs.get(light_chain) if light_chain else None
+                else:
+                    binder_seq = seqs.get(binder_chain) if binder_chain else None
                 writer.writerow({
                     "design_id": r.get("design_id"),
                     "score": r.get("score"),
@@ -482,6 +543,9 @@ class RankStep(Step):
                     "composite_score": r.get("composite_score"),
                     "passed_filter": r.get("passed_filter"),
                     "source_path": r.get("source_path"),
+                    "binder_seq": binder_seq,
+                    "ab_heavy_seq": ab_heavy_seq,
+                    "ab_light_seq": ab_light_seq,
                 })
         tmp_path.replace(summary_path)
 
@@ -495,8 +559,8 @@ class RankStep(Step):
             src = r.get("source_path")
             if not src:
                 continue
-            src_path = Path(src)
-            if not src_path.exists():
+            src_path = _resolve_pdb_path(str(src))
+            if src_path is None:
                 continue
             dst = top_dir / src_path.name
             if not dst.exists():

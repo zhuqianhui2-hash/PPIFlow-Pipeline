@@ -155,12 +155,24 @@ class DockQStep(Step):
         out_dir = self.output_dir(ctx)
         rows = []
         for fp in out_dir.rglob("*_dockq_score"):
+            # NOTE: DockQ score files are created from model_path.stem where model_path is a PDB like:
+            #   <id>.pdb__sampleX_-1_Y.pdb
+            # so the score filename contains an internal ".pdb__..." segment. Using Path.stem would
+            # truncate at that dot and break ID matching. Use the literal filename instead.
+            fname = fp.name
+            name = fname[: -len("_dockq_score")] if fname.endswith("_dockq_score") else fname
+            score = None
             try:
-                text = fp.read_text().strip().split()
-                score = float(text[-1]) if text else None
+                for line in fp.read_text().splitlines():
+                    line = line.strip()
+                    if not line.startswith("DockQ"):
+                        continue
+                    parts = line.split()
+                    if len(parts) > 1:
+                        score = float(parts[1])
+                        break
             except Exception:
                 score = None
-            name = fp.stem.replace("_dockq_score", "")
             rows.append({
                 "design_id": extract_design_id(name),
                 "structure_id": structure_id_from_name(name),

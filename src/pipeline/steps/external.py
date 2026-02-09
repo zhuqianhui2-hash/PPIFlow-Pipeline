@@ -22,6 +22,7 @@ from ..io import collect_pdbs, is_ignored_path
 from ..logging_utils import log_command_progress, run_command
 from ..manifests import build_name_map, extract_design_id, find_metrics_file, structure_id_from_name, write_csv
 from ..output_policy import is_minimal, mode as output_mode, optional_dir, should_keep, step_scratch_dir
+from ..pdb_sequences import chain_sequences_from_pdb
 from ..work_queue import WorkItem
 
 
@@ -2604,11 +2605,58 @@ class AF3ScoreStep(ExternalCommandStep):
                 return
             df = pd.read_csv(metrics_path)
 
-        # Consolidated metrics.csv (atomic write)
-        metrics_csv = out_dir / "metrics.csv"
-        tmp_metrics = metrics_csv.parent / f"{metrics_csv.name}.tmp"
-        df.to_csv(tmp_metrics, index=False)
-        os.replace(tmp_metrics, metrics_csv)
+        def _norm_desc_keys(raw: str) -> list[str]:
+            text = str(raw or "").strip()
+            candidates = [text]
+            # Metrics "description" can be a basename or a path-like string; try both.
+            try:
+                candidates.append(Path(text).name)
+            except Exception:
+                pass
+            out: list[str] = []
+            seen: set[str] = set()
+            for cand in candidates:
+                norm = str(cand or "").strip().lower()
+                if norm.endswith(".pdb"):
+                    norm = norm[:-4]
+                if not norm or norm in seen:
+                    continue
+                out.append(norm)
+                seen.add(norm)
+            return out
+
+        def _filtered_name(raw: str) -> str:
+            # Match the naming rules used when materializing filtered_pdbs below.
+            norm = str(raw or "").strip()
+            norm = Path(norm).name
+            if norm.lower().endswith(".pdb"):
+                norm = norm[:-4]
+            return norm.replace("/", "_").replace("\\", "_")
+
+        def _resolve_container_path(p: Path) -> Path | None:
+            # When pipeline runs in a container, config paths may look like /root/.../output/<step>/...
+            # but the host-visible equivalent is usually ctx.out_dir/output/<step>/...
+            try:
+                s = str(p)
+            except Exception:
+                return None
+            if "/output/" in s:
+                tail = s.split("/output/", 1)[1]
+                cand = ctx.out_dir / "output" / tail
+                if cand.exists():
+                    return cand
+            return None
+
+        def _find_unique_dir_by_basename(root: Path, name: str) -> Path | None:
+            if not root.exists() or not name:
+                return None
+            try:
+                matches = [p for p in root.rglob(name) if p.is_dir()]
+            except Exception:
+                matches = []
+            if len(matches) == 1:
+                return matches[0]
+            return None
 
         # Build mapping to upstream PDBs directly from configured input_dir (no metrics_pdbs staging).
         cfg = self._af3score_config()
@@ -2616,11 +2664,20 @@ class AF3ScoreStep(ExternalCommandStep):
         input_root: Path | None = None
         pdbs: list[Path] = []
         if input_dir:
-            input_root = Path(str(input_dir))
-            if not input_root.is_absolute():
-                input_root = ctx.out_dir / input_root
-            if input_root.exists():
-                input_root = self._resolve_input_dir(input_root)
+            raw_input = Path(str(input_dir))
+            cand = raw_input
+            if not cand.is_absolute():
+                cand = ctx.out_dir / cand
+            if not cand.exists() and raw_input.is_absolute():
+                remap = _resolve_container_path(raw_input)
+                if remap is not None:
+                    cand = remap
+            if not cand.exists() and raw_input.is_absolute():
+                uniq = _find_unique_dir_by_basename(ctx.out_dir / "output", raw_input.name)
+                if uniq is not None:
+                    cand = uniq
+            if cand.exists():
+                input_root = self._resolve_input_dir(cand)
                 pdbs = collect_pdbs(input_root)
 
         run_stem_to_pdb: dict[str, Path] = {}
@@ -2635,6 +2692,26 @@ class AF3ScoreStep(ExternalCommandStep):
                 run_stem_to_pdb = {}
                 stem_to_pdb = {p.stem.lower(): p for p in pdbs}
         run_stem_to_pdb_lower = {k.lower(): v for k, v in run_stem_to_pdb.items()}
+        stem_to_pdb_lower = {k.lower(): v for k, v in stem_to_pdb.items()}
+
+        # Fallback index: if configured input_dir cannot be resolved (e.g., container path on host),
+        # try host-visible PDB roots that typically exist after a run.
+        fallback_roots: list[Path] = []
+        for root in [
+            ctx.out_dir / "output" / "af3_refold" / "pdbs",
+            ctx.out_dir / "output" / "af3_refold" / "filtered_pdbs",
+            out_dir / "filtered_pdbs",
+            out_dir / "pdbs",
+        ]:
+            if root.exists():
+                fallback_roots.append(root)
+        fallback_index: dict[str, Path] = {}
+        for root in fallback_roots:
+            try:
+                for p in collect_pdbs(root):
+                    fallback_index.setdefault(p.stem.lower(), p)
+            except Exception:
+                continue
 
         def _get(row, *keys):
             for k in keys:
@@ -2654,6 +2731,13 @@ class AF3ScoreStep(ExternalCommandStep):
         iptm_binder_target_col: list[float | None] = []
         protocol = ctx.input_data.get("protocol")
         is_antibody = protocol == "antibody"
+        binder_chain = str(ctx.input_data.get("binder_chain") or "A")
+        framework = ctx.input_data.get("framework") or {}
+        heavy_chain = str(framework.get("heavy_chain") or "A")
+        light_chain = str(framework.get("light_chain") or "").strip()
+        binder_seq_col: list[str | None] = []
+        ab_heavy_seq_col: list[str | None] = []
+        ab_light_seq_col: list[str | None] = []
         target_chain = "B"
         if is_antibody:
             target = ctx.input_data.get("target") or {}
@@ -2665,13 +2749,40 @@ class AF3ScoreStep(ExternalCommandStep):
 
         step_label = str(self.cfg.get("name") or self.name)
         missing_pdbs: list[str] = []
+        seq_cache: dict[str, dict[str, str]] = {}
+
+        def _seqs_for(path: Path | None) -> dict[str, str]:
+            if path is None:
+                return {}
+            key = str(path)
+            cached = seq_cache.get(key)
+            if cached is not None:
+                return cached
+            try:
+                seqs = chain_sequences_from_pdb(path)
+            except Exception:
+                seqs = {}
+            seq_cache[key] = seqs
+            return seqs
+
         for _, row in df.iterrows():
             desc = _get(row, "description", "name", "model", "pdb_name")
             desc = str(desc) if desc is not None else ""
-            key = desc.strip().lower()
-            if key.endswith(".pdb"):
-                key = key[:-4]
-            pdb_path = run_stem_to_pdb_lower.get(key) or stem_to_pdb.get(key)
+            keys = _norm_desc_keys(desc)
+            filtered_key = _filtered_name(desc).lower()
+
+            pdb_path = None
+            for key in keys:
+                # Prefer upstream input_dir mapping (most reliable for AF3Score metrics rows).
+                pdb_path = run_stem_to_pdb_lower.get(key) or stem_to_pdb_lower.get(key)
+                if pdb_path is not None:
+                    break
+                # Then try a host-visible fallback index (refold outputs and/or prior filtered_pdbs).
+                pdb_path = fallback_index.get(key)
+                if pdb_path is not None:
+                    break
+            if pdb_path is None and filtered_key:
+                pdb_path = fallback_index.get(filtered_key)
             if desc and pdb_path is None:
                 missing_pdbs.append(desc)
 
@@ -2696,6 +2807,18 @@ class AF3ScoreStep(ExternalCommandStep):
             iptm_binder_target_col.append(
                 float(iptm_binder_target) if iptm_binder_target is not None else None
             )
+
+            # Add sequences for easy copy/paste (aligned to df rows).
+            seqs = _seqs_for(pdb_path)
+            if is_antibody:
+                binder_seq_col.append(None)
+                ab_heavy_seq_col.append(seqs.get(heavy_chain) if heavy_chain else None)
+                ab_light_seq_col.append(seqs.get(light_chain) if light_chain else None)
+            else:
+                binder_seq_col.append(seqs.get(binder_chain) if binder_chain else None)
+                ab_heavy_seq_col.append(None)
+                ab_light_seq_col.append(None)
+
             rows.append({
                 # Internal-only (not written to the manifest CSV): used for filtered_pdbs naming.
                 "run_stem": desc,
@@ -2718,8 +2841,18 @@ class AF3ScoreStep(ExternalCommandStep):
                 flush=True,
             )
 
+        # Consolidated metrics.csv (atomic write) with added sequence columns.
+        df_out = df.copy()
+        df_out["binder_seq"] = binder_seq_col
+        df_out["ab_heavy_seq"] = ab_heavy_seq_col
+        df_out["ab_light_seq"] = ab_light_seq_col
+        metrics_csv = out_dir / "metrics.csv"
+        tmp_metrics = metrics_csv.parent / f"{metrics_csv.name}.tmp"
+        df_out.to_csv(tmp_metrics, index=False)
+        os.replace(tmp_metrics, metrics_csv)
+
         # Write derived metrics with binder-target ipTM if needed (atomic write).
-        df_ppi = df.copy()
+        df_ppi = df_out.copy()
         df_ppi["iptm_global"] = iptm_global_col
         df_ppi["iptm_binder_target"] = iptm_binder_target_col
         metrics_ppiflow = out_dir / "metrics_ppiflow.csv"
@@ -2773,10 +2906,13 @@ class AF3ScoreStep(ExternalCommandStep):
                 r["passed_top_k"] = r.get("passed_filter")
 
         # Rebuild filtered_pdbs/ deterministically to avoid downstream picking up stale files.
+        # Build into a new directory and swap to avoid self-deleting sources when reusing old filtered_pdbs.
         filtered_dir = out_dir / "filtered_pdbs"
-        if filtered_dir.exists():
-            shutil.rmtree(filtered_dir, ignore_errors=True)
-        filtered_dir.mkdir(parents=True, exist_ok=True)
+        filtered_dir_new = out_dir / "filtered_pdbs_new"
+        filtered_dir_old = out_dir / "filtered_pdbs_old"
+        if filtered_dir_new.exists():
+            shutil.rmtree(filtered_dir_new, ignore_errors=True)
+        filtered_dir_new.mkdir(parents=True, exist_ok=True)
         expected_passing = 0
         missing_passing: list[str] = []
         passing = 0
@@ -2795,14 +2931,12 @@ class AF3ScoreStep(ExternalCommandStep):
                 continue
             if run_stem == "<missing>":
                 run_stem = src.stem
-            if run_stem.lower().endswith(".pdb"):
-                run_stem = run_stem[:-4]
-            run_stem = run_stem.replace("/", "_").replace("\\", "_")
-            dst = filtered_dir / f"{run_stem}.pdb"
+            dst_name = _filtered_name(run_stem)
+            dst = filtered_dir_new / f"{dst_name}.pdb"
             try:
                 promote_file_atomic(src, dst, allow_reuse=True)
             except Exception as exc:
-                raise StepError(f"Failed to materialize filtered_pdbs for {run_stem}: {exc}") from exc
+                raise StepError(f"Failed to materialize filtered_pdbs for {dst_name}: {exc}") from exc
             passing += 1
 
         if expected_passing == 0:
@@ -2829,6 +2963,15 @@ class AF3ScoreStep(ExternalCommandStep):
                 f"(examples: {sample})."
             )
             raise StepError(msg)
+
+        # Swap in the newly-built filtered_pdbs directory.
+        if filtered_dir_old.exists():
+            shutil.rmtree(filtered_dir_old, ignore_errors=True)
+        if filtered_dir.exists():
+            os.replace(filtered_dir, filtered_dir_old)
+        os.replace(filtered_dir_new, filtered_dir)
+        if filtered_dir_old.exists():
+            shutil.rmtree(filtered_dir_old, ignore_errors=True)
 
         # Write manifest atomically.
         manifest_path = self.manifest_path(ctx)
@@ -3931,13 +4074,17 @@ class AF3RefoldStep(ExternalCommandStep):
                 return
             df = pd.read_csv(metrics_path)
 
-        # Consolidated metrics.csv (atomic write)
-        metrics_csv = out_dir / "metrics.csv"
-        tmp_metrics = metrics_csv.parent / f"{metrics_csv.name}.tmp"
-        df.to_csv(tmp_metrics, index=False)
-        os.replace(tmp_metrics, metrics_csv)
-
-        name_map = build_name_map(out_dir / "pdbs")
+        # Refold metrics rows are matched to PDBs by stem; normalize desc values to avoid
+        # missing lookups when metrics include ".pdb" or a path-like prefix.
+        name_map_lower: dict[str, Path] = {}
+        for root in [out_dir / "pdbs", out_dir / "filtered_pdbs"]:
+            if not root.exists():
+                continue
+            try:
+                for stem, path in build_name_map(root).items():
+                    name_map_lower.setdefault(str(stem).lower(), path)
+            except Exception:
+                continue
 
         def _get(row, *keys):
             for k in keys:
@@ -3957,6 +4104,13 @@ class AF3RefoldStep(ExternalCommandStep):
         iptm_binder_target_col: list[float | None] = []
         protocol = ctx.input_data.get("protocol")
         is_antibody = protocol == "antibody"
+        binder_chain = str(ctx.input_data.get("binder_chain") or "A")
+        framework = ctx.input_data.get("framework") or {}
+        heavy_chain = str(framework.get("heavy_chain") or "A")
+        light_chain = str(framework.get("light_chain") or "").strip()
+        binder_seq_col: list[str | None] = []
+        ab_heavy_seq_col: list[str | None] = []
+        ab_light_seq_col: list[str | None] = []
         target_chain = "B"
         if is_antibody:
             target = ctx.input_data.get("target") or {}
@@ -3965,6 +4119,23 @@ class AF3RefoldStep(ExternalCommandStep):
                 target_chain = str(chains[0])
             elif isinstance(chains, str) and chains:
                 target_chain = str(chains)
+        seq_cache: dict[str, dict[str, str]] = {}
+        missing_pdbs: list[str] = []
+
+        def _seqs_for(path: Path | None) -> dict[str, str]:
+            if path is None:
+                return {}
+            key = str(path)
+            cached = seq_cache.get(key)
+            if cached is not None:
+                return cached
+            try:
+                seqs = chain_sequences_from_pdb(path)
+            except Exception:
+                seqs = {}
+            seq_cache[key] = seqs
+            return seqs
+
         for _, row in df.iterrows():
             desc = _get(row, "description", "name", "model", "pdb_name")
             desc = str(desc) if desc is not None else ""
@@ -3994,8 +4165,29 @@ class AF3RefoldStep(ExternalCommandStep):
             )
 
             if not desc:
+                binder_seq_col.append(None)
+                ab_heavy_seq_col.append(None)
+                ab_light_seq_col.append(None)
                 continue
-            pdb_path = name_map.get(desc)
+            key = str(desc).strip()
+            key = Path(key).name
+            key_lower = key.lower()
+            if key_lower.endswith(".pdb"):
+                key_lower = key_lower[:-4]
+            pdb_path = name_map_lower.get(key_lower)
+            if pdb_path is None:
+                pdb_path = name_map_lower.get(key_lower.replace("/", "_").replace("\\", "_"))
+            if pdb_path is None:
+                missing_pdbs.append(desc)
+            seqs = _seqs_for(pdb_path)
+            if is_antibody:
+                binder_seq_col.append(None)
+                ab_heavy_seq_col.append(seqs.get(heavy_chain) if heavy_chain else None)
+                ab_light_seq_col.append(seqs.get(light_chain) if light_chain else None)
+            else:
+                binder_seq_col.append(seqs.get(binder_chain) if binder_chain else None)
+                ab_heavy_seq_col.append(None)
+                ab_light_seq_col.append(None)
             rows.append({
                 "design_id": extract_design_id(desc),
                 "structure_id": structure_id_from_name(desc),
@@ -4004,8 +4196,27 @@ class AF3RefoldStep(ExternalCommandStep):
                 "pdb_path": str(pdb_path) if pdb_path else None,
             })
 
+        if missing_pdbs:
+            sample = ", ".join(missing_pdbs[:5])
+            step_label = str(self.cfg.get("name") or self.name)
+            print(
+                f"[{step_label}] WARN missing {len(missing_pdbs)} PDBs for AF3Refold rows "
+                f"(examples: {sample}).",
+                flush=True,
+            )
+
+        # Consolidated metrics.csv (atomic write) with added sequence columns.
+        df_out = df.copy()
+        df_out["binder_seq"] = binder_seq_col
+        df_out["ab_heavy_seq"] = ab_heavy_seq_col
+        df_out["ab_light_seq"] = ab_light_seq_col
+        metrics_csv = out_dir / "metrics.csv"
+        tmp_metrics = metrics_csv.parent / f"{metrics_csv.name}.tmp"
+        df_out.to_csv(tmp_metrics, index=False)
+        os.replace(tmp_metrics, metrics_csv)
+
         # Write derived metrics_ppiflow.csv (atomic write).
-        df_ppi = df.copy()
+        df_ppi = df_out.copy()
         df_ppi["iptm_global"] = iptm_global_col
         df_ppi["iptm_binder_target"] = iptm_binder_target_col
         metrics_ppiflow = out_dir / "metrics_ppiflow.csv"
