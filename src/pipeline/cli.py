@@ -174,6 +174,11 @@ def build_parser() -> argparse.ArgumentParser:
     _add_common_args(p_pipeline)
     _add_orchestrator_pool_args(p_pipeline)
     p_pipeline.add_argument(
+        "--single-process",
+        action="store_true",
+        help="Force legacy single-process execution (debug/regression only; disables orchestrator pools)",
+    )
+    p_pipeline.add_argument(
         "--skip-config",
         action="store_true",
         help="Skip configure if config files already exist (auto-configure if missing)",
@@ -201,6 +206,11 @@ def build_parser() -> argparse.ArgumentParser:
     p_execute.add_argument("--num-devices", type=str, default=None, help="Number of GPUs/workers (e.g. 4 or 'all')")
     p_execute.add_argument("--devices", type=str, default=None, help="Comma-separated GPU list or 'all'")
     _add_orchestrator_pool_args(p_execute)
+    p_execute.add_argument(
+        "--single-process",
+        action="store_true",
+        help="Force legacy single-process execution (debug/regression only; disables orchestrator pools)",
+    )
     _add_work_queue_args(p_execute)
     _add_run_lock_args(p_execute)
 
@@ -224,7 +234,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="Output mode (minimal or full). Default: minimal.",
     )
     p_orch.add_argument("--configure", action="store_true", help="Run configure if steps.yaml is missing")
-    p_orch.add_argument("--steps", type=str, default=None, help="Run a single step only")
+    p_orch.add_argument("--steps", type=str, default="all", help="Step names (all or comma-separated step list)")
     p_orch.add_argument("--pool-size", type=int, default=None, help="Override pool size (advanced)")
     p_orch.add_argument("--num-devices", type=str, default=None, help="Number of GPUs/workers (e.g. 4 or 'all')")
     _add_orchestrator_pool_args(p_orch)
@@ -243,6 +253,12 @@ def build_parser() -> argparse.ArgumentParser:
     sub.add_parser("wizard", help="Interactive setup wizard")
 
     return parser
+
+
+def _single_process_conflicts(args) -> bool:
+    return bool(getattr(args, "num_devices", None)) or bool(getattr(args, "devices", None)) or (
+        getattr(args, "num_rosetta_workers", None) is not None or getattr(args, "num_cpu_workers", None) is not None
+    )
 
 
 def main(argv: list[str] | None = None) -> None:
@@ -266,43 +282,25 @@ def main(argv: list[str] | None = None) -> None:
             if getattr(args, "input", None) and not getattr(args, "skip_config", False):
                 print("[pipeline] using existing config; use --force-config to regenerate.")
 
-        wants_orchestrator = bool(getattr(args, "num_devices", None)) or (
-            getattr(args, "num_rosetta_workers", None) is not None or getattr(args, "num_cpu_workers", None) is not None
-        )
-        if wants_orchestrator:
-            step_arg = getattr(args, "steps", None)
-            if step_arg and "," in step_arg and step_arg not in {"all", ""}:
-                flags = []
-                if getattr(args, "num_devices", None):
-                    flags.append("--num-devices")
-                if getattr(args, "num_rosetta_workers", None) is not None or getattr(args, "num_cpu_workers", None) is not None:
-                    flags.append("--num-rosetta-workers")
-                if flags:
-                    raise SystemExit(f"{'/'.join(flags)} requires a single step or --steps all")
-                raise SystemExit("orchestrate mode requires a single step or --steps all")
-            orchestrate_pipeline(args)
-        else:
+        if getattr(args, "single_process", False):
+            if _single_process_conflicts(args):
+                raise SystemExit(
+                    "--single-process cannot be combined with --num-devices/--devices or --num-rosetta-workers/--num-cpu-workers"
+                )
             execute_pipeline(args)
+        else:
+            orchestrate_pipeline(args)
     elif args.command == "configure":
         configure_pipeline(args)
     elif args.command == "execute":
-        wants_orchestrator = bool(getattr(args, "num_devices", None)) or (
-            getattr(args, "num_rosetta_workers", None) is not None or getattr(args, "num_cpu_workers", None) is not None
-        )
-        if wants_orchestrator:
-            step_arg = getattr(args, "steps", None)
-            if step_arg and "," in step_arg and step_arg not in {"all", ""}:
-                flags = []
-                if getattr(args, "num_devices", None):
-                    flags.append("--num-devices")
-                if getattr(args, "num_rosetta_workers", None) is not None or getattr(args, "num_cpu_workers", None) is not None:
-                    flags.append("--num-rosetta-workers")
-                if flags:
-                    raise SystemExit(f"{'/'.join(flags)} requires a single step or --steps all")
-                raise SystemExit("orchestrate mode requires a single step or --steps all")
-            orchestrate_pipeline(args)
-        else:
+        if getattr(args, "single_process", False):
+            if _single_process_conflicts(args):
+                raise SystemExit(
+                    "--single-process cannot be combined with --num-devices/--devices or --num-rosetta-workers/--num-cpu-workers"
+                )
             execute_pipeline(args)
+        else:
+            orchestrate_pipeline(args)
     elif args.command == "rank":
         if getattr(args, "num_devices", None):
             raise SystemExit("rank does not support --num-devices (use execute/orchestrate instead)")

@@ -252,22 +252,32 @@ def _parse_num_devices(raw: Optional[str]) -> Optional[str]:
     return value if value else None
 
 
-def _resolve_device_list(cfg: Dict[str, Any], args_devices: Optional[str]) -> list[str]:
-    cli_devices = _parse_devices(args_devices)
-    if cli_devices:
-        return cli_devices
-    binding = cfg.get("gpu_binding") or {}
-    cfg_devices = binding.get("devices")
-    if isinstance(cfg_devices, str) and cfg_devices.strip().lower() == "all":
-        detected = _detect_visible_devices()
-        return detected or []
-    if isinstance(cfg_devices, list) and cfg_devices:
-        return [str(d) for d in cfg_devices]
-    env_devices = os.environ.get("CUDA_VISIBLE_DEVICES")
-    if env_devices:
-        return [d.strip() for d in env_devices.split(",") if d.strip()]
-    return []
-
+def _parse_steps_filter(steps_arg: Any, available_steps: list[str]) -> Optional[list[str]]:
+    """
+    Parse --steps values in the same shapes supported by execute:
+    - all/empty: no filter
+    - single step: filter to that step
+    - comma-list: filter-only; preserve canonical steps.yaml ordering
+    """
+    if steps_arg is None:
+        return None
+    raw = str(steps_arg).strip()
+    if not raw or raw.lower() == "all":
+        return None
+    tokens = [s.strip() for s in raw.split(",") if s.strip()]
+    if not tokens:
+        return None
+    requested = set(tokens)
+    available = set(available_steps)
+    unknown = sorted(requested - available)
+    if unknown:
+        valid = ", ".join(available_steps)
+        bad = ", ".join(unknown)
+        raise OrchestratorError(f"Unknown step(s) in --steps: {bad}\nValid steps: {valid}")
+    filtered = [s for s in available_steps if s in requested]
+    if not filtered:
+        raise OrchestratorError("No steps selected (after filtering)")
+    return filtered
 
 def _next_attempt(run_dir: Path) -> int:
     if not run_dir.exists():
@@ -721,13 +731,8 @@ def orchestrate_pipeline(args) -> None:
         step_cfgs = _load_step_configs(out_dir)
         ready_ctx = _build_ready_context(out_dir, input_data, work_queue_cfg)
 
-        step_arg = getattr(args, "steps", None)
-        if step_arg and step_arg not in {"", "all"}:
-            if "," in step_arg:
-                raise OrchestratorError("--steps accepts a single step only")
-            single_step = step_arg.strip()
-        else:
-            single_step = None
+        steps_arg_raw = getattr(args, "steps", None)
+        selected_steps = _parse_steps_filter(steps_arg_raw, available_steps)
 
         rosetta_cli = getattr(args, "num_rosetta_workers", None)
         rosetta_cli_alias = getattr(args, "num_cpu_workers", None)
@@ -783,12 +788,32 @@ def orchestrate_pipeline(args) -> None:
             if explicit_devices is not None and len(explicit_devices) == 0:
                 explicit_devices = None
 
+            binding = orch_cfg.get("gpu_binding") or {}
+            cfg_devices_raw = binding.get("devices")
+            cfg_devices: Optional[list[str]] = None
+            if isinstance(cfg_devices_raw, str) and cfg_devices_raw.strip().lower() == "all":
+                cfg_devices = _detect_visible_devices() or None
+            elif isinstance(cfg_devices_raw, list) and cfg_devices_raw:
+                cfg_devices = [str(d) for d in cfg_devices_raw]
+
             if num_devices_raw.lower() == "all":
-                devices = explicit_devices or _detect_visible_devices()
+                if explicit_devices is not None:
+                    visible = _detect_visible_devices()
+                    if visible and len(explicit_devices) != len(visible):
+                        raise OrchestratorError("--devices and --num-devices all conflict")
+                    devices = explicit_devices
+                else:
+                    # CLI intent: "all" means all visible/allocated GPUs (ignore YAML device pinning).
+                    if isinstance(cfg_devices_raw, list) and cfg_devices_raw:
+                        print(
+                            "[orchestrator] note: ignoring orchestrator.gpu_binding.devices because --num-devices all was requested "
+                            "(use --devices to pin)",
+                            file=sys.__stdout__,
+                            flush=True,
+                        )
+                    devices = _detect_visible_devices()
                 if not devices:
                     raise OrchestratorError("No GPUs detected for --num-devices all")
-                if explicit_devices is not None and len(explicit_devices) != len(devices):
-                    raise OrchestratorError("--devices and --num-devices all conflict")
             else:
                 try:
                     num_devices = int(num_devices_raw)
@@ -800,6 +825,12 @@ def orchestrate_pipeline(args) -> None:
                     if len(explicit_devices) != num_devices:
                         raise OrchestratorError("--devices count must match --num-devices")
                     devices = explicit_devices
+                elif cfg_devices is not None:
+                    if len(cfg_devices) < num_devices:
+                        raise OrchestratorError(
+                            f"--num-devices {num_devices} requested but only {len(cfg_devices)} devices configured in orchestrator.gpu_binding.devices"
+                        )
+                    devices = cfg_devices[:num_devices]
                 else:
                     visible = _detect_visible_devices()
                     if len(visible) < num_devices:
@@ -812,14 +843,38 @@ def orchestrate_pipeline(args) -> None:
                 raise OrchestratorError("--pool-size must match --num-devices")
             gpu_pool_override = len(devices)
         else:
-            devices = _resolve_device_list(orch_cfg, devices_arg)
+            if getattr(args, "no_bind", False) and devices_arg:
+                raise OrchestratorError("--devices requires GPU binding (remove --no-bind)")
 
-        plan = _build_plan(
-            available_steps,
-            orch_cfg,
-            single_step=single_step,
-            pool_override=None,
-        )
+            explicit_devices = _parse_devices(devices_arg)
+            if devices_arg and isinstance(devices_arg, str) and devices_arg.strip().lower() == "all" and not explicit_devices:
+                raise OrchestratorError("No GPUs detected for --devices all")
+
+            binding = orch_cfg.get("gpu_binding") or {}
+            cfg_devices_raw = binding.get("devices")
+            cfg_devices: Optional[list[str]] = None
+            if isinstance(cfg_devices_raw, str) and cfg_devices_raw.strip().lower() == "all":
+                cfg_devices = _detect_visible_devices() or None
+            elif isinstance(cfg_devices_raw, list) and cfg_devices_raw:
+                cfg_devices = [str(d) for d in cfg_devices_raw]
+
+            # Device lists from CLI/YAML are explicit intent; env is treated as "available set" only.
+            if explicit_devices:
+                devices = explicit_devices
+                if gpu_pool_override is None:
+                    gpu_pool_override = len(devices)
+            elif cfg_devices:
+                devices = cfg_devices
+                if gpu_pool_override is None:
+                    gpu_pool_override = len(devices)
+            else:
+                # Let cuda_bind choose from visible devices based on the final plan pool size.
+                devices = []
+
+        plan_available = selected_steps if selected_steps is not None else available_steps
+        # If the user explicitly selected steps, treat orchestrator.steps as pool overrides only (not a plan filter).
+        plan_cfg = orch_cfg if selected_steps is None else {k: v for k, v in orch_cfg.items() if k != "steps"}
+        plan = _build_plan(plan_available, plan_cfg, single_step=None, pool_override=None)
 
         # Apply pool overrides.
         for entry in plan:
@@ -845,6 +900,8 @@ def orchestrate_pipeline(args) -> None:
         ensure_dir(orch_dir)
         plan_payload = {
             "output": str(out_dir),
+            "steps_arg": steps_arg_raw,
+            "steps_selected": selected_steps if selected_steps is not None else "all",
             "plan": [
                 {
                     "name": entry.name,
@@ -878,21 +935,25 @@ def orchestrate_pipeline(args) -> None:
             cuda_bind = False
 
         if cuda_bind:
-            if not devices:
-                gpu_pool_sizes: set[int] = set()
-                for entry in plan:
-                    step_name = entry.steps[0] if entry.steps else entry.name
-                    if _is_rosetta_items_step(step_name):
-                        continue
-                    gpu_pool_sizes.add(int(entry.pool_size))
+            gpu_pool_sizes: set[int] = set()
+            for entry in plan:
+                step_name = entry.steps[0] if entry.steps else entry.name
+                if _is_rosetta_items_step(step_name):
+                    continue
+                gpu_pool_sizes.add(int(entry.pool_size))
 
-                if gpu_pool_sizes:
-                    if len(gpu_pool_sizes) != 1:
-                        raise OrchestratorError(
-                            "GPU binding requires a single GPU pool size (use --num-devices/--pool-size "
-                            "and avoid per-step GPU pool_size overrides)"
-                        )
-                    pool_size = next(iter(gpu_pool_sizes))
+            if not gpu_pool_sizes:
+                # No GPU-pool steps in the plan (e.g., rosetta-only); do not require GPUs.
+                devices = []
+            else:
+                if len(gpu_pool_sizes) != 1:
+                    raise OrchestratorError(
+                        "GPU binding requires a single GPU pool size (use --num-devices/--devices/--pool-size "
+                        "and avoid per-step GPU pool_size overrides)"
+                    )
+                pool_size = next(iter(gpu_pool_sizes))
+
+                if not devices:
                     visible = _detect_visible_devices()
                     if len(visible) < pool_size:
                         raise OrchestratorError(
@@ -900,8 +961,12 @@ def orchestrate_pipeline(args) -> None:
                         )
                     devices = visible[:pool_size]
                 else:
-                    # No GPU-pool steps in the plan (e.g., rosetta-only); do not require GPUs.
-                    devices = []
+                    if len(devices) < pool_size:
+                        raise OrchestratorError(
+                            f"Pool size {pool_size} requires {pool_size} GPUs but only {len(devices)} provided"
+                        )
+                    if len(devices) > pool_size:
+                        devices = devices[:pool_size]
 
             device_count = len(devices)
             for entry in plan:

@@ -9,7 +9,7 @@ This repo's README is intentionally "getting started" focused. This page is the 
 - `execute`: run/resume from an existing `steps.yaml`
 - `rank`: run ranking only (`rank_features` + `rank_finalize`)
 - `wizard`: interactive setup (guided prompts)
-- `orchestrate`: advanced multi-worker controller (usually called implicitly when you pass `--num-devices` and/or `--num-rosetta-workers`)
+- `orchestrate`: advanced multi-worker controller (this is the default controller used by `pipeline`/`execute`; use `--single-process` to opt out for debugging)
 
 ## Help
 
@@ -18,16 +18,17 @@ The definitive reference for flags is always:
 python ppiflow.py <command> --help
 ```
 
-## Common Flags (High Signal)
+## Common Flags
 
 - `--output`: output directory (run identity)
 - `--input`: YAML input (`design.yaml`)
 - `--protocol`: `binder`, `vhh`, `antibody` (CLI-only mode)
-- `--steps`: `all` or comma-separated step list (note: some multi-worker modes restrict this)
+- `--steps`: `all` or comma-separated step list
 - `--output-mode`: `minimal` or `full`
 - `--num-devices`: multi-GPU parallelism (`all`, or an integer)
-- `--devices`: bind to specific GPUs (`0,2,3`)
+- `--devices`: bind to specific GPUs (`0,2,3`) (implies `--num-devices 3`)
 - `--num-rosetta-workers` / `--num-cpu-workers`: CPU worker pool size for Rosetta-heavy item steps
+- `--single-process`: force legacy single-process execution (debug/regression only)
 
 ## Common Flags By Command
 
@@ -48,7 +49,7 @@ python ppiflow.py <command> --help
 
 `rank` (ranking only):
 - Typical: `--output`
-- Note: `rank` is single-process only. For multi-GPU ranking, use `execute --steps rank_features` (and/or `orchestrate`).
+- Note: `rank` is single-process only.
 
 ## YAML Input Schema (Minimal)
 

@@ -2,11 +2,11 @@
 
 ![](./assets/model.png)
 
-PPIFlow is a unified, resumable CLI pipeline for de novo protein binders. This fork supports binder, antibody, and VHH protocols.
+PPIFlow-Pipeline is a unified, parallelizable, and resumable CLI pipeline for PPIFlow. This fork supports binder, antibody, and VHH protocols.
 
 ## What You Need
 
-- **GPU(s):** at least one CUDA GPU. Use `--num-devices` to scale across multiple GPUs.
+- **GPU(s):** at least one CUDA GPU.
 - **Files you must supply:**
   - A target PDB file
   - PPIFlow checkpoints (`binder.ckpt`, `antibody.ckpt`, `nanobody.ckpt`, `monomer.ckpt`): see the upstream PPIFlow release instructions
@@ -90,20 +90,28 @@ These examples are intentionally small (`samples_per_target: 10`). They are for 
 
 See `examples/README.md` for details.
 
-## Key Concepts (The Minimum You Need)
+## Key Conventions
 
-- **Protocols:** `binder` designs a free-form binder chain; `vhh` designs a nanobody (single heavy chain); `antibody` designs an scFv (heavy + light).
-- **Hotspots syntax:** chain is required. Examples: `A` (whole chain), `A56` (single residue), `A56-70` (range), `A3,A5-25,B72` (mixed list). Hotspots use chain IDs/residue numbers from your input PDB; they are mapped to the internal concatenated target chain `B` during `configure`.
-- **Chain conventions (internal):**
+- **Protocols:** `binder` designs a de novo binder chain; `vhh` designs a nanobody (single heavy chain); `antibody` designs an scFv (heavy + light).
+- **`samples_per_target`:** number of backbones to generate. The PPIFlow authors recommend ~20k+ for serious production runs.
+- **`target_chains`:** the chain ID(s) in the target PDB file to include in the design process. Unselected chains will be ignored.
+- **Multi-chain targets:** if you provide multiple target chains, the pipeline concatenates them into a single gapped internal target chain `B` during `configure`. Hotspots are specified on the original target chain IDs/residue numbers and then mapped onto the concatenated internal chain `B`.
+- **Hotspots syntax:** Specify hotspot for binder/VHH/antibody targeting. Chain ID is required. Examples: `A` (whole chain), `A56` (single residue), `A56-70` (range), `A3,A5-25,B72` (mixed list). Hotspots use chain IDs/residue numbers from your input PDB; they are mapped to the internal concatenated target chain `B` during `configure`.
+- **Chain conventions:** Irrespective of the input PDB chain IDs, PPIflow will remap them to the following internal chain IDs:
   - Binder/VHH: binder is `A`, target is `B`
   - Antibody: heavy is `A`, light is `C`, target is `B`
 - **Framework chain IDs:** `framework.heavy_chain` / `framework.light_chain` should match the chain IDs in the framework PDB you provide (many scFv frameworks are `A/B`). During `configure`, PPIFlow rewrites framework chains to the internal conventions (heavy `A`, light `C`).
-- **Multi-chain targets:** if you provide multiple target chains, the pipeline concatenates them into a single gapped internal target chain `B` during `configure`. Hotspots are specified on the original target chain IDs/residue numbers and then mapped onto the concatenated internal chain `B`.
-- **`samples_per_target`:** number of backbones to generate. The PPIFlow authors recommend ~20k+ for serious production runs. This is where multi-GPU parallelization matters most.
 
 ## Run Your Own Job
 
-### YAML (Recommended)
+### Interactive CLI Wizard
+Run the CLI wizard to be prompted for all required fields.
+
+```bash
+python ppiflow.py wizard
+```
+
+### YAML
 
 Start from one of:
 - `assets/examples/binder_minimal.yaml`
@@ -125,7 +133,8 @@ python ppiflow.py pipeline \
   --target_chains A \
   --binder_length 75-90 \
   --hotspots A56 \
-  --output /path/to/out_dir
+  --output /path/to/out_dir \
+  --samples_per_target 10
 ```
 
 For antibody/VHH CLI-only required flags, see `documentation/cli_reference.md`.
@@ -139,7 +148,7 @@ python ppiflow.py pipeline --input design.yaml --output out_dir --num-devices al
 
 Pin to specific GPUs:
 ```bash
-python ppiflow.py pipeline --input design.yaml --output out_dir --devices 0,2,3 --num-devices 3
+python ppiflow.py pipeline --input design.yaml --output out_dir --devices 0,2,3
 ```
 
 Rosetta CPU workers (CPU-heavy steps):
@@ -148,6 +157,8 @@ python ppiflow.py execute --output out_dir --num-rosetta-workers 32
 ```
 
 Guideline: set `--num-rosetta-workers` to roughly your available CPU cores; a practical upper bound is around ~40 on many systems.
+
+`pipeline` and `execute` use the orchestrator controller by default. Use `--single-process` to force the legacy single-process path for debugging/regression checks.
 
 More details: `documentation/scaling_and_orchestration.md`.
 

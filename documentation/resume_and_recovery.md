@@ -1,6 +1,6 @@
 # Resume and Recovery
 
-## The Mental Model
+## Mental Model
 
 - A run is an `--output` directory.
 - To resume the same run, rerun `execute` (or `pipeline`) pointing at the same `--output`.
