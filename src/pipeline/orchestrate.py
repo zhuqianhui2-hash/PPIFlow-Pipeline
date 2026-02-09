@@ -346,7 +346,18 @@ def _build_worker_cmd(
 ) -> list[str]:
     root = repo_root(out_dir)
     ppiflow = root / "ppiflow.py"
-    cmd = [sys.executable, str(ppiflow), "execute", "--output", str(out_dir), "--steps", ",".join(steps), "--work-queue"]
+    # Orchestrator workers must never re-enter orchestration (would recurse + fork bomb).
+    cmd = [
+        sys.executable,
+        str(ppiflow),
+        "execute",
+        "--output",
+        str(out_dir),
+        "--steps",
+        ",".join(steps),
+        "--work-queue",
+        "--single-process",
+    ]
     if no_run_lock:
         # Pass through for transparency/debugging (env-based disable is still the source of truth).
         cmd.append("--no-run-lock")
@@ -397,6 +408,9 @@ def _spawn_workers(
 
     for rank in range(pool_size):
         env = os.environ.copy()
+        # Marker used by CLI to prevent accidental execute->orchestrate routing in workers.
+        # We also re-set this after applying extra_env as defense-in-depth.
+        env["PPIFLOW_ORCH_WORKER"] = "1"
         device = None
         if identity_env:
             env["WORLD_SIZE"] = str(pool_size)
@@ -416,6 +430,8 @@ def _spawn_workers(
                 if k and v is not None:
                     # Force override: we want a consistent worker runtime regardless of scheduler defaults.
                     env[str(k)] = str(v)
+        # Defense-in-depth: don't allow extra_env (current or future) to unset the worker marker.
+        env["PPIFLOW_ORCH_WORKER"] = "1"
         if retry_failed_override is not None:
             env["PPIFLOW_WORK_QUEUE_RETRY_FAILED"] = "1" if retry_failed_override else "0"
         if progress_log_path is not None:

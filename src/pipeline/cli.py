@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import os
 from pathlib import Path
 
 from .configure import configure_pipeline
@@ -264,6 +265,14 @@ def _single_process_conflicts(args) -> bool:
 def main(argv: list[str] | None = None) -> None:
     parser = build_parser()
     args = parser.parse_args(argv)
+
+    # Defense-in-depth: orchestrator-spawned worker processes must never re-enter orchestration.
+    # The orchestrator sets PPIFLOW_ORCH_WORKER=1 in the worker env; workers must use --single-process.
+    if args.command == "execute" and os.environ.get("PPIFLOW_ORCH_WORKER") and not getattr(args, "single_process", False):
+        raise SystemExit(
+            "Internal error: orchestrator worker invoked without --single-process. "
+            "This would cause recursive orchestration. Re-run with --single-process."
+        )
 
     if args.command == "pipeline":
         out_dir = Path(args.output).resolve()
