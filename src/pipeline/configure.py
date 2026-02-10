@@ -11,6 +11,13 @@ from Bio import PDB
 from .config import ConfigError, InputSpec, apply_preset, build_input_from_cli, load_input, normalize_input, validate_input, write_cli_input_yaml
 from .io import ensure_dir, write_json, write_yaml, repo_root
 from .output_policy import mode as output_mode, scratch_dir as resolve_scratch_dir
+from .skip_refold import (
+    SKIP_REFOLD_STEPS,
+    apply_skip_refold_ranking_policy,
+    remove_skip_refold_steps,
+    resolve_steps_arg,
+    steps_conflict_with_skip_refold,
+)
 from .state import collect_tool_versions, init_or_update_state, sha256_json
 from .steps import STEP_ORDER
 
@@ -447,6 +454,8 @@ def configure_pipeline(args) -> dict:
     data = apply_preset(data, args.preset)
     validate_input(data)
     normalized = normalize_input(data, base_dir=base_dir, output_dir=out_dir)
+    if getattr(args, "skip_refold", False):
+        apply_skip_refold_ranking_policy(normalized)
     if getattr(args, "output_mode", None):
         output_cfg = normalized.get("output")
         if not isinstance(output_cfg, dict):
@@ -492,7 +501,18 @@ def configure_pipeline(args) -> dict:
     ensure_dir(config_dir)
 
     steps_info = []
-    steps_to_write = list(STEP_ORDER)
+    try:
+        steps_arg = getattr(args, "steps", None)
+        steps_to_write = resolve_steps_arg(steps_arg, available_steps=STEP_ORDER)
+        if getattr(args, "skip_refold", False):
+            conflicts = steps_conflict_with_skip_refold(steps_arg)
+            if conflicts:
+                raise ConfigError(f"--skip-refold conflicts with --steps containing: {', '.join(conflicts)}")
+            steps_to_write = remove_skip_refold_steps(steps_to_write)
+            if not steps_to_write:
+                raise ConfigError(f"--skip-refold removed all steps (skipped: {', '.join(SKIP_REFOLD_STEPS)})")
+    except ValueError as exc:
+        raise ConfigError(str(exc)) from exc
     run_id = int((state.get("runs") or [{"run_id": 0}])[0].get("run_id", 0))
     for step_name in steps_to_write:
         cfg = _step_config(step_name, run_id, normalized)

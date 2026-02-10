@@ -348,34 +348,89 @@ class SeqDesignStep(ExternalCommandStep):
         pdbs: list[Path],
         fixed_positions_csv: str | Path,
         default_chain: str,
+        *,
+        chain_list: list[str] | None = None,
     ) -> Path | None:
+        # ProteinMPNN expects a dict keyed by structure name:
+        #   fixed_positions_dict[<name>][<chain>] -> [1-indexed positions]
+        # In protein_mpnn_run.py, the loader overwrites per line instead of updating,
+        # so we must write a single JSON object containing all structures.
         mapping = self._build_fixed_positions_map(fixed_positions_csv)
         if not mapping:
             return None
+        chains = [c.strip() for c in (chain_list or []) if c and str(c).strip()]
+        fixed_positions_dict: dict[str, dict[str, list[int]]] = {}
+        any_fixed = False
+        for pdb_path in pdbs:
+            entry = self._resolve_fixed_positions(pdb_path, mapping)
+            # Always include an entry for every structure in the batch directory to
+            # prevent ProteinMPNN KeyError on missing names.
+            by_chain: dict[str, list[int]] = {c: [] for c in chains} if chains else {}
+            if not entry:
+                fixed_positions_dict[pdb_path.stem] = by_chain
+                continue
+            fixed_positions = entry.get("fixed_positions")
+            if isinstance(fixed_positions, dict) and fixed_positions:
+                # Ensure JSON-serializable list[int] values.
+                for chain, idxs in fixed_positions.items():
+                    if not idxs:
+                        continue
+                    try:
+                        ch = str(chain).strip() or default_chain or "A"
+                        # Keep only configured chains if provided; this avoids surprising
+                        # chain keys that ProteinMPNN might not parse for this run.
+                        if chains and ch not in by_chain:
+                            continue
+                        by_chain[ch] = sorted({int(x) for x in idxs if int(x) > 0})
+                    except Exception:
+                        continue
+                fixed_positions_dict[pdb_path.stem] = by_chain
+                any_fixed = any_fixed or any(bool(v) for v in by_chain.values())
+            else:
+                indices = [int(x) for x in entry.get("indices") or []]
+                indices = [int(x) for x in indices if int(x) > 0]
+                chain = str(entry.get("chain") or default_chain or "A").strip() or "A"
+                if indices:
+                    if chains and chain not in by_chain:
+                        # If caller provided a chain_list and this index belongs to a different chain,
+                        # treat it as "no fixed positions" rather than creating an unexpected key.
+                        pass
+                    elif chains:
+                        by_chain[chain] = sorted({int(x) for x in indices})
+                    else:
+                        by_chain = {chain: sorted({int(x) for x in indices})}
+                    any_fixed = True
+                fixed_positions_dict[pdb_path.stem] = by_chain
+
+        if not fixed_positions_dict or not any_fixed:
+            return None
+        # Validate that indices are within ProteinMPNN's parsed chain lengths to prevent silently
+        # fixing the wrong residues (or crashing later).
+        if chains:
+            for pdb_path in pdbs:
+                lengths = self._mpnn_chain_lengths_from_pdb(pdb_path, chains)
+                by_chain = fixed_positions_dict.get(pdb_path.stem) or {}
+                for ch in chains:
+                    L = int(lengths.get(ch, 0) or 0)
+                    if L <= 0:
+                        raise StepError(f"Chain {ch} not found (or empty) in {pdb_path}")
+                    idxs = by_chain.get(ch) or []
+                    if not idxs:
+                        continue
+                    try:
+                        lo = int(min(idxs))
+                        hi = int(max(idxs))
+                    except Exception:
+                        raise StepError(f"Invalid fixed positions for {pdb_path.stem} chain {ch}: {idxs}")
+                    if lo < 1 or hi > L:
+                        raise StepError(
+                            f"Fixed positions out of range for {pdb_path.stem} chain {ch}: "
+                            f"min={lo}, max={hi}, chain_len={L}. "
+                            "These must be 1-indexed positions in ProteinMPNN's parsed chain sequence."
+                        )
         out_dir.mkdir(parents=True, exist_ok=True)
         jsonl_path = out_dir / "fixed_positions.jsonl"
-        count = 0
-        with jsonl_path.open("w") as handle:
-            for pdb_path in pdbs:
-                entry = self._resolve_fixed_positions(pdb_path, mapping)
-                if not entry:
-                    continue
-                fixed_positions = entry.get("fixed_positions")
-                if isinstance(fixed_positions, dict) and fixed_positions:
-                    payload = {"name": pdb_path.stem, "fixed_positions": fixed_positions}
-                else:
-                    indices = [int(x) for x in entry.get("indices") or []]
-                    if not indices:
-                        continue
-                    chain = str(entry.get("chain") or default_chain or "A")
-                    payload = {
-                        "name": pdb_path.stem,
-                        "fixed_positions": {chain: indices},
-                    }
-                handle.write(json.dumps(payload) + "\n")
-                count += 1
-        if count == 0:
-            return None
+        jsonl_path.write_text(json.dumps(fixed_positions_dict) + "\n")
         return jsonl_path
 
     def _write_fixed_positions_jsonl_item(
@@ -385,7 +440,10 @@ class SeqDesignStep(ExternalCommandStep):
         run_stem: str,
         fixed_positions_csv: str | Path,
         default_chain: str,
+        *,
+        chain_list: list[str] | None = None,
     ) -> Path | None:
+        # Same format notes as _write_fixed_positions_jsonl(): single JSON object keyed by name.
         mapping = self._build_fixed_positions_map(fixed_positions_csv)
         if not mapping:
             return None
@@ -393,21 +451,116 @@ class SeqDesignStep(ExternalCommandStep):
         if not entry:
             return None
         fixed_positions = entry.get("fixed_positions")
+        chains = [c.strip() for c in (chain_list or []) if c and str(c).strip()]
+        by_chain: dict[str, list[int]] = {c: [] for c in chains} if chains else {}
         if isinstance(fixed_positions, dict) and fixed_positions:
-            payload = {"name": run_stem, "fixed_positions": fixed_positions}
+            for chain, idxs in fixed_positions.items():
+                if not idxs:
+                    continue
+                try:
+                    ch = str(chain).strip() or default_chain or "A"
+                    if chains and ch not in by_chain:
+                        continue
+                    by_chain[ch] = sorted({int(x) for x in idxs if int(x) > 0})
+                except Exception:
+                    continue
         else:
             indices = [int(x) for x in entry.get("indices") or []]
+            indices = [int(x) for x in indices if int(x) > 0]
             if not indices:
                 return None
             chain = str(entry.get("chain") or default_chain or "A")
-            payload = {
-                "name": run_stem,
-                "fixed_positions": {chain: indices},
-            }
+            chain = chain.strip() or "A"
+            if chains:
+                if chain in by_chain:
+                    by_chain[chain] = sorted({int(x) for x in indices})
+            else:
+                by_chain = {chain: sorted({int(x) for x in indices})}
+        if not by_chain or not any(bool(v) for v in by_chain.values()):
+            return None
+        # Validate indices against ProteinMPNN's parsed chain lengths.
+        if chains:
+            lengths = self._mpnn_chain_lengths_from_pdb(pdb_path, chains)
+            for ch in chains:
+                L = int(lengths.get(ch, 0) or 0)
+                if L <= 0:
+                    raise StepError(f"Chain {ch} not found (or empty) in {pdb_path}")
+                idxs = by_chain.get(ch) or []
+                if not idxs:
+                    continue
+                lo = int(min(idxs))
+                hi = int(max(idxs))
+                if lo < 1 or hi > L:
+                    raise StepError(
+                        f"Fixed positions out of range for {run_stem} chain {ch}: "
+                        f"min={lo}, max={hi}, chain_len={L}. "
+                        "These must be 1-indexed positions in ProteinMPNN's parsed chain sequence."
+                    )
         out_dir.mkdir(parents=True, exist_ok=True)
         jsonl_path = out_dir / "fixed_positions.jsonl"
-        jsonl_path.write_text(json.dumps(payload) + "\n")
+        jsonl_path.write_text(json.dumps({run_stem: by_chain}) + "\n")
         return jsonl_path
+
+    def _mpnn_chain_lengths_from_pdb(self, pdb_path: Path, chains: list[str]) -> dict[str, int]:
+        """
+        Compute per-chain sequence lengths in the same indexing scheme as ProteinMPNN's
+        helper_scripts/parse_multiple_chains.py (including gaps and insertion codes).
+
+        This is the authoritative "position space" for --fixed_positions_jsonl.
+        """
+        chain_set = {c.strip() for c in chains if c and str(c).strip()}
+        if not chain_set:
+            return {}
+        resas_by_chain: dict[str, dict[int, set[str]]] = {c: {} for c in chain_set}
+        min_resn: dict[str, int] = {}
+        max_resn: dict[str, int] = {}
+        try:
+            lines = pdb_path.read_bytes().splitlines()
+        except Exception:
+            return {c: 0 for c in chain_set}
+        for raw in lines:
+            try:
+                line = raw.decode("utf-8", "ignore").rstrip()
+            except Exception:
+                continue
+            if line[:6] == "HETATM" and line[17:20] == "MSE":
+                line = line.replace("HETATM", "ATOM  ").replace("MSE", "MET")
+            if line[:4] != "ATOM":
+                continue
+            ch = line[21:22].strip()
+            if ch not in chain_set:
+                continue
+            resn_field = line[22:27].strip()
+            if not resn_field:
+                continue
+            if resn_field[-1].isalpha():
+                resa = resn_field[-1]
+                try:
+                    resn = int(resn_field[:-1]) - 1
+                except Exception:
+                    continue
+            else:
+                resa = ""
+                try:
+                    resn = int(resn_field) - 1
+                except Exception:
+                    continue
+            min_resn[ch] = resn if ch not in min_resn else min(min_resn[ch], resn)
+            max_resn[ch] = resn if ch not in max_resn else max(max_resn[ch], resn)
+            resas_by_chain.setdefault(ch, {}).setdefault(resn, set()).add(resa)
+        lengths: dict[str, int] = {}
+        for ch in chain_set:
+            if ch not in min_resn or ch not in max_resn:
+                lengths[ch] = 0
+                continue
+            pos = 0
+            for resn in range(min_resn[ch], max_resn[ch] + 1):
+                if resn in resas_by_chain.get(ch, {}):
+                    pos += len(sorted(resas_by_chain[ch][resn]))
+                else:
+                    pos += 1  # GAP in ProteinMPNN parsing
+            lengths[ch] = pos
+        return lengths
 
     def _fixed_positions_from_bfactor(
         self,
@@ -415,45 +568,100 @@ class SeqDesignStep(ExternalCommandStep):
         chains: list[str],
         threshold: float = 3.9,
     ) -> dict[str, list[int]]:
-        positions: dict[str, set[int]] = {}
+        """
+        Derive fixed positions from B-factors using ProteinMPNN's position indexing.
+
+        Important: ProteinMPNN does NOT interpret these indices as PDB resseq directly.
+        Indices are 1-indexed positions in the parsed chain sequence produced by
+        helper_scripts/parse_multiple_chains.py, which includes:
+        - gaps for missing residue numbers
+        - insertion codes (e.g. 27A, 27B) as additional positions within the same resn
+        """
         chain_set = {c.strip() for c in chains if c and str(c).strip()}
         if not chain_set:
             return {}
+
+        # Track max B-factor per (resn, insertion) in the same residue indexing scheme used by ProteinMPNN.
+        max_b: dict[str, dict[int, dict[str, float]]] = {c: {} for c in chain_set}
+        min_resn: dict[str, int] = {}
+        max_resn: dict[str, int] = {}
         try:
-            lines = pdb_path.read_text().splitlines()
+            lines = pdb_path.read_bytes().splitlines()
         except Exception:
-            return {}
-        for line in lines:
-            if not line.startswith(("ATOM", "HETATM")) or len(line) < 66:
+            return {c: [] for c in chain_set}
+        for raw in lines:
+            try:
+                line = raw.decode("utf-8", "ignore").rstrip()
+            except Exception:
                 continue
-            chain_id = line[21].strip()
-            if chain_id not in chain_set:
+            if line[:6] == "HETATM" and line[17:20] == "MSE":
+                line = line.replace("HETATM", "ATOM  ").replace("MSE", "MET")
+            if line[:4] != "ATOM":
                 continue
+            if len(line) < 66:
+                continue
+            ch = line[21:22].strip()
+            if ch not in chain_set:
+                continue
+            resn_field = line[22:27].strip()
+            if not resn_field:
+                continue
+            if resn_field[-1].isalpha():
+                resa = resn_field[-1]
+                try:
+                    resn = int(resn_field[:-1]) - 1
+                except Exception:
+                    continue
+            else:
+                resa = ""
+                try:
+                    resn = int(resn_field) - 1
+                except Exception:
+                    continue
             try:
                 b_factor = float(line[60:66])
             except Exception:
                 continue
-            if b_factor < threshold:
+            min_resn[ch] = resn if ch not in min_resn else min(min_resn[ch], resn)
+            max_resn[ch] = resn if ch not in max_resn else max(max_resn[ch], resn)
+            cur = max_b.setdefault(ch, {}).setdefault(resn, {}).get(resa)
+            if cur is None or b_factor > cur:
+                max_b[ch][resn][resa] = b_factor
+
+        out: dict[str, list[int]] = {}
+        for ch in chain_set:
+            if ch not in min_resn or ch not in max_resn:
+                out[ch] = []
                 continue
-            try:
-                resseq = int(line[22:26])
-            except Exception:
-                continue
-            positions.setdefault(chain_id, set()).add(resseq)
-        return {c: sorted(v) for c, v in positions.items() if v}
+            pos = 0
+            fixed: list[int] = []
+            for resn in range(min_resn[ch], max_resn[ch] + 1):
+                if resn in max_b.get(ch, {}):
+                    for resa in sorted(max_b[ch][resn].keys()):
+                        pos += 1
+                        if float(max_b[ch][resn][resa]) >= float(threshold):
+                            fixed.append(pos)
+                else:
+                    pos += 1  # GAP
+            out[ch] = fixed
+        return out
 
     def _write_fixed_positions_jsonl_from_mapping(
         self,
         out_dir: Path,
         run_stem: str,
         mapping: dict[str, list[int]],
+        *,
+        chain_list: list[str] | None = None,
     ) -> Path | None:
-        if not mapping:
+        chains = [c.strip() for c in (chain_list or []) if c and str(c).strip()]
+        if chains:
+            mapping = {c: sorted({int(x) for x in (mapping or {}).get(c, []) if int(x) > 0}) for c in chains}
+        if not mapping or not any(bool(v) for v in mapping.values()):
             return None
         out_dir.mkdir(parents=True, exist_ok=True)
-        payload = {"name": run_stem, "fixed_positions": mapping}
         jsonl_path = out_dir / "fixed_positions.jsonl"
-        jsonl_path.write_text(json.dumps(payload) + "\n")
+        jsonl_path.write_text(json.dumps({run_stem: mapping}) + "\n")
         return jsonl_path
 
     def _merge_fastas(self, vanilla_dir: Path, bias_dir: Path, out_dir: Path) -> None:
@@ -677,6 +885,7 @@ class SeqDesignStep(ExternalCommandStep):
         if num_seq <= 0:
             raise StepError("sequence_design.num_seq_per_backbone must be > 0")
         chain_list = self._default_chain_list(ctx)
+        chain_tokens = [c.strip() for c in str(chain_list).split(",") if c and str(c).strip()]
         protocol = ctx.input_data.get("protocol")
         omit_aas = seq_cfg.get("omit_aas") if protocol != "binder" else None
         use_soluble = bool(seq_cfg.get("use_soluble_ckpt"))
@@ -697,6 +906,7 @@ class SeqDesignStep(ExternalCommandStep):
                 run_stem,
                 fixed_positions_csv,
                 default_chain,
+                chain_list=chain_tokens,
             )
 
         def build_base_cmd(out_folder: Path, num_seq_target: int, temp: float, use_soluble_model: bool) -> list[str]:
@@ -735,10 +945,14 @@ class SeqDesignStep(ExternalCommandStep):
         if not run_stem:
             run_stem = pdb_path.stem
         if fixed_positions_jsonl is None and protocol in {"antibody", "vhh"} and step_name == "seq1":
-            chains = [c.strip() for c in str(chain_list).split(",") if c.strip()]
-            mapping = self._fixed_positions_from_bfactor(pdb_path, chains)
+            mapping = self._fixed_positions_from_bfactor(pdb_path, chain_tokens)
+            if not any(bool(v) for v in (mapping or {}).values()):
+                raise StepError(
+                    f"No framework fixed positions detected for antibody/VHH seq1 in {pdb_path}. "
+                    "Expected PPIFlow-generated backbones with mask-encoded B-factors (framework residues ~4.0)."
+                )
             fixed_positions_jsonl = self._write_fixed_positions_jsonl_from_mapping(
-                item_tmp, run_stem, mapping
+                item_tmp, run_stem, mapping, chain_list=chain_tokens
             )
         # Materialize legacy pdbs/ for downstream flowpacker (seq2).
         pdbs_dir = out_dir / "pdbs"
@@ -855,6 +1069,7 @@ class SeqDesignStep(ExternalCommandStep):
             raise StepError("sequence_design.num_seq_per_backbone must be > 0")
         chain_list = self._default_chain_list(ctx)
         chain_arg = " ".join(str(chain_list).replace(",", " ").split())
+        chain_tokens = [c.strip() for c in str(chain_list).split(",") if c and str(c).strip()]
         protocol = ctx.input_data.get("protocol")
         omit_aas = seq_cfg.get("omit_aas") if protocol != "binder" else None
         use_soluble = bool(seq_cfg.get("use_soluble_ckpt"))
@@ -919,18 +1134,28 @@ class SeqDesignStep(ExternalCommandStep):
                 staged_pdbs,
                 str(fixed_positions_csv),
                 default_chain,
+                chain_list=chain_tokens,
             )
         if fixed_positions_jsonl is None and protocol in {"antibody", "vhh"} and step_name == "seq1":
-            lines = []
-            chains = [c.strip() for c in str(chain_list).split(",") if c.strip()]
+            # ProteinMPNN's loader for --fixed_positions_jsonl overwrites instead of updating per line,
+            # so write a single JSON object keyed by structure name.
+            fixed_positions_dict: dict[str, dict[str, list[int]]] = {}
+            any_fixed = False
             for pdb_path in staged_pdbs:
-                mapping = self._fixed_positions_from_bfactor(pdb_path, chains)
-                if not mapping:
-                    continue
-                lines.append(json.dumps({"name": pdb_path.stem, "fixed_positions": mapping}))
-            if lines:
+                raw = self._fixed_positions_from_bfactor(pdb_path, chain_tokens)
+                mapping = {c: sorted((raw or {}).get(c, []) or []) for c in chain_tokens}
+                any_fixed = any_fixed or any(bool(v) for v in mapping.values())
+                fixed_positions_dict[pdb_path.stem] = mapping
+            # Antibody/VHH seq1 relies on PPIFlow-authored mask-encoded B-factors to freeze framework
+            # residues. If nothing is fixed, that's an error (we don't want to silently design everything).
+            if fixed_positions_dict and any_fixed:
                 fixed_positions_jsonl = batch_dir / "fixed_positions.jsonl"
-                fixed_positions_jsonl.write_text("\n".join(lines) + "\n")
+                fixed_positions_jsonl.write_text(json.dumps(fixed_positions_dict) + "\n")
+            else:
+                raise StepError(
+                    "No framework fixed positions detected for antibody/VHH seq1 batch. "
+                    "Expected PPIFlow-generated backbones with mask-encoded B-factors (framework residues ~4.0)."
+                )
 
         def build_base_cmd(out_folder: Path, num_seq_target: int, temp: float, use_soluble_model: bool) -> list[str]:
             cmd = [
@@ -1099,6 +1324,7 @@ class SeqDesignStep(ExternalCommandStep):
         if num_seq <= 0:
             raise StepError("sequence_design.num_seq_per_backbone must be > 0")
         chain_list = self._default_chain_list(ctx)
+        chain_tokens = [c.strip() for c in str(chain_list).split(",") if c and str(c).strip()]
         position_list = self.cfg.get("fixed_positions_csv")
         protocol = ctx.input_data.get("protocol")
         omit_aas = seq_cfg.get("omit_aas") if protocol != "binder" else None
@@ -1161,20 +1387,26 @@ class SeqDesignStep(ExternalCommandStep):
                 pdbs,
                 position_list,
                 str(chain_list).split(",")[0].strip() or "A",
+                chain_list=chain_tokens,
             )
             if not fixed_positions_jsonl:
                 print("Warning: fixed_positions_csv provided but could not generate fixed_positions_jsonl; skipping anchors.")
         if fixed_positions_jsonl is None and protocol in {"antibody", "vhh"} and step_label == "seq1":
-            lines = []
-            chains = [c.strip() for c in str(chain_list).split(",") if c.strip()]
+            fixed_positions_dict: dict[str, dict[str, list[int]]] = {}
+            any_fixed = False
             for pdb_path in pdbs:
-                mapping = self._fixed_positions_from_bfactor(pdb_path, chains)
-                if not mapping:
-                    continue
-                lines.append(json.dumps({"name": pdb_path.stem, "fixed_positions": mapping}))
-            if lines:
+                raw = self._fixed_positions_from_bfactor(pdb_path, chain_tokens)
+                mapping = {c: sorted((raw or {}).get(c, []) or []) for c in chain_tokens}
+                any_fixed = any_fixed or any(bool(v) for v in mapping.values())
+                fixed_positions_dict[pdb_path.stem] = mapping
+            if fixed_positions_dict and any_fixed:
                 fixed_positions_jsonl = out_dir / "fixed_positions.jsonl"
-                fixed_positions_jsonl.write_text("\n".join(lines) + "\n")
+                fixed_positions_jsonl.write_text(json.dumps(fixed_positions_dict) + "\n")
+            else:
+                raise StepError(
+                    "No framework fixed positions detected for antibody/VHH seq1. "
+                    "Expected PPIFlow-generated backbones with mask-encoded B-factors (framework residues ~4.0)."
+                )
 
         env = os.environ.copy()
 
@@ -1484,12 +1716,12 @@ class FlowPackerStep(ExternalCommandStep):
         items: list[WorkItem] = []
         for pdb_path in pdbs:
             run_stem = run_stems[pdb_path]
-            fasta_path = self._find_fasta(seq_fasta_dir, run_stem)
+            fasta_path = self._find_fasta(seq_fasta_dir, run_stem) if seq_fasta_dir else None
             if fasta_path is None and run_stem == pdb_path.stem:
                 # Only fall back to pdb_path.stem when there was no de-dup renaming.
                 # If run_stem != pdb_path.stem, using the fallback can silently attach
                 # an ambiguous FASTA to multiple distinct PDBs.
-                fasta_path = self._find_fasta(seq_fasta_dir, pdb_path.stem)
+                fasta_path = self._find_fasta(seq_fasta_dir, pdb_path.stem) if seq_fasta_dir else None
             items.append(
                 WorkItem(
                     id=run_stem,
@@ -1529,11 +1761,12 @@ class FlowPackerStep(ExternalCommandStep):
             raise FileNotFoundError(f"PDB not found: {pdb_path}")
 
         fasta_path = (item.payload or {}).get("fasta_path")
-        if not fasta_path:
+        if fasta_path:
+            fasta_path = Path(str(fasta_path))
+            if not fasta_path.exists():
+                raise FileNotFoundError(f"Fasta not found: {fasta_path}")
+        else:
             raise FileNotFoundError(f"Missing fasta for {pdb_path.stem}")
-        fasta_path = Path(str(fasta_path))
-        if not fasta_path.exists():
-            raise FileNotFoundError(f"Fasta not found: {fasta_path}")
 
         binder_chain = str(cfg.get("binder_chain") or (ctx.input_data.get("binder_chain") or "A"))
         link_suffix = str(cfg.get("link_suffix") or ".pdb")

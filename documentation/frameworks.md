@@ -10,6 +10,16 @@ Note on paths in YAML: framework PDB paths are resolved relative to the YAML fil
 
 Chain ID note: `--heavy_chain` / `--light_chain` should match the chain IDs in the framework PDB file you provide (many scFv frameworks use `A/B`). During `configure`, PPIFlow rewrites framework chains to the pipeline's internal conventions (heavy `A`, light `C`).
 
+## Mask-Encoded B-Factors (Important For `seq1`)
+
+For antibody/VHH pipelines, PPIFlow-generated backbone PDBs are *mask-encoded*: the PDB B-factor column is repurposed to store discrete region masks (not experimental B-factors from crystallography).
+
+Downstream steps use these masks, for example:
+- `seq1` (AbMPNN) freezes framework residues by fixing positions where B-factor is approximately `4.0`.
+- Metrics utilities treat B-factor `2.0` as CDR residues and B-factor `1.0` as antigen hotspots.
+
+This is why `seq1` expects to consume PPIFlow-generated backbones (from `gen`/`partial`), not arbitrary external PDBs.
+
 ## VHH (Nanobody) Frameworks (Single Chain `A`)
 
 - 5JDS nanobody

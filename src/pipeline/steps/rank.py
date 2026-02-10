@@ -98,15 +98,22 @@ class RankStep(Step):
                 return False
         return True
 
-    def _find_metrics_csv(self, run_dir: Path) -> Path | None:
-        for rel in [
-            "af3_refold/metrics_ppiflow.csv",
-            "af3_refold/metrics.csv",
-            "af3score_round2/metrics_ppiflow.csv",
-            "af3score_round1/metrics_ppiflow.csv",
-            "af3score_round2/metrics.csv",
-            "af3score_round1/metrics.csv",
-        ]:
+    def _find_metrics_csv(self, run_dir: Path, *, metrics_source: str = "auto") -> Path | None:
+        metrics_source = str(metrics_source or "auto").strip().lower()
+        if metrics_source == "refold":
+            rels = ["af3_refold/metrics_ppiflow.csv", "af3_refold/metrics.csv"]
+        elif metrics_source == "af3score2":
+            rels = ["af3score_round2/metrics_ppiflow.csv", "af3score_round2/metrics.csv"]
+        else:
+            rels = [
+                "af3_refold/metrics_ppiflow.csv",
+                "af3_refold/metrics.csv",
+                "af3score_round2/metrics_ppiflow.csv",
+                "af3score_round1/metrics_ppiflow.csv",
+                "af3score_round2/metrics.csv",
+                "af3score_round1/metrics.csv",
+            ]
+        for rel in rels:
             p = run_dir / rel
             if p.exists():
                 return p
@@ -287,22 +294,55 @@ class RankStep(Step):
                 mapping[name] = score
         return mapping
 
-    def _collect_structures(self, run_dir: Path, name: str) -> tuple[dict[int, Path], dict[str, Path]]:
-        # Priority: refold -> relax -> partial_flow -> backbones
+    def _collect_structures(
+        self,
+        run_dir: Path,
+        name: str,
+        *,
+        structure_source: str = "auto",
+    ) -> tuple[dict[int, Path], dict[str, Path]]:
+        structure_source = str(structure_source or "auto").strip().lower()
+        # Priority in auto mode: refold -> relax -> partial_flow -> backbones
         mapping_by_id: dict[int, Path] = {}
         mapping_by_name: dict[str, Path] = {}
-        for rel, pattern in [
-            ("af3_refold/pdbs", "*.pdb"),
-            ("relax", "*.pdb"),
-            ("partial_flow", "**/*.pdb"),
-            ("backbones", f"{name}_*.pdb"),
-        ]:
+        if structure_source == "refold":
+            candidates = [
+                ("af3_refold/pdbs", "*.pdb"),
+                ("af3_refold/filtered_pdbs", "*.pdb"),
+            ]
+        elif structure_source == "af3score2":
+            # Prefer AF3Score R2 predicted structures. In minimal mode, cif/ is the robust source.
+            candidates = [
+                ("af3score_round2/cif", "*.cif"),
+                ("af3score_round2/pdbs", "*.pdb"),
+                ("af3score_round2/filtered_pdbs", "*.pdb"),
+                # Fallbacks (avoid hard failure if a few models are missing in af3score2 outputs).
+                ("relax", "*.pdb"),
+                ("partial_flow", "**/*.pdb"),
+                ("backbones", f"{name}_*.pdb"),
+            ]
+        elif structure_source == "relax":
+            candidates = [
+                ("relax", "*.pdb"),
+                ("partial_flow", "**/*.pdb"),
+                ("backbones", f"{name}_*.pdb"),
+            ]
+        else:
+            candidates = [
+                ("af3_refold/pdbs", "*.pdb"),
+                ("relax", "*.pdb"),
+                ("partial_flow", "**/*.pdb"),
+                ("backbones", f"{name}_*.pdb"),
+            ]
+        for rel, pattern in candidates:
             root = run_dir / rel
             if not root.exists():
                 continue
             for fp in root.glob(pattern):
                 stem = fp.stem
-                mapping_by_name.setdefault(stem, fp)
+                # Store a case-insensitive index: real-world AF3Score can differ in case between
+                # metrics.csv descriptions and on-disk CIF/PDB filenames (e.g. "_b_" vs "_B_").
+                mapping_by_name.setdefault(stem.lower(), fp)
                 if stem.startswith(f"{name}_"):
                     suffix = stem.split("_", 1)[1]
                     if suffix.isdigit():
@@ -315,11 +355,65 @@ class RankStep(Step):
                         mapping_by_id.setdefault(int(parts[0]), fp)
         return mapping_by_id, mapping_by_name
 
+    def _structure_key_candidates(self, raw: Any) -> list[str]:
+        """
+        Produce a small set of normalized candidates to match metric "design_id"/"description"
+        fields to on-disk artifact stems.
+
+        This must be robust to:
+        - case mismatches
+        - pathy strings ("/root/.../foo.pdb")
+        - trailing extensions (".pdb"/".cif")
+        """
+        if raw is None:
+            return []
+        try:
+            text = str(raw).strip()
+        except Exception:
+            return []
+        if not text or text.lower() in {"nan", "none", "null"}:
+            return []
+
+        out: list[str] = []
+
+        def _add(val: str) -> None:
+            val = str(val or "").strip()
+            if not val:
+                return
+            out.append(val.lower())
+
+        _add(text)
+
+        # If this looks like a path, prefer the basename.
+        try:
+            base = Path(text).name
+        except Exception:
+            base = text
+        _add(base)
+
+        # Strip common structure extensions.
+        for candidate in list(out):
+            if candidate.endswith(".pdb") or candidate.endswith(".cif"):
+                _add(Path(candidate).stem)
+
+        # De-dup while preserving order.
+        dedup: list[str] = []
+        seen: set[str] = set()
+        for c in out:
+            if c in seen:
+                continue
+            seen.add(c)
+            dedup.append(c)
+        return dedup
+
     def _compute_rows(self, ctx: StepContext) -> tuple[list[dict[str, Any]], bool]:
         out_dir = ctx.out_dir
         run_dir = out_dir / "output"
         name = ctx.input_data.get("name", "design")
-        metrics_path = self._find_metrics_csv(run_dir)
+        ranking_cfg = ctx.input_data.get("ranking") or {}
+        metrics_source = str(ranking_cfg.get("metrics_source") or "auto")
+        structure_source = str(ranking_cfg.get("structure_source") or "auto")
+        metrics_path = self._find_metrics_csv(run_dir, metrics_source=metrics_source)
 
         rows: list[dict[str, Any]] = []
         interface_scores = self._load_interface_scores(run_dir)
@@ -327,7 +421,12 @@ class RankStep(Step):
         if protocol == "binder":
             interface_scores = self._augment_binder_interface_scores(run_dir, interface_scores)
         dockq_scores = self._load_dockq_scores(run_dir)
-        using_refold = bool(metrics_path and "af3_refold" in str(metrics_path))
+        dockq_dir_exists = (run_dir / "dockq").exists()
+        metrics_source_l = str(metrics_source or "auto").strip().lower()
+        using_refold = bool(
+            metrics_source_l == "refold"
+            or (metrics_source_l == "auto" and metrics_path and "af3_refold" in str(metrics_path))
+        )
 
         if metrics_path and metrics_path.exists():
             try:
@@ -358,17 +457,21 @@ class RankStep(Step):
                         "ptm": ptm_val,
                         "dockq": dockq_val,
                         "interface_score": self._lookup_interface_score(str(design_name), interface_scores),
+                        # Prefer sequences emitted by AF3Score-derived metrics when present.
+                        "binder_seq": row.get("binder_seq") if "binder_seq" in row else None,
+                        "ab_heavy_seq": row.get("ab_heavy_seq") if "ab_heavy_seq" in row else None,
+                        "ab_light_seq": row.get("ab_light_seq") if "ab_light_seq" in row else None,
                     })
             except Exception:
                 rows = []
 
         if not rows:
             # Fallback to file listing
-            mapping_by_id, _ = self._collect_structures(run_dir, name)
+            mapping_by_id, _ = self._collect_structures(run_dir, name, structure_source=structure_source)
             for design_id in sorted(mapping_by_id.keys()):
                 rows.append({"design_id": design_id, "score": None, "interface_score": None})
 
-        mapping_by_id, mapping_by_name = self._collect_structures(run_dir, name)
+        mapping_by_id, mapping_by_name = self._collect_structures(run_dir, name, structure_source=structure_source)
         for r in rows:
             did = r.get("design_id")
             if did is None or (isinstance(did, float) and str(did) == "nan"):
@@ -378,11 +481,20 @@ class RankStep(Step):
             except Exception:
                 did_int = None
             if did_int is not None and did_int in mapping_by_id:
-                r["source_path"] = str(mapping_by_id[did_int])
+                chosen = mapping_by_id[did_int]
+                r["source_path"] = str(chosen)
+                if chosen.suffix.lower() == ".cif":
+                    r["source_cif_path"] = str(chosen)
             else:
-                key = str(did)
-                if key in mapping_by_name:
-                    r["source_path"] = str(mapping_by_name[key])
+                matched = None
+                for cand in self._structure_key_candidates(did):
+                    if cand in mapping_by_name:
+                        matched = mapping_by_name[cand]
+                        break
+                if matched is not None:
+                    r["source_path"] = str(matched)
+                    if matched.suffix.lower() == ".cif":
+                        r["source_cif_path"] = str(matched)
 
         filters = ctx.input_data.get("filters") or {}
         if using_refold:
@@ -395,6 +507,11 @@ class RankStep(Step):
             iptm_min = r2.get("iptm_min")
             ptm_min = r2.get("ptm_min")
             dockq_min = (filters.get("dockq") or {}).get("min")
+            if dockq_min is not None and not dockq_dir_exists:
+                # DockQ wasn't run; treat the filter as disabled (more intuitive than "everything failed").
+                dockq_min = None
+        if using_refold and dockq_min is not None and not dockq_dir_exists:
+            dockq_min = None
 
         for r in rows:
             passed = True
@@ -431,6 +548,8 @@ class RankStep(Step):
         structures_dir = results_dir / "structures"
         top_dir = structures_dir / "top"
         ensure_dir(top_dir)
+        cache_dir = structures_dir / "cache"
+        ensure_dir(cache_dir)
         rows: list[dict[str, Any]] = []
         features_dir = self.cfg.get("features_dir")
         if features_dir:
@@ -465,7 +584,18 @@ class RankStep(Step):
         light_chain = str(framework.get("light_chain") or "").strip()
         seq_cache: dict[str, dict[str, str]] = {}
 
-        def _resolve_pdb_path(raw: str | None) -> Path | None:
+        def _safe_seq(val: Any) -> str | None:
+            if val is None:
+                return None
+            try:
+                text = str(val).strip()
+            except Exception:
+                return None
+            if not text or text.lower() in {"nan", "none", "null"}:
+                return None
+            return text
+
+        def _resolve_source_path(raw: str | None) -> Path | None:
             if not raw:
                 return None
             p = Path(str(raw))
@@ -482,13 +612,50 @@ class RankStep(Step):
             for cand in [
                 ctx.out_dir / "output" / "af3_refold" / "pdbs" / name,
                 ctx.out_dir / "output" / "af3_refold" / "filtered_pdbs" / name,
+                ctx.out_dir / "output" / "af3score_round2" / "cif" / name,
+                ctx.out_dir / "output" / "af3score_round2" / "pdbs" / name,
+                ctx.out_dir / "output" / "af3score_round2" / "filtered_pdbs" / name,
+                ctx.out_dir / "output" / "relax" / name,
             ]:
                 if cand.exists():
                     return cand
             return None
 
-        def _seqs_for(raw_path: str | None) -> dict[str, str]:
-            path = _resolve_pdb_path(raw_path)
+        def _convert_cif_to_pdb(cif_path: Path, pdb_path: Path) -> bool:
+            try:
+                from Bio.PDB import MMCIFParser, PDBIO
+            except Exception:
+                return False
+            try:
+                parser = MMCIFParser(QUIET=True)
+                structure = parser.get_structure("model", str(cif_path))
+                io = PDBIO()
+                io.set_structure(structure)
+                io.save(str(pdb_path))
+                return True
+            except Exception:
+                return False
+
+        def _ensure_row_pdb(row: dict[str, Any]) -> Path | None:
+            raw = row.get("source_path")
+            path = _resolve_source_path(str(raw) if raw is not None else None)
+            if path is None:
+                return None
+            if path.suffix.lower() == ".pdb":
+                return path
+            if path.suffix.lower() != ".cif":
+                return None
+            stem = path.stem
+            out_pdb = cache_dir / f"{stem}.pdb"
+            if not out_pdb.exists():
+                if not _convert_cif_to_pdb(path, out_pdb):
+                    return None
+            row["source_path"] = str(out_pdb)
+            row.setdefault("source_cif_path", str(path))
+            return out_pdb
+
+        def _seqs_for(row: dict[str, Any]) -> dict[str, str]:
+            path = _ensure_row_pdb(row)
             if path is None:
                 return {}
             key = str(path)
@@ -524,15 +691,32 @@ class RankStep(Step):
             )
             writer.writeheader()
             for r in rows:
-                seqs = _seqs_for(r.get("source_path"))
-                binder_seq = None
-                ab_heavy_seq = None
-                ab_light_seq = None
+                # Contract: summary.csv's source_path should be a PDB for downstream consistency.
+                # If the canonical structure source is CIF (e.g. AF3Score2 in minimal mode),
+                # materialize a cached PDB path deterministically under results*/structures/cache/.
+                src_raw = r.get("source_path")
+                if src_raw and str(src_raw).lower().endswith(".cif"):
+                    converted = _ensure_row_pdb(r)
+                    if converted is None:
+                        raise StepError(f"Failed to convert CIF to PDB for summary source_path: {src_raw}")
+
+                # Prefer sequences already present in AF3Score-derived metrics (avoid CIF->PDB
+                # conversion for every row). Fall back to parsing a structure only if needed.
+                binder_seq = _safe_seq(r.get("binder_seq"))
+                ab_heavy_seq = _safe_seq(r.get("ab_heavy_seq"))
+                ab_light_seq = _safe_seq(r.get("ab_light_seq"))
+                need_parse = False
                 if is_antibody:
-                    ab_heavy_seq = seqs.get(heavy_chain) if heavy_chain else None
-                    ab_light_seq = seqs.get(light_chain) if light_chain else None
+                    need_parse = (ab_heavy_seq is None and heavy_chain) or (ab_light_seq is None and light_chain)
                 else:
-                    binder_seq = seqs.get(binder_chain) if binder_chain else None
+                    need_parse = binder_seq is None and binder_chain
+                if need_parse:
+                    seqs = _seqs_for(r)
+                    if is_antibody:
+                        ab_heavy_seq = ab_heavy_seq if ab_heavy_seq is not None else (seqs.get(heavy_chain) if heavy_chain else None)
+                        ab_light_seq = ab_light_seq if ab_light_seq is not None else (seqs.get(light_chain) if light_chain else None)
+                    else:
+                        binder_seq = binder_seq if binder_seq is not None else (seqs.get(binder_chain) if binder_chain else None)
                 writer.writerow({
                     "design_id": r.get("design_id"),
                     "score": r.get("score"),
@@ -559,7 +743,7 @@ class RankStep(Step):
             src = r.get("source_path")
             if not src:
                 continue
-            src_path = _resolve_pdb_path(str(src))
+            src_path = _ensure_row_pdb(r)
             if src_path is None:
                 continue
             dst = top_dir / src_path.name

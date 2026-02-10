@@ -23,6 +23,13 @@ This page is the reference for what each step does, where outputs go, and which 
 | `rank_features` | Collect ranking features |
 | `rank_finalize` | Produce ranked results |
 
+## Skipping Refold (Stopgap)
+
+When running without a refold policy/installation, you can use `--skip-refold` (aka `--skip-af3-refold`) to:
+
+- omit `af3_refold` and `dockq` from the configured/executed step set
+- force ranking to use AF3Score R2 metrics + AF3Score R2 predicted structures (so scores and exported structures are consistent)
+
 ## Step Outputs
 
 Most step outputs live under `output/`. Ranking outputs live under `results/`.
@@ -67,4 +74,3 @@ Each step config may contain a `command` field (string or list) executed as a su
 - You provide `target.chains` and optional `target.hotspots` using the chain IDs and residue numbering of your original input PDB.
 - During `configure`, if multiple target chains are provided, they are concatenated into a single gapped internal target chain `B`.
 - Hotspots are expanded on the original target PDB, then mapped into the internal concatenated chain `B`. Mapping artifacts are written under `inputs/`.
-

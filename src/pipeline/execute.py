@@ -18,6 +18,12 @@ from .steps.base import StepContext, StepError
 from .output_policy import mode as output_mode
 from . import prune as prune_outputs
 from .run_lock import RunLock, RunLockError, ensure_expected_lock_id, run_lock_disabled, validate_expected_lock_id
+from .skip_refold import (
+    SKIP_REFOLD_STEPS,
+    apply_skip_refold_ranking_policy,
+    remove_skip_refold_steps,
+    steps_conflict_with_skip_refold,
+)
 from .work_queue import reset_all_claims_and_leaders
 
 
@@ -172,6 +178,18 @@ def execute_pipeline(args) -> None:
     from .io import read_json
 
     input_data = read_json(input_json)
+    if getattr(args, "skip_refold", False):
+        apply_skip_refold_ranking_policy(input_data)
+        conflicts = steps_conflict_with_skip_refold(getattr(args, "steps", None))
+        if conflicts:
+            raise StepError(f"--skip-refold conflicts with --steps containing: {', '.join(conflicts)}")
+        raw_steps = getattr(args, "steps", None)
+        raw_steps = "all" if raw_steps is None else str(raw_steps).strip()
+        if not raw_steps or raw_steps.lower() == "all":
+            effective = remove_skip_refold_steps(list(STEP_ORDER))
+            if not effective:
+                raise StepError(f"--skip-refold removed all steps (skipped: {', '.join(SKIP_REFOLD_STEPS)})")
+            args.steps = ",".join(effective)
 
     rank = int(os.environ.get("RANK", "0"))
     world_size = int(os.environ.get("WORLD_SIZE", "1"))

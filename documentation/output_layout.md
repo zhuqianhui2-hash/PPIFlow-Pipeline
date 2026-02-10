@@ -27,6 +27,8 @@ Minimal mode keeps only artifacts needed for resume and ranking. AF3 CIFs are al
 - `output/af3score_round*/cif/`
 - `output/af3_refold/cif/`
 
+In `--skip-refold` mode, ranking derives final structures from `output/af3score_round2/cif/` and materializes PDBs under `results*/structures/cache/` for downstream consumers that expect PDBs.
+
 ## Optional Files
 
 When output mode is `full`, or when step configs enable optional retention, additional intermediates can be preserved under `output/_optional/`.

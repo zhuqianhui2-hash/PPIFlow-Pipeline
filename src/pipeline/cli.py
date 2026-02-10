@@ -7,6 +7,8 @@ from pathlib import Path
 from .configure import configure_pipeline
 from .execute import execute_pipeline
 from .orchestrate import orchestrate_pipeline
+from .skip_refold import remove_skip_refold_steps, steps_conflict_with_skip_refold
+from .steps import STEP_ORDER
 from .wizard import run_wizard
 
 
@@ -27,6 +29,13 @@ def _add_common_args(parser: argparse.ArgumentParser) -> None:
         type=str,
         default="all",
         help="Step names (all or comma-separated step list)",
+    )
+    parser.add_argument(
+        "--skip-refold",
+        "--skip-af3-refold",
+        dest="skip_refold",
+        action="store_true",
+        help="Skip AF3 refold + DockQ and force ranking to use AF3Score R2 metrics/structures.",
     )
     parser.add_argument("--reuse", action="store_true", help="Reuse existing outputs")
     parser.add_argument(
@@ -201,6 +210,13 @@ def build_parser() -> argparse.ArgumentParser:
     p_execute = sub.add_parser("execute", help="Execute from steps.yaml")
     p_execute.add_argument("--output", type=str, required=True)
     p_execute.add_argument("--steps", type=str, default="all")
+    p_execute.add_argument(
+        "--skip-refold",
+        "--skip-af3-refold",
+        dest="skip_refold",
+        action="store_true",
+        help="Skip AF3 refold + DockQ and force ranking to use AF3Score R2 metrics/structures.",
+    )
     p_execute.add_argument("--reuse", action="store_true")
     p_execute.add_argument("--continue-on-error", action="store_true")
     p_execute.add_argument("--verbose", action="store_true")
@@ -218,6 +234,13 @@ def build_parser() -> argparse.ArgumentParser:
     p_rank = sub.add_parser("rank", help="Run rank step only")
     p_rank.add_argument("--output", type=str, required=True)
     p_rank.add_argument("--reuse", action="store_true")
+    p_rank.add_argument(
+        "--skip-refold",
+        "--skip-af3-refold",
+        dest="skip_refold",
+        action="store_true",
+        help="Force ranking to use AF3Score R2 metrics/structures (ignore refold artifacts).",
+    )
     p_rank.add_argument("--continue-on-error", action="store_true")
     p_rank.add_argument("--verbose", action="store_true")
     _add_work_queue_args(p_rank)
@@ -236,6 +259,13 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_orch.add_argument("--configure", action="store_true", help="Run configure if steps.yaml is missing")
     p_orch.add_argument("--steps", type=str, default="all", help="Step names (all or comma-separated step list)")
+    p_orch.add_argument(
+        "--skip-refold",
+        "--skip-af3-refold",
+        dest="skip_refold",
+        action="store_true",
+        help="Skip AF3 refold + DockQ and force ranking to use AF3Score R2 metrics/structures.",
+    )
     p_orch.add_argument("--pool-size", type=int, default=None, help="Override pool size (advanced)")
     p_orch.add_argument("--num-devices", type=str, default=None, help="Number of GPUs/workers (e.g. 4 or 'all')")
     _add_orchestrator_pool_args(p_orch)
@@ -262,9 +292,29 @@ def _single_process_conflicts(args) -> bool:
     )
 
 
+def _apply_skip_refold_args(args) -> None:
+    """
+    Enforce --skip-refold semantics consistently across configure/execute/orchestrate.
+    """
+    if not getattr(args, "skip_refold", False):
+        return
+
+    conflicts = steps_conflict_with_skip_refold(getattr(args, "steps", None))
+    if conflicts:
+        raise SystemExit(f"--skip-refold conflicts with --steps containing: {', '.join(conflicts)}")
+
+    raw_steps = getattr(args, "steps", None)
+    raw_steps = "all" if raw_steps is None else str(raw_steps).strip()
+    if not raw_steps or raw_steps.lower() == "all":
+        effective = remove_skip_refold_steps(list(STEP_ORDER))
+        args.steps = ",".join(effective)
+
+
 def main(argv: list[str] | None = None) -> None:
     parser = build_parser()
     args = parser.parse_args(argv)
+
+    _apply_skip_refold_args(args)
 
     # Defense-in-depth: orchestrator-spawned worker processes must never re-enter orchestration.
     # The orchestrator sets PPIFLOW_ORCH_WORKER=1 in the worker env; workers must use --single-process.

@@ -13,6 +13,13 @@ from typing import Any, Dict, Iterable, List, Optional
 from .configure import configure_pipeline
 from .io import ensure_dir, read_json, read_yaml, repo_root, write_json
 from .run_lock import RunLock, RunLockError, run_lock_disabled
+from .skip_refold import (
+    SKIP_REFOLD_STEPS,
+    apply_skip_refold_ranking_policy,
+    remove_skip_refold_steps,
+    steps_conflict_with_skip_refold,
+)
+from .steps import STEP_ORDER
 from .steps import STEP_REGISTRY
 from .steps.base import StepContext
 from .work_queue import WaitResult, reset_all_claims_and_leaders, wait_for_step, WorkQueue
@@ -699,6 +706,18 @@ def orchestrate_pipeline(args) -> None:
                 raise OrchestratorError(f"{missing} missing; run configure first or pass --configure")
 
         input_data = read_json(input_json)
+        if getattr(args, "skip_refold", False):
+            apply_skip_refold_ranking_policy(input_data)
+            conflicts = steps_conflict_with_skip_refold(getattr(args, "steps", None))
+            if conflicts:
+                raise OrchestratorError(f"--skip-refold conflicts with --steps containing: {', '.join(conflicts)}")
+            raw_steps = getattr(args, "steps", None)
+            raw_steps = "all" if raw_steps is None else str(raw_steps).strip()
+            if not raw_steps or raw_steps.lower() == "all":
+                effective = remove_skip_refold_steps(list(STEP_ORDER))
+                if not effective:
+                    raise OrchestratorError(f"--skip-refold removed all steps (skipped: {', '.join(SKIP_REFOLD_STEPS)})")
+                args.steps = ",".join(effective)
         orch_cfg = dict(input_data.get("orchestrator") or {})
         if orch_cfg.get("groups"):
             raise OrchestratorError("orchestrator groups are not supported; use per-step pools only")

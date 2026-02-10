@@ -24,6 +24,7 @@ python ppiflow.py <command> --help
 - `--input`: YAML input (`design.yaml`)
 - `--protocol`: `binder`, `vhh`, `antibody` (CLI-only mode)
 - `--steps`: `all` or comma-separated step list
+- `--skip-refold`: skip `af3_refold` + `dockq` and force ranking to use AF3Score R2 metrics/structures (also accepts `--skip-af3-refold`)
 - `--output-mode`: `minimal` or `full`
 - `--num-devices`: multi-GPU parallelism (`all`, or an integer)
 - `--devices`: bind to specific GPUs (`0,2,3`) (implies `--num-devices 3`)
