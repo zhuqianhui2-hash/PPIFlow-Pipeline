@@ -8,6 +8,7 @@ import re
 import shlex
 import shutil
 import subprocess
+import socket
 import threading
 import time
 import sys
@@ -23,6 +24,7 @@ from ..logging_utils import log_command_progress, run_command
 from ..manifests import build_name_map, extract_design_id, find_metrics_file, structure_id_from_name, write_csv
 from ..output_policy import is_minimal, mode as output_mode, optional_dir, should_keep, step_scratch_dir
 from ..pdb_sequences import chain_sequences_from_pdb
+from ..metrics_ledger import MetricsLedger
 from ..work_queue import WorkItem
 
 
@@ -2168,9 +2170,12 @@ class AF3ScoreStep(ExternalCommandStep):
 
     def item_done(self, ctx: StepContext, item: WorkItem) -> bool:
         out_dir = self.output_dir(ctx)
-        metrics_path = out_dir / "metrics_items" / f"{item.id}.csv"
         cif_path = out_dir / "cif" / f"{item.id}.cif"
-        return is_valid_metrics_shard(metrics_path, expected_desc=str(item.id)) and cif_path.exists()
+        ledger = MetricsLedger(ctx.out_dir, out_dir)
+        try:
+            return cif_path.exists() and ledger.has_done(str(item.id))
+        finally:
+            ledger.close()
 
     def run_item(self, ctx: StepContext, item: WorkItem) -> None:
         cfg = self._af3score_config()
@@ -2275,20 +2280,11 @@ class AF3ScoreStep(ExternalCommandStep):
 
         allow_reuse = bool((ctx.work_queue or {}).get("allow_reuse", True))
         out_dir = self.output_dir(ctx)
-        metrics_items = out_dir / "metrics_items"
-        metrics_items.mkdir(parents=True, exist_ok=True)
         metrics_src = scratch_root / "metrics.csv"
         if not metrics_src.exists():
             raise StepError(f"Missing metrics.csv for {item.id} at {metrics_src}")
         if not is_valid_metrics_shard(metrics_src, expected_desc=str(run_stem)):
             raise StepError(f"Invalid metrics.csv for {item.id} at {metrics_src}")
-        metrics_dst = metrics_items / f"{item.id}.csv"
-        if metrics_dst.exists() and not is_valid_metrics_shard(metrics_dst, expected_desc=str(item.id)):
-            try:
-                metrics_dst.unlink()
-            except Exception as exc:
-                raise StepError(f"Failed to remove invalid promoted metrics shard at {metrics_dst}: {exc}") from exc
-        promote_file_atomic(metrics_src, metrics_dst, allow_reuse=allow_reuse)
 
         job_dir = scratch_root / "af3score_outputs" / run_stem
         cif_src = _best_job_cif(job_dir, run_stem)
@@ -2296,7 +2292,32 @@ class AF3ScoreStep(ExternalCommandStep):
             raise StepError(f"Missing CIF output for {item.id} under {job_dir}")
         cif_dir = out_dir / "cif"
         cif_dir.mkdir(parents=True, exist_ok=True)
-        promote_file_atomic(cif_src, cif_dir / f"{item.id}.cif", allow_reuse=allow_reuse)
+        cif_dst = cif_dir / f"{item.id}.cif"
+        promote_file_atomic(cif_src, cif_dst, allow_reuse=allow_reuse)
+
+        # Record canonical per-item metrics in the SQLite ledger (avoid per-item CSV shards).
+        try:
+            df_row = pd.read_csv(metrics_src)
+        except Exception as exc:
+            raise StepError(f"Failed to read metrics.csv for {item.id}: {exc}") from exc
+        if getattr(df_row, "empty", False):
+            raise StepError(f"AF3Score metrics.csv is empty for {item.id}: {metrics_src}")
+        row_dict = dict(df_row.iloc[0].to_dict())
+        row_dict.setdefault("description", str(run_stem))
+        ledger = MetricsLedger(ctx.out_dir, out_dir)
+        try:
+            ledger.upsert(
+                str(item.id),
+                status="done",
+                metrics=row_dict,
+                outputs={"cif_path": str(cif_dst)},
+                worker_id=os.environ.get("PPIFLOW_WORKER_ID") or f"{socket.gethostname()}:{os.getpid()}:{os.environ.get('RANK','0')}",
+                attempt=attempt,
+                design_id=extract_design_id(str(item.id)),
+                structure_id=structure_id_from_name(str(item.id)),
+            )
+        finally:
+            ledger.close()
 
         # Optional retention: copy heavy/raw runner outputs under output/_optional/... (never required for resume).
         try:
@@ -2429,8 +2450,6 @@ class AF3ScoreStep(ExternalCommandStep):
 
         allow_reuse = bool((ctx.work_queue or {}).get("allow_reuse", True))
         out_dir = self.output_dir(ctx)
-        metrics_items = out_dir / "metrics_items"
-        metrics_items.mkdir(parents=True, exist_ok=True)
         cif_dir = out_dir / "cif"
         cif_dir.mkdir(parents=True, exist_ok=True)
 
@@ -2561,13 +2580,29 @@ class AF3ScoreStep(ExternalCommandStep):
             if not is_valid_metrics_shard(metrics_csv, expected_desc=str(job_name)):
                 return False
             try:
-                dst = metrics_items / f"{item.id}.csv"
-                if dst.exists() and not is_valid_metrics_shard(dst, expected_desc=str(item.id)):
-                    try:
-                        dst.unlink()
-                    except Exception:
-                        return False
-                promote_file_atomic(metrics_csv, dst, allow_reuse=allow_reuse)
+                df_row = pd.read_csv(metrics_csv)
+            except Exception:
+                return False
+            if getattr(df_row, "empty", False):
+                return False
+            row_dict = dict(df_row.iloc[0].to_dict())
+            row_dict.setdefault("description", str(job_name))
+            try:
+                ledger = MetricsLedger(ctx.out_dir, out_dir)
+                try:
+                    ledger.upsert(
+                        str(item.id),
+                        status="done",
+                        metrics=row_dict,
+                        outputs={"cif_path": str(cif_dir / f"{item.id}.cif")},
+                        worker_id=os.environ.get("PPIFLOW_WORKER_ID")
+                        or f"{socket.gethostname()}:{os.getpid()}:{os.environ.get('RANK','0')}",
+                        attempt=attempt_by_id.get(item.id, 1),
+                        design_id=extract_design_id(str(item.id)),
+                        structure_id=structure_id_from_name(str(item.id)),
+                    )
+                finally:
+                    ledger.close()
             except Exception:
                 return False
             shutil.rmtree(tmp_root, ignore_errors=True)
@@ -2575,28 +2610,7 @@ class AF3ScoreStep(ExternalCommandStep):
 
         committed: set[str] = set()
         commit_lock = threading.Lock()
-
-        from ..work_queue import WorkQueue
-
-        wq = WorkQueue(ctx.out_dir, self.name, ctx.work_queue or {})
         forced_failed: dict[str, str] = {}
-
-        def _mark_done(item: WorkItem) -> None:
-            try:
-                attempt = attempt_by_id.get(item.id, 1)
-                wq.mark_done(item.id, attempt)
-            except Exception:
-                pass
-            if ctx.heartbeat:
-                try:
-                    prog = wq.progress()
-                    ctx.heartbeat.update(
-                        produced_total=int(prog.get("produced_total", 0)),
-                        expected_total=int(prog.get("expected_total", 0)),
-                        state=str(prog.get("status") or "running"),
-                    )
-                except Exception:
-                    pass
 
         def _commit_job(job_name: str, job_dir: Path) -> bool:
             item = item_by_stem.get(job_name) or item_by_norm.get(_norm_name(job_name))
@@ -2604,7 +2618,6 @@ class AF3ScoreStep(ExternalCommandStep):
                 return False
             if self.item_done(ctx, item):
                 committed.add(job_name)
-                _mark_done(item)
                 return True
             input_pdb = _input_pdb_for_job(job_name, item)
             if input_pdb is None:
@@ -2625,7 +2638,6 @@ class AF3ScoreStep(ExternalCommandStep):
                             f"{prefer}. (seed-only canonical source selection)"
                         )
                         forced_failed[item.id] = msg
-                        wq.mark_failed(item.id, attempt, msg)
                         committed.add(job_name)
                         return True
                 return False
@@ -2641,26 +2653,30 @@ class AF3ScoreStep(ExternalCommandStep):
                                 f"selected seed source {source.cif_path}"
                             )
                             forced_failed[item.id] = msg
-                            wq.mark_failed(item.id, attempt, msg)
                             committed.add(job_name)
                             return True
                     except Exception as exc:
                         attempt = attempt_by_id.get(item.id, 1)
                         msg = f"AF3Score CIF compare failed for {item.id}: {exc}"
                         forced_failed[item.id] = msg
-                        wq.mark_failed(item.id, attempt, msg)
                         committed.add(job_name)
                         return True
                 if not _promote_cif_for_source(source, item):
                     return False
-                # Avoid rerunning metrics if a valid shard is already promoted.
-                metrics_dst = metrics_items / f"{item.id}.csv"
-                if not is_valid_metrics_shard(metrics_dst, expected_desc=str(item.id)):
+                # Avoid rerunning metrics if the ledger already has a done row.
+                try:
+                    ledger = MetricsLedger(ctx.out_dir, out_dir)
+                    try:
+                        has_metrics = ledger.has_done(str(item.id))
+                    finally:
+                        ledger.close()
+                except Exception:
+                    has_metrics = False
+                if not has_metrics:
                     if not _write_metrics_for_source(job_name, source, input_pdb, item):
                         return False
                 if self.item_done(ctx, item):
                     committed.add(job_name)
-                    _mark_done(item)
                     return True
             return False
 
@@ -2713,24 +2729,26 @@ class AF3ScoreStep(ExternalCommandStep):
         commit_thread.join(timeout=2.0)
         _scan_batch_outputs()
 
-        # Fallback: split wrapper metrics.csv into per-item shards if any are missing.
+        # Fallback: if wrapper metrics.csv exists, backfill missing ledger rows.
         metrics_src = batch_dir / "metrics.csv"
         if metrics_src.exists():
             try:
-                import pandas as pd
-
                 df = pd.read_csv(metrics_src)
                 for item in valid_items:
-                    run_stem = str((item.payload or {}).get("run_stem") or item.id)
-                    dst_metrics = metrics_items / f"{item.id}.csv"
-                    if dst_metrics.exists():
-                        # Repair known-bad promoted shards so retries can recover.
-                        if is_valid_metrics_shard(dst_metrics, expected_desc=run_stem):
-                            continue
+                    # Only mark ledger rows as done once the required artifact is promoted.
+                    cif_dst = cif_dir / f"{item.id}.cif"
+                    if not cif_dst.exists():
+                        continue
+                    try:
+                        ledger = MetricsLedger(ctx.out_dir, out_dir)
                         try:
-                            dst_metrics.unlink()
-                        except Exception:
-                            continue
+                            if ledger.has_done(str(item.id)):
+                                continue
+                        finally:
+                            ledger.close()
+                    except Exception:
+                        pass
+                    run_stem = str((item.payload or {}).get("run_stem") or item.id)
                     run_stem_norm = run_stem.lower()
                     if run_stem_norm.endswith(".pdb"):
                         run_stem_norm = run_stem_norm[:-4]
@@ -2744,25 +2762,30 @@ class AF3ScoreStep(ExternalCommandStep):
                             if mask.any():
                                 break
                     if mask is not None and mask.any():
-                        tmp = batch_dir / f".metrics_item.{item.id}.csv"
+                        row_dict = dict(df.loc[mask].iloc[0].to_dict())
+                    elif len(valid_items) == 1 and not getattr(df, "empty", False):
+                        row_dict = dict(df.iloc[0].to_dict())
+                    else:
+                        continue
+                    row_dict.setdefault("description", str(run_stem))
+                    try:
+                        ledger = MetricsLedger(ctx.out_dir, out_dir)
                         try:
-                            df.loc[mask].to_csv(tmp, index=False)
-                            promote_file_atomic(tmp, dst_metrics, allow_reuse=allow_reuse)
+                            ledger.upsert(
+                                str(item.id),
+                                status="done",
+                                metrics=row_dict,
+                                outputs={"cif_path": str(cif_dst)},
+                                worker_id=os.environ.get("PPIFLOW_WORKER_ID")
+                                or f"{socket.gethostname()}:{os.getpid()}:{os.environ.get('RANK','0')}",
+                                attempt=attempt_by_id.get(item.id, 1),
+                                design_id=extract_design_id(str(item.id)),
+                                structure_id=structure_id_from_name(str(item.id)),
+                            )
                         finally:
-                            try:
-                                tmp.unlink()
-                            except Exception:
-                                pass
-                    elif len(valid_items) == 1:
-                        tmp = batch_dir / f".metrics_item.{item.id}.csv"
-                        try:
-                            df.to_csv(tmp, index=False)
-                            promote_file_atomic(tmp, dst_metrics, allow_reuse=allow_reuse)
-                        finally:
-                            try:
-                                tmp.unlink()
-                            except Exception:
-                                pass
+                            ledger.close()
+                    except Exception:
+                        continue
             except Exception:
                 pass
 
@@ -2824,19 +2847,63 @@ class AF3ScoreStep(ExternalCommandStep):
         out_dir = self.output_dir(ctx)
 
         df = None
-        metrics_items = out_dir / "metrics_items"
-        if metrics_items.exists():
-            metrics_paths = sorted(p for p in metrics_items.glob("*.csv"))
-            if metrics_paths:
-                try:
-                    df = pd.concat([pd.read_csv(p) for p in metrics_paths], ignore_index=True)
-                except Exception:
-                    df = None
-        if df is None:
+        try:
+            ledger = MetricsLedger(ctx.out_dir, out_dir)
+            try:
+                rows = [r.metrics for r in ledger.iter_rows(status="done")]
+            finally:
+                ledger.close()
+        except Exception:
+            rows = []
+
+        if rows:
+            df = pd.DataFrame(rows)
+        else:
+            # Legacy/resume fallback: derive from an existing consolidated metrics.csv if present.
             metrics_path = find_metrics_file(out_dir)
             if not metrics_path:
                 return
-            df = pd.read_csv(metrics_path)
+            # Reconcile: if metrics.csv exists but metrics.db is missing/incomplete, backfill ledger rows.
+            try:
+                df_existing = pd.read_csv(metrics_path)
+                ledger = MetricsLedger(ctx.out_dir, out_dir)
+                try:
+                    for _, row in df_existing.iterrows():
+                        desc = None
+                        for key in ("description", "name", "model", "pdb_name"):
+                            if key in df_existing.columns and pd.notna(row.get(key)):
+                                desc = str(row.get(key))
+                                break
+                        if not desc:
+                            continue
+                        item_id = Path(str(desc)).name
+                        if item_id.lower().endswith(".pdb"):
+                            item_id = item_id[:-4]
+                        if ledger.has_done(item_id):
+                            continue
+                        metrics_dict = dict(row.to_dict())
+                        metrics_dict.setdefault("description", str(desc))
+                        cif_path = out_dir / "cif" / f"{item_id}.cif"
+                        ledger.upsert(
+                            item_id,
+                            status="done",
+                            metrics=metrics_dict,
+                            outputs={"cif_path": str(cif_path)} if cif_path.exists() else {},
+                            worker_id="reconcile",
+                            attempt=1,
+                            design_id=extract_design_id(item_id),
+                            structure_id=structure_id_from_name(item_id),
+                        )
+                finally:
+                    ledger.close()
+                ledger = MetricsLedger(ctx.out_dir, out_dir)
+                try:
+                    rows = [r.metrics for r in ledger.iter_rows(status="done")]
+                finally:
+                    ledger.close()
+                df = pd.DataFrame(rows) if rows else df_existing
+            except Exception:
+                df = pd.read_csv(metrics_path)
 
         def _norm_desc_keys(raw: str) -> list[str]:
             text = str(raw or "").strip()
@@ -3231,6 +3298,9 @@ class AF3ScoreStep(ExternalCommandStep):
         if not super().outputs_complete(ctx):
             return False
         out_dir = self._resolve_output_dir_path(ctx)
+        if not (out_dir / "metrics.db").exists():
+            if not self._allow_legacy_outputs(ctx):
+                return False
         if not (out_dir / "metrics.csv").exists():
             return False
         if not (out_dir / "metrics_ppiflow.csv").exists():
@@ -3255,6 +3325,15 @@ class AF3ScoreStep(ExternalCommandStep):
             if self.cfg.get("manifest"):
                 # Strict: propagate exceptions (e.g. zero passing structures).
                 self.write_manifest(ctx)
+            # Seal WAL so metrics.db is self-contained when copying/pruning outputs.
+            try:
+                ledger = MetricsLedger(ctx.out_dir, self.output_dir(ctx))
+                try:
+                    ledger.checkpoint_and_truncate_wal()
+                finally:
+                    ledger.close()
+            except Exception:
+                pass
 
             if allow_failures:
                 failed_ids: list[str] = []
@@ -3456,14 +3535,13 @@ class AF3RefoldStep(ExternalCommandStep):
 
     def item_done(self, ctx: StepContext, item: WorkItem) -> bool:
         out_dir = self.output_dir(ctx)
-        metrics_path = out_dir / "metrics_items" / f"{item.id}.csv"
         cif_path = out_dir / "cif" / f"{item.id}.cif"
         pdb_path = out_dir / "pdbs" / f"{item.id}.pdb"
-        return (
-            is_valid_metrics_shard(metrics_path, expected_desc=str(item.id))
-            and cif_path.exists()
-            and pdb_path.exists()
-        )
+        ledger = MetricsLedger(ctx.out_dir, out_dir)
+        try:
+            return cif_path.exists() and pdb_path.exists() and ledger.has_done(str(item.id))
+        finally:
+            ledger.close()
 
     def run_item(self, ctx: StepContext, item: WorkItem) -> None:
         cfg = self._af3score_config()
@@ -3621,8 +3699,6 @@ class AF3RefoldStep(ExternalCommandStep):
 
         allow_reuse = bool((ctx.work_queue or {}).get("allow_reuse", True))
         out_dir = self.output_dir(ctx)
-        metrics_items = out_dir / "metrics_items"
-        metrics_items.mkdir(parents=True, exist_ok=True)
         cif_dir = out_dir / "cif"
         cif_dir.mkdir(parents=True, exist_ok=True)
         pdbs_dir = out_dir / "pdbs"
@@ -3633,19 +3709,13 @@ class AF3RefoldStep(ExternalCommandStep):
             raise StepError(f"Missing metrics.csv for {item.id} at {metrics_src}")
         if not is_valid_metrics_shard(metrics_src, expected_desc=str(run_stem)):
             raise StepError(f"Invalid metrics.csv for {item.id} at {metrics_src}")
-        metrics_dst = metrics_items / f"{item.id}.csv"
-        if metrics_dst.exists() and not is_valid_metrics_shard(metrics_dst, expected_desc=str(item.id)):
-            try:
-                metrics_dst.unlink()
-            except Exception as exc:
-                raise StepError(f"Failed to remove invalid promoted metrics shard at {metrics_dst}: {exc}") from exc
-        promote_file_atomic(metrics_src, metrics_dst, allow_reuse=allow_reuse)
 
         job_dir = scratch_root / "af3score_outputs" / run_stem
         cif_src = _best_job_cif(job_dir, run_stem)
         if cif_src is None or not cif_src.exists():
             raise StepError(f"Missing CIF output for {item.id} under {job_dir}")
-        promote_file_atomic(cif_src, cif_dir / f"{item.id}.cif", allow_reuse=allow_reuse)
+        cif_dst = cif_dir / f"{item.id}.cif"
+        promote_file_atomic(cif_src, cif_dst, allow_reuse=allow_reuse)
 
         # Convert CIF -> PDB in scratch, optionally renumber chain offsets, then promote.
         cfg_target_chain = str(cfg.get("target_chain") or "B")
@@ -3660,7 +3730,32 @@ class AF3RefoldStep(ExternalCommandStep):
             raise StepError(f"Failed to convert CIF to PDB for {item.id}")
         if offset_map:
             _renumber_chain_with_offsets(scratch_pdb, cfg_target_chain, offset_map)
-        promote_file_atomic(scratch_pdb, pdbs_dir / f"{item.id}.pdb", allow_reuse=allow_reuse)
+        pdb_dst = pdbs_dir / f"{item.id}.pdb"
+        promote_file_atomic(scratch_pdb, pdb_dst, allow_reuse=allow_reuse)
+
+        # Record canonical per-item metrics in the SQLite ledger (avoid per-item CSV shards).
+        try:
+            df_row = pd.read_csv(metrics_src)
+        except Exception as exc:
+            raise StepError(f"Failed to read metrics.csv for {item.id}: {exc}") from exc
+        if getattr(df_row, "empty", False):
+            raise StepError(f"AF3Refold metrics.csv is empty for {item.id}: {metrics_src}")
+        row_dict = dict(df_row.iloc[0].to_dict())
+        row_dict.setdefault("description", str(run_stem))
+        ledger = MetricsLedger(ctx.out_dir, out_dir)
+        try:
+            ledger.upsert(
+                str(item.id),
+                status="done",
+                metrics=row_dict,
+                outputs={"cif_path": str(cif_dst), "pdb_path": str(pdb_dst)},
+                worker_id=os.environ.get("PPIFLOW_WORKER_ID") or f"{socket.gethostname()}:{os.getpid()}:{os.environ.get('RANK','0')}",
+                attempt=attempt,
+                design_id=extract_design_id(str(item.id)),
+                structure_id=structure_id_from_name(str(item.id)),
+            )
+        finally:
+            ledger.close()
 
         # Optional retention: copy heavy/raw runner outputs under output/_optional/... (never required for resume).
         try:
@@ -3786,8 +3881,6 @@ class AF3RefoldStep(ExternalCommandStep):
 
         allow_reuse = bool((ctx.work_queue or {}).get("allow_reuse", True))
         out_dir = self.output_dir(ctx)
-        metrics_items = out_dir / "metrics_items"
-        metrics_items.mkdir(parents=True, exist_ok=True)
         cif_dir = out_dir / "cif"
         cif_dir.mkdir(parents=True, exist_ok=True)
         pdbs_dir = out_dir / "pdbs"
@@ -4029,13 +4122,32 @@ class AF3RefoldStep(ExternalCommandStep):
             if not is_valid_metrics_shard(metrics_csv, expected_desc=str(job_name)):
                 return False
             try:
-                dst = metrics_items / f"{item.id}.csv"
-                if dst.exists() and not is_valid_metrics_shard(dst, expected_desc=str(item.id)):
-                    try:
-                        dst.unlink()
-                    except Exception:
-                        return False
-                promote_file_atomic(metrics_csv, dst, allow_reuse=allow_reuse)
+                df_row = pd.read_csv(metrics_csv)
+            except Exception:
+                return False
+            if getattr(df_row, "empty", False):
+                return False
+            row_dict = dict(df_row.iloc[0].to_dict())
+            row_dict.setdefault("description", str(job_name))
+            try:
+                ledger = MetricsLedger(ctx.out_dir, out_dir)
+                try:
+                    ledger.upsert(
+                        str(item.id),
+                        status="done",
+                        metrics=row_dict,
+                        outputs={
+                            "cif_path": str(cif_dir / f"{item.id}.cif"),
+                            "pdb_path": str(pdbs_dir / f"{item.id}.pdb"),
+                        },
+                        worker_id=os.environ.get("PPIFLOW_WORKER_ID")
+                        or f"{socket.gethostname()}:{os.getpid()}:{os.environ.get('RANK','0')}",
+                        attempt=attempt_by_id.get(item.id, 1),
+                        design_id=extract_design_id(str(item.id)),
+                        structure_id=structure_id_from_name(str(item.id)),
+                    )
+                finally:
+                    ledger.close()
             except Exception:
                 return False
             shutil.rmtree(tmp_root, ignore_errors=True)
@@ -4043,28 +4155,7 @@ class AF3RefoldStep(ExternalCommandStep):
 
         committed: set[str] = set()
         commit_lock = threading.Lock()
-
-        from ..work_queue import WorkQueue
-
-        wq = WorkQueue(ctx.out_dir, self.name, ctx.work_queue or {})
         forced_failed: dict[str, str] = {}
-
-        def _mark_done(item: WorkItem) -> None:
-            try:
-                attempt = attempt_by_id.get(item.id, 1)
-                wq.mark_done(item.id, attempt)
-            except Exception:
-                pass
-            if ctx.heartbeat:
-                try:
-                    prog = wq.progress()
-                    ctx.heartbeat.update(
-                        produced_total=int(prog.get("produced_total", 0)),
-                        expected_total=int(prog.get("expected_total", 0)),
-                        state=str(prog.get("status") or "running"),
-                    )
-                except Exception:
-                    pass
 
         def _commit_job(job_name: str, job_dir: Path) -> bool:
             item = item_by_stem.get(job_name) or item_by_norm.get(_norm_name(job_name))
@@ -4072,7 +4163,6 @@ class AF3RefoldStep(ExternalCommandStep):
                 return False
             if self.item_done(ctx, item):
                 committed.add(job_name)
-                _mark_done(item)
                 return True
             input_pdb = _input_pdb_for_job(job_name, item)
             if input_pdb is None:
@@ -4091,7 +4181,6 @@ class AF3RefoldStep(ExternalCommandStep):
                             f"{prefer}. (seed-only canonical source selection)"
                         )
                         forced_failed[item.id] = msg
-                        wq.mark_failed(item.id, attempt, msg)
                         committed.add(job_name)
                         return True
                 return False
@@ -4107,28 +4196,32 @@ class AF3RefoldStep(ExternalCommandStep):
                                 f"selected seed source {source.cif_path}"
                             )
                             forced_failed[item.id] = msg
-                            wq.mark_failed(item.id, attempt, msg)
                             committed.add(job_name)
                             return True
                     except Exception as exc:
                         attempt = attempt_by_id.get(item.id, 1)
                         msg = f"AF3Refold CIF compare failed for {item.id}: {exc}"
                         forced_failed[item.id] = msg
-                        wq.mark_failed(item.id, attempt, msg)
                         committed.add(job_name)
                         return True
                 if not _promote_cif_for_source(source, item):
                     return False
                 if not _promote_pdb_for_source(source, item):
                     return False
-                # Avoid rerunning metrics if a valid shard is already promoted.
-                metrics_dst = metrics_items / f"{item.id}.csv"
-                if not is_valid_metrics_shard(metrics_dst, expected_desc=str(item.id)):
+                # Avoid rerunning metrics if the ledger already has a done row.
+                try:
+                    ledger = MetricsLedger(ctx.out_dir, out_dir)
+                    try:
+                        has_metrics = ledger.has_done(str(item.id))
+                    finally:
+                        ledger.close()
+                except Exception:
+                    has_metrics = False
+                if not has_metrics:
                     if not _write_metrics_for_source(job_name, source, input_pdb, item):
                         return False
                 if self.item_done(ctx, item):
                     committed.add(job_name)
-                    _mark_done(item)
                     return True
             return False
 
@@ -4181,24 +4274,26 @@ class AF3RefoldStep(ExternalCommandStep):
         commit_thread.join(timeout=2.0)
         _scan_batch_outputs()
 
-        # Fallback: split wrapper metrics.csv into per-item shards if any are missing.
+        # Fallback: if wrapper metrics.csv exists, backfill missing ledger rows.
         metrics_src = batch_dir / "metrics.csv"
         if metrics_src.exists():
             try:
-                import pandas as pd
-
                 df = pd.read_csv(metrics_src)
                 for item in valid_items:
-                    run_stem = str((item.payload or {}).get("run_stem") or item.id)
-                    dst_metrics = metrics_items / f"{item.id}.csv"
-                    if dst_metrics.exists():
-                        # Repair known-bad promoted shards so retries can recover.
-                        if is_valid_metrics_shard(dst_metrics, expected_desc=run_stem):
-                            continue
+                    cif_dst = cif_dir / f"{item.id}.cif"
+                    pdb_dst = pdbs_dir / f"{item.id}.pdb"
+                    if not (cif_dst.exists() and pdb_dst.exists()):
+                        continue
+                    try:
+                        ledger = MetricsLedger(ctx.out_dir, out_dir)
                         try:
-                            dst_metrics.unlink()
-                        except Exception:
-                            continue
+                            if ledger.has_done(str(item.id)):
+                                continue
+                        finally:
+                            ledger.close()
+                    except Exception:
+                        pass
+                    run_stem = str((item.payload or {}).get("run_stem") or item.id)
                     run_stem_norm = run_stem.lower()
                     if run_stem_norm.endswith(".pdb"):
                         run_stem_norm = run_stem_norm[:-4]
@@ -4212,25 +4307,30 @@ class AF3RefoldStep(ExternalCommandStep):
                             if mask.any():
                                 break
                     if mask is not None and mask.any():
-                        tmp = batch_dir / f".metrics_item.{item.id}.csv"
+                        row_dict = dict(df.loc[mask].iloc[0].to_dict())
+                    elif len(valid_items) == 1 and not getattr(df, "empty", False):
+                        row_dict = dict(df.iloc[0].to_dict())
+                    else:
+                        continue
+                    row_dict.setdefault("description", str(run_stem))
+                    try:
+                        ledger = MetricsLedger(ctx.out_dir, out_dir)
                         try:
-                            df.loc[mask].to_csv(tmp, index=False)
-                            promote_file_atomic(tmp, dst_metrics, allow_reuse=allow_reuse)
+                            ledger.upsert(
+                                str(item.id),
+                                status="done",
+                                metrics=row_dict,
+                                outputs={"cif_path": str(cif_dst), "pdb_path": str(pdb_dst)},
+                                worker_id=os.environ.get("PPIFLOW_WORKER_ID")
+                                or f"{socket.gethostname()}:{os.getpid()}:{os.environ.get('RANK','0')}",
+                                attempt=attempt_by_id.get(item.id, 1),
+                                design_id=extract_design_id(str(item.id)),
+                                structure_id=structure_id_from_name(str(item.id)),
+                            )
                         finally:
-                            try:
-                                tmp.unlink()
-                            except Exception:
-                                pass
-                    elif len(valid_items) == 1:
-                        tmp = batch_dir / f".metrics_item.{item.id}.csv"
-                        try:
-                            df.to_csv(tmp, index=False)
-                            promote_file_atomic(tmp, dst_metrics, allow_reuse=allow_reuse)
-                        finally:
-                            try:
-                                tmp.unlink()
-                            except Exception:
-                                pass
+                            ledger.close()
+                    except Exception:
+                        continue
             except Exception:
                 pass
 
@@ -4293,19 +4393,68 @@ class AF3RefoldStep(ExternalCommandStep):
     def write_manifest(self, ctx: StepContext) -> None:
         out_dir = self.output_dir(ctx)
         df = None
-        metrics_items = out_dir / "metrics_items"
-        if metrics_items.exists():
-            metrics_paths = sorted(p for p in metrics_items.glob("*.csv"))
-            if metrics_paths:
-                try:
-                    df = pd.concat([pd.read_csv(p) for p in metrics_paths], ignore_index=True)
-                except Exception:
-                    df = None
-        if df is None:
+        try:
+            ledger = MetricsLedger(ctx.out_dir, out_dir)
+            try:
+                rows_ledger = [r.metrics for r in ledger.iter_rows(status="done")]
+            finally:
+                ledger.close()
+        except Exception:
+            rows_ledger = []
+
+        if rows_ledger:
+            df = pd.DataFrame(rows_ledger)
+        else:
             metrics_path = find_metrics_file(out_dir)
             if not metrics_path:
                 return
-            df = pd.read_csv(metrics_path)
+            # Reconcile: if metrics.csv exists but metrics.db is missing/incomplete, backfill ledger rows.
+            try:
+                df_existing = pd.read_csv(metrics_path)
+                ledger = MetricsLedger(ctx.out_dir, out_dir)
+                try:
+                    for _, row in df_existing.iterrows():
+                        desc = None
+                        for key in ("description", "name", "model", "pdb_name"):
+                            if key in df_existing.columns and pd.notna(row.get(key)):
+                                desc = str(row.get(key))
+                                break
+                        if not desc:
+                            continue
+                        item_id = Path(str(desc)).name
+                        if item_id.lower().endswith(".pdb"):
+                            item_id = item_id[:-4]
+                        if ledger.has_done(item_id):
+                            continue
+                        metrics_dict = dict(row.to_dict())
+                        metrics_dict.setdefault("description", str(desc))
+                        cif_path = out_dir / "cif" / f"{item_id}.cif"
+                        pdb_path = out_dir / "pdbs" / f"{item_id}.pdb"
+                        outputs = {}
+                        if cif_path.exists():
+                            outputs["cif_path"] = str(cif_path)
+                        if pdb_path.exists():
+                            outputs["pdb_path"] = str(pdb_path)
+                        ledger.upsert(
+                            item_id,
+                            status="done",
+                            metrics=metrics_dict,
+                            outputs=outputs,
+                            worker_id="reconcile",
+                            attempt=1,
+                            design_id=extract_design_id(item_id),
+                            structure_id=structure_id_from_name(item_id),
+                        )
+                finally:
+                    ledger.close()
+                ledger = MetricsLedger(ctx.out_dir, out_dir)
+                try:
+                    rows_ledger = [r.metrics for r in ledger.iter_rows(status="done")]
+                finally:
+                    ledger.close()
+                df = pd.DataFrame(rows_ledger) if rows_ledger else df_existing
+            except Exception:
+                df = pd.read_csv(metrics_path)
 
         # Refold metrics rows are matched to PDBs by stem; normalize desc values to avoid
         # missing lookups when metrics include ".pdb" or a path-like prefix.
@@ -4467,6 +4616,9 @@ class AF3RefoldStep(ExternalCommandStep):
         if not super().outputs_complete(ctx):
             return False
         out_dir = self._resolve_output_dir_path(ctx)
+        if not (out_dir / "metrics.db").exists():
+            if not self._allow_legacy_outputs(ctx):
+                return False
         if not (out_dir / "metrics.csv").exists():
             return False
         if not (out_dir / "metrics_ppiflow.csv").exists():
@@ -4490,6 +4642,15 @@ class AF3RefoldStep(ExternalCommandStep):
         try:
             if self.cfg.get("manifest"):
                 self.write_manifest(ctx)
+            # Seal WAL so metrics.db is self-contained when copying/pruning outputs.
+            try:
+                ledger = MetricsLedger(ctx.out_dir, self.output_dir(ctx))
+                try:
+                    ledger.checkpoint_and_truncate_wal()
+                finally:
+                    ledger.close()
+            except Exception:
+                pass
 
             if allow_failures:
                 failed_ids: list[str] = []

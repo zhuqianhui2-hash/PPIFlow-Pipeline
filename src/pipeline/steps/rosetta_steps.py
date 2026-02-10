@@ -15,6 +15,7 @@ from ..direct_legacy import compute_run_stems, promote_file, promote_file_atomic
 from ..io import collect_pdbs, is_ignored_path
 from ..logging_utils import log_command_progress, run_command
 from ..manifests import extract_design_id, structure_id_from_name, write_csv
+from ..metrics_ledger import MetricsLedger
 from ..output_policy import is_minimal, optional_dir, step_scratch_dir
 from ..work_queue import WorkItem
 
@@ -188,8 +189,11 @@ class RosettaInterfaceStep(Step):
 
     def item_done(self, ctx: StepContext, item: WorkItem) -> bool:
         out_dir = self.output_dir(ctx)
-        items_dir = out_dir / "residue_energy_items"
-        return (items_dir / f"{item.id}.csv").exists()
+        ledger = MetricsLedger(ctx.out_dir, out_dir)
+        try:
+            return ledger.has_done(str(item.id))
+        finally:
+            ledger.close()
 
     def run_item(self, ctx: StepContext, item: WorkItem) -> None:
         pdb_path = Path(str((item.payload or {}).get("pdb_path") or ""))
@@ -299,21 +303,47 @@ class RosettaInterfaceStep(Step):
         allow_reuse = bool((ctx.work_queue or {}).get("allow_reuse", True))
         if output_enabled and not is_minimal(ctx):
             promote_tree(job_root, optional_dir(ctx) / "rosetta_interface" / "rosetta_jobs", allow_reuse=allow_reuse)
-        residue_items = out_dir / "residue_energy_items"
-        residue_items.mkdir(parents=True, exist_ok=True)
         residue_src = item_out / "residue_energy.csv"
-        if residue_src.exists():
-            # Rewrite pdbpath to point at the original input PDB (not .tmp) for downstream steps.
-            try:
-                import pandas as pd
+        if not residue_src.exists():
+            raise StepError(f"rosetta_interface missing residue_energy.csv for {item.id} at {residue_src}")
 
-                df = pd.read_csv(residue_src)
-                if "pdbpath" in df.columns:
-                    df["pdbpath"] = str(pdb_path)
-                df.to_csv(residue_src, index=False)
-            except Exception:
-                pass
-            promote_file_atomic(residue_src, residue_items / f"{item.id}.csv", allow_reuse=allow_reuse)
+        # Rewrite pdbpath to point at the original input PDB (not .tmp) for downstream steps.
+        try:
+            import pandas as pd
+
+            df = pd.read_csv(residue_src)
+            if "pdbpath" in df.columns:
+                df["pdbpath"] = str(pdb_path)
+            df.to_csv(residue_src, index=False)
+        except Exception:
+            pass
+
+        # Record canonical metrics in the SQLite ledger (avoid residue_energy_items shards).
+        try:
+            import pandas as pd
+
+            df = pd.read_csv(residue_src)
+            if getattr(df, "empty", False):
+                raise StepError(f"rosetta_interface produced empty residue_energy.csv for {item.id}")
+            row_dict = dict(df.iloc[0].to_dict())
+        except Exception as exc:
+            raise StepError(f"Failed to parse residue_energy.csv for {item.id}: {exc}") from exc
+        name = str(row_dict.get("pdbname") or Path(str(row_dict.get("pdbpath", ""))).stem or item.id)
+        ledger = MetricsLedger(ctx.out_dir, out_dir)
+        try:
+            ledger.upsert(
+                str(item.id),
+                status="done",
+                metrics=row_dict,
+                outputs={"pdb_path": str(pdb_path)},
+                worker_id=os.environ.get("PPIFLOW_WORKER_ID")
+                or f"{os.uname().nodename}:{os.getpid()}:{os.environ.get('RANK','0')}",
+                attempt=int((item.payload or {}).get("_attempt") or 1) if isinstance(item.payload, dict) else 1,
+                design_id=extract_design_id(name),
+                structure_id=structure_id_from_name(name),
+            )
+        finally:
+            ledger.close()
         shutil.rmtree(item_dir, ignore_errors=True)
         if output_enabled:
             shutil.rmtree(job_root.parent, ignore_errors=True)
@@ -504,17 +534,59 @@ class RosettaInterfaceStep(Step):
 
     def write_manifest(self, ctx: StepContext) -> None:
         out_dir = self.output_dir(ctx)
-        residue_items = out_dir / "residue_energy_items"
-        item_csvs = sorted(residue_items.glob("*.csv")) if residue_items.exists() else []
-        if not item_csvs:
-            raise StepError("rosetta_interface missing residue_energy_items/*.csv; cannot build residue_energy.csv")
+        try:
+            ledger = MetricsLedger(ctx.out_dir, out_dir)
+            try:
+                rows = [r.metrics for r in ledger.iter_rows(status="done")]
+            finally:
+                ledger.close()
+        except Exception:
+            rows = []
+        if not rows:
+            # Reconcile: if residue_energy.csv exists but metrics.db is missing/incomplete, backfill ledger rows.
+            residue_csv = out_dir / "residue_energy.csv"
+            if residue_csv.exists():
+                try:
+                    import pandas as pd
 
+                    df_existing = pd.read_csv(residue_csv)
+                    ledger = MetricsLedger(ctx.out_dir, out_dir)
+                    try:
+                        for _, row in df_existing.iterrows():
+                            item_id = str(row.get("pdbname") or "") or Path(str(row.get("pdbpath", ""))).stem
+                            if not item_id:
+                                continue
+                            if ledger.has_done(item_id):
+                                continue
+                            metrics_dict = dict(row.to_dict())
+                            pdb_path = row.get("pdbpath") or row.get("pdb_path")
+                            ledger.upsert(
+                                item_id,
+                                status="done",
+                                metrics=metrics_dict,
+                                outputs={"pdb_path": str(pdb_path)} if pdb_path else {},
+                                worker_id="reconcile",
+                                attempt=1,
+                                design_id=extract_design_id(item_id),
+                                structure_id=structure_id_from_name(item_id),
+                            )
+                    finally:
+                        ledger.close()
+                    ledger = MetricsLedger(ctx.out_dir, out_dir)
+                    try:
+                        rows = [r.metrics for r in ledger.iter_rows(status="done")]
+                    finally:
+                        ledger.close()
+                except Exception:
+                    rows = []
+            if not rows:
+                raise StepError("rosetta_interface missing metrics ledger rows; cannot build residue_energy.csv")
         try:
             import pandas as pd
 
-            df_all = pd.concat([pd.read_csv(p) for p in item_csvs], ignore_index=True)
+            df_all = pd.DataFrame(rows)
         except Exception as exc:
-            raise StepError(f"Failed to build residue_energy.csv from residue_energy_items: {exc}") from exc
+            raise StepError(f"Failed to build residue_energy.csv from ledger: {exc}") from exc
         if getattr(df_all, "empty", False):
             raise StepError("rosetta_interface produced empty residue_energy.csv")
 
@@ -565,6 +637,9 @@ class RosettaInterfaceStep(Step):
         if not super().outputs_complete(ctx):
             return False
         out_dir = self._resolve_output_dir_path(ctx)
+        if not (out_dir / "metrics.db").exists():
+            if not self._allow_legacy_outputs(ctx):
+                return False
         residue_csv = out_dir / "residue_energy.csv"
         if not residue_csv.exists():
             return False
@@ -588,6 +663,15 @@ class RosettaInterfaceStep(Step):
         try:
             if self.cfg.get("manifest"):
                 self.write_manifest(ctx)
+            # Seal WAL so metrics.db is self-contained when copying/pruning outputs.
+            try:
+                ledger = MetricsLedger(ctx.out_dir, self.output_dir(ctx))
+                try:
+                    ledger.checkpoint_and_truncate_wal()
+                finally:
+                    ledger.close()
+            except Exception:
+                pass
 
             if allow_failures:
                 failed_ids: list[str] = []

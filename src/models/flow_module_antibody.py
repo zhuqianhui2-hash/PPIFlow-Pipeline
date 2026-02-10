@@ -3,6 +3,8 @@ import torch
 import torch.nn.functional as F
 import os
 import logging
+import re
+import socket
 import torch.distributed as dist
 import pandas as pd
 
@@ -24,6 +26,8 @@ from analysis import utils as au
 from models.flow_model_antibody import FlowModel
 from data.interpolant_antibody import Interpolant
 from data import so3_utils
+
+from pipeline.metrics_ledger import MetricsLedger
 
 
 logging.basicConfig(level=logging.INFO)
@@ -53,6 +57,43 @@ class FlowModule(LightningModule):
 
         self._checkpoint_dir = None
         self._inference_dir = None
+        self._metrics_ledger = None
+
+    def _metrics_worker_id(self) -> str:
+        rank = os.environ.get("RANK", "0")
+        return f"{socket.gethostname()}:{os.getpid()}:{rank}"
+
+    def _get_metrics_ledger(self) -> MetricsLedger | None:
+        """
+        Optional per-step SQLite metrics ledger.
+
+        Pipeline runs set:
+          PPIFLOW_METRICS_RUN_DIR=<run root containing .ppiflow_lock>
+          PPIFLOW_METRICS_STEP_DIR=<step output dir>
+        """
+        if self._metrics_ledger is not None:
+            return self._metrics_ledger
+        run_dir = os.environ.get("PPIFLOW_METRICS_RUN_DIR")
+        step_dir = os.environ.get("PPIFLOW_METRICS_STEP_DIR")
+        if not run_dir or not step_dir:
+            self._metrics_ledger = None
+            return None
+        try:
+            self._metrics_ledger = MetricsLedger(run_dir, step_dir)
+        except Exception:
+            self._metrics_ledger = None
+        return self._metrics_ledger
+
+    def _infer_item_id_from_pdb_path(self, pdb_path: str) -> str | None:
+        name = os.path.splitext(os.path.basename(str(pdb_path)))[0]
+        # Expected: <name>_antigen_antibody_sample_<id>
+        m = re.search(r"sample_(\\d+)$", name)
+        if m:
+            return m.group(1)
+        m = re.search(r"_(\\d+)$", name)
+        if m:
+            return m.group(1)
+        return None
 
     @property
     def checkpoint_dir(self):
@@ -262,7 +303,20 @@ class FlowModule(LightningModule):
                 test_metric["rmsd_framework"] = rmsd
                 test_metric["has_clash"] = has_clash
 
-                self.test_epoch_metrics.append(test_metric)
+                ledger = self._get_metrics_ledger()
+                if ledger is not None:
+                    item_id = self._infer_item_id_from_pdb_path(pdb_path) or str(batch_idx)
+                    # Store required downstream columns in metrics (pdb_path, cdr_interface_ratio, ...).
+                    ledger.upsert(
+                        item_id,
+                        status="done",
+                        metrics=dict(test_metric),
+                        outputs={"pdb_path": pdb_path},
+                        worker_id=self._metrics_worker_id(),
+                        structure_id=os.path.splitext(os.path.basename(pdb_path))[0],
+                    )
+                else:
+                    self.test_epoch_metrics.append(test_metric)
 
                 if os.path.exists(output_pdb):
                     os.remove(output_pdb)
@@ -277,14 +331,18 @@ class FlowModule(LightningModule):
                     os.remove(output_pdb)
 
     def on_test_end(self):
-        if len(self.test_epoch_metrics) > 0:
+        ledger = self._get_metrics_ledger()
+        if ledger is None and len(self.test_epoch_metrics) > 0:
+            # Legacy path (non-pipeline usage): write a single CSV at the end.
             test_metrics_df = pd.DataFrame(self.test_epoch_metrics)
             test_metrics_df.to_csv(
-                os.path.join(
-                    self._exp_cfg.testing_model.save_dir,
-                    f"sample_metrics.csv",
-                ),
+                os.path.join(self._exp_cfg.testing_model.save_dir, "sample_metrics.csv"),
                 float_format="%.4f",
                 index=False,
             )
         self.test_epoch_metrics.clear()
+        try:
+            if ledger is not None:
+                ledger.close()
+        except Exception:
+            pass

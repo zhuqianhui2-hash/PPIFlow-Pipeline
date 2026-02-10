@@ -197,23 +197,23 @@ def run_pipeline(args) -> None:
         args.length_schedule_path, args.samples_per_target
     )
 
-    # Preprocessing: generate CSV from PDB or use provided CSV
+    rank = int(os.environ.get("RANK", "0") or 0)
+
+    # Preprocessing: generate CSV from PDB or use provided CSV.
+    # For distributed pipeline runs, callers should run preprocessing once (leader) and then
+    # invoke inference-only workers using --input_csv (no --input_pdb) to avoid write races.
     if args.input_pdb is not None:
         assert args.target_chain is not None, "Target chain ID required"
         input_data_dir = os.path.join(output_dir, "input")
         os.makedirs(input_data_dir, exist_ok=True)
-        processed_csv_path = preprocess_csv_and_pkl(
-            pdb_path=args.input_pdb, output_dir=input_data_dir, args=args
-        )
+        processed_csv_path = preprocess_csv_and_pkl(pdb_path=args.input_pdb, output_dir=input_data_dir, args=args)
+        if getattr(args, "preprocess_only", False):
+            print(f"Preprocess-only complete: {processed_csv_path}")
+            return
     else:
-        assert (
-            args.input_csv is not None
-        ), "Either input_csv or input_pdb required"
+        assert args.input_csv is not None, "Either input_csv or input_pdb required"
         processed_csv_path = args.input_csv
-        shutil.copy(
-            processed_csv_path,
-            os.path.join(output_dir, f"{args.name}_input.csv"),
-        )
+        assert os.path.exists(processed_csv_path), f"input_csv not found: {processed_csv_path}"
 
     # Load and update configuration
     config_manager = ConfigManager(args.config)
@@ -249,9 +249,10 @@ def run_pipeline(args) -> None:
     }
     config_manager.update_config(update_configs)
 
-    # Save config and load as OmegaConf
-    config_save_path = os.path.join(output_dir, "sample_config.yml")
-    config_manager.save_config(config_save_path)
+    # Shared artifact: only rank0 writes the YAML snapshot.
+    if rank == 0:
+        config_save_path = os.path.join(output_dir, "sample_config.yml")
+        config_manager.save_config(config_save_path)
     cfg = OmegaConf.create(config_manager.current_config)
 
     # Initialize model and run inference
@@ -297,15 +298,17 @@ def run_pipeline(args) -> None:
             except Exception:
                 pass
 
-    _write_progress(0, "running")
-    t = threading.Thread(target=_progress_loop, daemon=True)
-    t.start()
+    if rank == 0:
+        _write_progress(0, "running")
+        t = threading.Thread(target=_progress_loop, daemon=True)
+        t.start()
     try:
         exp.test()
     finally:
-        stop_event.set()
-        t.join(timeout=1.0)
-        _write_progress(_count_outputs(), "completed")
+        if rank == 0:
+            stop_event.set()
+            t.join(timeout=1.0)
+            _write_progress(_count_outputs(), "completed")
     print("Sampling finished.")
 
 
@@ -322,6 +325,11 @@ def get_parser() -> argparse.ArgumentParser:
     )
     input_group.add_argument(
         "--input_csv", type=str, help="Input CSV file path"
+    )
+    parser.add_argument(
+        "--preprocess_only",
+        action="store_true",
+        help="Run preprocessing (input CSV + PKLs) and exit.",
     )
 
     # Chain configuration
@@ -445,6 +453,8 @@ def validate_inputs(args) -> None:
         assert os.path.exists(
             args.input_pdb
         ), f"PDB file not found: {args.input_pdb}"
+    if args.input_csv is not None:
+        assert os.path.exists(args.input_csv), f"Input CSV not found: {args.input_csv}"
 
     target_chains = parse_chain_list(args.target_chain)
     assert len(target_chains) == 1, "Binder protocol currently supports a single target chain"

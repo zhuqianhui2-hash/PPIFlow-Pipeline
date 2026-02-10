@@ -4,6 +4,7 @@ import os
 import numpy as np
 import pandas as pd
 import logging
+import socket
 import torch.distributed as dist
 from lightning import LightningModule
 
@@ -17,6 +18,8 @@ from data import all_atom
 from data import so3_utils
 from data import residue_constants
 from omegaconf import OmegaConf
+
+from pipeline.metrics_ledger import MetricsLedger
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -45,6 +48,25 @@ class FlowModule(LightningModule):
 
         self._checkpoint_dir = None
         self._inference_dir = None
+        self._metrics_ledger = None
+
+    def _metrics_worker_id(self) -> str:
+        rank = os.environ.get("RANK", "0")
+        return f"{socket.gethostname()}:{os.getpid()}:{rank}"
+
+    def _get_metrics_ledger(self) -> MetricsLedger | None:
+        if self._metrics_ledger is not None:
+            return self._metrics_ledger
+        run_dir = os.environ.get("PPIFLOW_METRICS_RUN_DIR")
+        step_dir = os.environ.get("PPIFLOW_METRICS_STEP_DIR")
+        if not run_dir or not step_dir:
+            self._metrics_ledger = None
+            return None
+        try:
+            self._metrics_ledger = MetricsLedger(run_dir, step_dir)
+        except Exception:
+            self._metrics_ledger = None
+        return self._metrics_ledger
 
     @property
     def checkpoint_dir(self):
@@ -233,15 +255,29 @@ class FlowModule(LightningModule):
                     other_metrics = metrics.calc_other_metrics(saved_path)
 
                     test_metric["pdb_name"] = f"{target_name}_{sample_ids[i].item()}.pdb"
+                    test_metric["pdb_path"] = saved_path
                     test_metric.update(mdtraj_metrics)
                     test_metric.update(ca_ca_metrics)
                     test_metric.update(other_metrics)
 
-                    self.test_epoch_metrics.append(test_metric)
+                    ledger = self._get_metrics_ledger()
+                    if ledger is not None:
+                        item_id = str(int(sample_ids[i].item()))
+                        ledger.upsert(
+                            item_id,
+                            status="done",
+                            metrics=dict(test_metric),
+                            outputs={"pdb_path": saved_path},
+                            worker_id=self._metrics_worker_id(),
+                            structure_id=os.path.splitext(os.path.basename(saved_path))[0],
+                        )
+                    else:
+                        self.test_epoch_metrics.append(test_metric)
 
 
     def on_test_end(self):
-        if len(self.test_epoch_metrics) > 0:
+        ledger = self._get_metrics_ledger()
+        if ledger is None and len(self.test_epoch_metrics) > 0:
             test_metrics_df = pd.DataFrame(self.test_epoch_metrics)
             test_metrics_df.to_csv(
                 os.path.join(
@@ -252,3 +288,8 @@ class FlowModule(LightningModule):
                 index=False,
             )
         self.test_epoch_metrics.clear()
+        try:
+            if ledger is not None:
+                ledger.close()
+        except Exception:
+            pass

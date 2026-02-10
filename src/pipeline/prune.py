@@ -16,23 +16,24 @@ from .work_queue import WorkQueue
 _OPTIONAL_DIRS: dict[str, list[str]] = {
     "flowpacker1": ["after_pdbs", "flowpacker_outputs", ".tmp"],
     "flowpacker2": ["after_pdbs", "flowpacker_outputs", ".tmp"],
-    "af3score1": ["af3score_outputs", "json", "af3_input_batch", "single_chain_cif", "pdbs", "af3score_subprocess_logs", ".tmp"],
-    "af3score2": ["af3score_outputs", "json", "af3_input_batch", "single_chain_cif", "pdbs", "af3score_subprocess_logs", ".tmp"],
-    "af3_refold": ["af3score_outputs", "json", "af3_input_batch", "single_chain_cif", "af3score_subprocess_logs", ".tmp"],
-    "rosetta_interface": ["rosetta_jobs", ".tmp"],
+    "af3score1": ["af3score_outputs", "json", "af3_input_batch", "single_chain_cif", "pdbs", "af3score_subprocess_logs", "metrics_items", ".tmp"],
+    "af3score2": ["af3score_outputs", "json", "af3_input_batch", "single_chain_cif", "pdbs", "af3score_subprocess_logs", "metrics_items", ".tmp"],
+    "af3_refold": ["af3score_outputs", "json", "af3_input_batch", "single_chain_cif", "af3score_subprocess_logs", "metrics_items", ".tmp"],
+    "rosetta_interface": ["rosetta_jobs", "residue_energy_items", ".tmp"],
     "relax": ["rosetta_jobs", ".tmp"],
     "seq1": [".tmp"],
     "seq2": [".tmp"],
 }
 
 _REQUIRED_OUTPUTS: dict[str, list[tuple[str, ...]]] = {
-    "gen": [("sample_metrics.csv",)],
+    "gen": [("metrics.db",), ("sample_metrics.csv",)],
     "flowpacker1": [("packed_pdbs/*.pdb",)],
     "flowpacker2": [("packed_pdbs/*.pdb",)],
-    "af3score1": [("metrics_items/*.csv",), ("cif/*.cif",), ("metrics.csv",), ("metrics_ppiflow.csv",), ("filtered_pdbs/*.pdb",)],
-    "af3score2": [("metrics_items/*.csv",), ("cif/*.cif",), ("metrics.csv",), ("metrics_ppiflow.csv",), ("filtered_pdbs/*.pdb",)],
-    "af3_refold": [("metrics_items/*.csv",), ("cif/*.cif",), ("pdbs/*.pdb",), ("metrics.csv",), ("metrics_ppiflow.csv",)],
-    "rosetta_interface": [("residue_energy_items/*.csv", "residue_energy.csv")],
+    "af3score1": [("metrics.db",), ("cif/*.cif",), ("metrics.csv",), ("metrics_ppiflow.csv",), ("filtered_pdbs/*.pdb",)],
+    "af3score2": [("metrics.db",), ("cif/*.cif",), ("metrics.csv",), ("metrics_ppiflow.csv",), ("filtered_pdbs/*.pdb",)],
+    "af3_refold": [("metrics.db",), ("cif/*.cif",), ("pdbs/*.pdb",), ("metrics.csv",), ("metrics_ppiflow.csv",)],
+    "rosetta_interface": [("metrics.db",), ("residue_energy.csv",)],
+    "dockq": [("metrics.db",), ("*_dockq_score",)],
     "relax": [("*.pdb",)],
     "seq2": [("seqs/*.fa*",), ("pdbs/*.pdb",)],
 }
@@ -167,7 +168,12 @@ def _required_outputs_ready(ctx, out_dir: Path, step_name: str) -> bool:
     required = list(_REQUIRED_OUTPUTS.get(step_name) or [])
     if not required:
         return True
+    explicit_reuse = bool((ctx.work_queue or {}).get("explicit_reuse"))
     for group in required:
+        # For legacy runs (explicit_reuse), allow pruning even if metrics.db does not exist yet.
+        # New runs should always produce metrics.db, and the other required outputs still gate pruning.
+        if explicit_reuse and tuple(group) == ("metrics.db",):
+            continue
         if not any(_has_pattern(out_dir, pattern) for pattern in group):
             return False
     return True

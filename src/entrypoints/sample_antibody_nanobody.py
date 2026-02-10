@@ -449,7 +449,11 @@ def process_file(
 
 
 def preprocess_csv_and_pkl(args, output_dir: str) -> str:
-    """Process PDB files and generate pkl and metadata CSV."""
+    """Process PDB files and generate pkl and metadata CSV.
+
+    Important: This must be safe under concurrent pipeline workers. We therefore write the
+    metadata CSV atomically (tmp + replace) instead of appending.
+    """
     csv_path = os.path.join(output_dir, f"{args.name}_input.csv")
 
     antigen_chains = parse_chain_list(args.antigen_chain)
@@ -470,13 +474,15 @@ def preprocess_csv_and_pkl(args, output_dir: str) -> str:
         input_info["light_chain"] = args.light_chain
 
     sample_ids = _resolve_sample_ids(args.sample_ids, args.samples_per_target)
-    for idx, sample_id in enumerate(sample_ids):
-        metadata = process_file(
-            input_info, write_dir=output_dir, sample_id=sample_id
-        )
-        metadata_df = pd.DataFrame([metadata])
-        header = False if idx > 0 else True
-        metadata_df.to_csv(csv_path, index=False, mode="a", header=header)
+    rows = []
+    for sample_id in sample_ids:
+        metadata = process_file(input_info, write_dir=output_dir, sample_id=sample_id)
+        rows.append(metadata)
+
+    # Atomic write to avoid partial/corrupted CSVs during crashes or multi-rank runs.
+    tmp = f"{csv_path}.tmp"
+    pd.DataFrame(rows).to_csv(tmp, index=False)
+    os.replace(tmp, csv_path)
 
     return csv_path
 
@@ -494,12 +500,22 @@ def run_pipeline(args):
         random.seed(args.seed)
         np.random.seed(args.seed)
 
-    # Preprocessing stage
+    rank = int(os.environ.get("RANK", "0") or 0)
+
+    # Preprocessing stage (optional)
     input_data_dir = os.path.join(output_dir, "input")
     os.makedirs(input_data_dir, exist_ok=True)
-    processed_csv_path = preprocess_csv_and_pkl(
-        args=args, output_dir=input_data_dir
-    )
+    if getattr(args, "skip_preprocess", False):
+        processed_csv_path = args.input_csv
+        if not processed_csv_path:
+            raise ValueError("--skip_preprocess requires --input_csv")
+        if not os.path.exists(processed_csv_path):
+            raise FileNotFoundError(f"input_csv not found: {processed_csv_path}")
+    else:
+        processed_csv_path = preprocess_csv_and_pkl(args=args, output_dir=input_data_dir)
+        if getattr(args, "preprocess_only", False):
+            print(f"Preprocess-only complete: {processed_csv_path}")
+            return
 
     # Load and update configuration
     conf = ConfigManager(args.config)
@@ -529,11 +545,11 @@ def run_pipeline(args):
         },
     }
     conf.update_config(update_configs)
-    os.makedirs(f"{args.output_dir}/yaml", exist_ok=True)
-    config_save_path = os.path.join(
-        output_dir, f"yaml/antibody_sample_config_{args.name}.yml"
-    )
-    conf.save_config(config_save_path)
+    # Shared artifact: only rank0 writes (avoid last-writer-wins across distributed workers).
+    if rank == 0:
+        os.makedirs(f"{args.output_dir}/yaml", exist_ok=True)
+        config_save_path = os.path.join(output_dir, f"yaml/antibody_sample_config_{args.name}.yml")
+        conf.save_config(config_save_path)
 
     # Initialize model
     print("\nInitializing model...")
@@ -581,15 +597,18 @@ def run_pipeline(args):
             except Exception:
                 pass
 
-    _write_progress(0, "running")
-    t = threading.Thread(target=_progress_loop, daemon=True)
-    t.start()
+    # Shared artifact: only rank0 writes progress.
+    if rank == 0:
+        _write_progress(0, "running")
+        t = threading.Thread(target=_progress_loop, daemon=True)
+        t.start()
     try:
         exp.test()
     finally:
-        stop_event.set()
-        t.join(timeout=1.0)
-        _write_progress(_count_outputs(), "completed")
+        if rank == 0:
+            stop_event.set()
+            t.join(timeout=1.0)
+            _write_progress(_count_outputs(), "completed")
 
     t2 = time.time()
     print(f"Sample finished in {round(t2 - t1, 2)} seconds")
@@ -674,6 +693,21 @@ def get_parser():
         help="Comma-separated sample ids to generate (overrides samples_per_target)",
     )
     parser.add_argument(
+        "--input_csv",
+        type=str,
+        help="Preprocessed CSV path (used with --skip_preprocess).",
+    )
+    parser.add_argument(
+        "--preprocess_only",
+        action="store_true",
+        help="Run preprocessing (input CSV + PKLs) and exit.",
+    )
+    parser.add_argument(
+        "--skip_preprocess",
+        action="store_true",
+        help="Skip preprocessing; require --input_csv.",
+    )
+    parser.add_argument(
         "--seed",
         type=int,
         help="Random seed for reproducibility",
@@ -699,15 +733,12 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     # Validate input files
-    assert os.path.exists(
-        args.antigen_pdb
-    ), f"Antigen PDB file not found: {args.antigen_pdb}"
-    assert os.path.exists(
-        args.config
-    ), f"Config file not found: {args.config}"
-    assert os.path.exists(
-        args.model_weights
-    ), f"Model weights file not found: {args.model_weights}"
+    assert os.path.exists(args.antigen_pdb), f"Antigen PDB file not found: {args.antigen_pdb}"
+    assert os.path.exists(args.config), f"Config file not found: {args.config}"
+    assert os.path.exists(args.model_weights), f"Model weights file not found: {args.model_weights}"
+    if getattr(args, "skip_preprocess", False):
+        assert args.input_csv, "--skip_preprocess requires --input_csv"
+        assert os.path.exists(args.input_csv), f"input_csv not found: {args.input_csv}"
 
     antigen_chains = parse_chain_list(args.antigen_chain)
     hotspots_spec = resolve_hotspots_input(
