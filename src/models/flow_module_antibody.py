@@ -5,6 +5,7 @@ import os
 import logging
 import re
 import socket
+import tempfile
 import torch.distributed as dist
 import pandas as pd
 
@@ -87,10 +88,10 @@ class FlowModule(LightningModule):
     def _infer_item_id_from_pdb_path(self, pdb_path: str) -> str | None:
         name = os.path.splitext(os.path.basename(str(pdb_path)))[0]
         # Expected: <name>_antigen_antibody_sample_<id>
-        m = re.search(r"sample_(\\d+)$", name)
+        m = re.search(r"sample_(\d+)$", name)
         if m:
             return m.group(1)
-        m = re.search(r"_(\\d+)$", name)
+        m = re.search(r"_(\d+)$", name)
         if m:
             return m.group(1)
         return None
@@ -248,13 +249,37 @@ class FlowModule(LightningModule):
                     residue_index=res_idx[i] if res_idx is not None else None,
                 )
             reference_pdb = self._exp_cfg.framework_pdb
-            output_pdb = os.path.join(
-                save_dir, f"sample{batch_idx}_filtered.pdb"
-            )
-
-            filter_pdb_by_bfactor(pdb_path, output_pdb)
-            rmsd = calc_rmsd(output_pdb, reference_pdb)
-            has_clash = detect_backbone_clash(pdb_path)
+            # NOTE: output_pdb must be unique per-process. Using batch_idx here is unsafe under
+            # distributed/batched inference because batch_idx is local to each worker and will
+            # collide across ranks, causing intermittent FileNotFoundError / wrong RMSD inputs.
+            output_pdb = None
+            try:
+                pdb_stem = os.path.splitext(os.path.basename(pdb_path))[0]
+                tmp = tempfile.NamedTemporaryFile(
+                    prefix=f"{pdb_stem}_filtered_",
+                    suffix=".pdb",
+                    dir=save_dir,
+                    delete=False,
+                )
+                output_pdb = tmp.name
+                tmp.close()
+                filter_pdb_by_bfactor(pdb_path, output_pdb)
+                rmsd = calc_rmsd(output_pdb, reference_pdb)
+                has_clash = detect_backbone_clash(pdb_path)
+            except Exception as exc:
+                # Treat as a failed attempt, clean up intermediates, and try again.
+                print(f"Attempt {attempt}: filtering/RMSD failed: {exc}")
+                try:
+                    if os.path.exists(pdb_path):
+                        os.remove(pdb_path)
+                except Exception:
+                    pass
+                try:
+                    if output_pdb and os.path.exists(output_pdb):
+                        os.remove(output_pdb)
+                except Exception:
+                    pass
+                continue
 
             if rmsd < 1 and not has_clash:
                 test_metric["sample"] = os.path.basename(pdb_path)
@@ -305,7 +330,36 @@ class FlowModule(LightningModule):
 
                 ledger = self._get_metrics_ledger()
                 if ledger is not None:
-                    item_id = self._infer_item_id_from_pdb_path(pdb_path) or str(batch_idx)
+                    # IMPORTANT: use the dataset-provided sample id when available.
+                    # batch_idx is the *position within this dataloader*, which may not equal the
+                    # logical sample id when we pass --sample_ids overrides (e.g., [5,6,7,8,9]).
+                    # Using batch_idx as the ledger key causes cross-worker collisions and corrupt
+                    # sample_metrics.csv exports.
+                    item_id = None
+                    try:
+                        sample_ids = None
+                        if isinstance(batch, dict):
+                            sample_ids = batch.get("sample_ids")
+                            if sample_ids is None:
+                                sample_ids = batch.get("original_index")
+                        sid_i = None
+                        if sample_ids is not None:
+                            try:
+                                sid_i = sample_ids[i]
+                            except Exception:
+                                sid_i = sample_ids
+                        if sid_i is not None:
+                            sid_val = sid_i
+                            item = getattr(sid_val, "item", None)
+                            if callable(item):
+                                sid_val = item()
+                            item_id = str(int(sid_val))
+                    except Exception:
+                        item_id = None
+                    if not item_id:
+                        item_id = self._infer_item_id_from_pdb_path(pdb_path)
+                    if not item_id:
+                        item_id = str(batch_idx)
                     # Store required downstream columns in metrics (pdb_path, cdr_interface_ratio, ...).
                     ledger.upsert(
                         item_id,

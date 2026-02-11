@@ -725,6 +725,21 @@ class SeqDesignStep(ExternalCommandStep):
                 else:
                     if "cdr_interface_ratio" not in df.columns or "pdb_path" not in df.columns:
                         df = None
+                    else:
+                        # If sample_metrics.csv has duplicate pdb_path rows, it's likely corrupt (e.g. bad
+                        # metrics ledger keying). Treat it as unusable and fall back to recomputing the
+                        # metric directly from on-disk PDBs to avoid staging/name collisions downstream.
+                        try:
+                            if df["pdb_path"].duplicated().any():
+                                step_label = str(self.cfg.get("name") or self.name)
+                                print(
+                                    f"[{step_label}] WARN duplicate pdb_path rows in {metrics_path}; "
+                                    "recomputing cdr_interface_ratio from PDBs.",
+                                    flush=True,
+                                )
+                                df = None
+                        except Exception:
+                            pass
 
             if df is not None:
                 try:
@@ -734,6 +749,7 @@ class SeqDesignStep(ExternalCommandStep):
                 if df.empty:
                     raise StepError("No backbones pass cdr_interface_ratio >= 0.6")
                 filtered: list[Path] = []
+                seen: set[str] = set()
                 for path_val in df["pdb_path"].tolist():
                     if not path_val:
                         continue
@@ -748,15 +764,27 @@ class SeqDesignStep(ExternalCommandStep):
                             alt = input_dir / cand.name
                             if alt.exists():
                                 cand = alt
+                        key = str(cand.resolve())
+                        if key in seen:
+                            continue
+                        seen.add(key)
                         filtered.append(cand)
                         continue
                     # Fallback for moved outputs: try input_dir/<name>.pdb
                     alt = input_dir / Path(str(path_val)).name
                     if alt.exists():
+                        key = str(alt.resolve())
+                        if key in seen:
+                            continue
+                        seen.add(key)
                         filtered.append(alt)
                         continue
                     alt = input_dir / f"{Path(str(path_val)).stem}.pdb"
                     if alt.exists():
+                        key = str(alt.resolve())
+                        if key in seen:
+                            continue
+                        seen.add(key)
                         filtered.append(alt)
                 if not filtered:
                     raise StepError("No backbone PDBs found after cdr_interface_ratio prefilter")
