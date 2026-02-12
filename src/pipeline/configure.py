@@ -238,11 +238,18 @@ def _auto_rename_framework(input_data: dict, out_dir: Path) -> dict:
     return out
 
 
-def _resolve_binder_chain(input_data: dict) -> str:
+def _resolve_flowpacker_chains(input_data: dict) -> str:
     protocol = input_data.get("protocol")
     if protocol in {"antibody", "vhh"}:
         framework = input_data.get("framework") or {}
-        return str(framework.get("heavy_chain") or "A")
+        heavy = str(framework.get("heavy_chain") or "A").strip() or "A"
+        if protocol == "antibody":
+            light = str(framework.get("light_chain") or "").strip()
+            chains = [heavy]
+            if light and light not in chains:
+                chains.append(light)
+            return ",".join(chains)
+        return heavy
     return str(input_data.get("binder_chain") or "A")
 
 
@@ -266,7 +273,7 @@ def _apply_default_command(
         if not script.exists():
             return
         run_dir = out_dir / "output"
-        binder_chain = _resolve_binder_chain(input_data)
+        binder_chain = _resolve_flowpacker_chains(input_data)
         num_jobs = int(os.environ.get("PPIFLOW_FLOWPACKER_JOBS", "1"))
         if step_name == "flowpacker1":
             input_pdb_dir = run_dir / "backbones"

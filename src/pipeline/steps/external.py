@@ -1618,6 +1618,38 @@ class FlowPackerStep(ExternalCommandStep):
                     out[token.lstrip("-")] = cmd[idx + 1]
         return out
 
+    def _parse_chain_list(self, value: Any) -> list[str]:
+        if value is None:
+            return []
+        chains: list[str] = []
+        for token in str(value).split(","):
+            chain = token.strip()
+            if not chain:
+                continue
+            if chain not in chains:
+                chains.append(chain)
+        return chains
+
+    def _validate_flowpacker_chain_config(self, ctx: StepContext, cfg: dict) -> None:
+        if str(ctx.input_data.get("protocol") or "") != "antibody":
+            return
+        framework = ctx.input_data.get("framework") or {}
+        heavy = str(framework.get("heavy_chain") or "A").strip() or "A"
+        light = str(framework.get("light_chain") or "").strip()
+        expected = [heavy] + ([light] if light else [])
+        configured = self._parse_chain_list(cfg.get("binder_chain"))
+        missing = [chain for chain in expected if chain not in configured]
+        if missing:
+            expected_str = ",".join(expected)
+            got_str = ",".join(configured) if configured else "(unset)"
+            if len(expected) > 1:
+                msg = (
+                    "FlowPacker antibody configuration must include both heavy and light chains in --binder_chain. "
+                )
+            else:
+                msg = "FlowPacker antibody configuration must include the required binder chain in --binder_chain. "
+            raise StepError(f"{msg}Expected '{expected_str}', got '{got_str}'.")
+
     def _resolve_path(self, ctx: StepContext, value: str | None) -> Path | None:
         if not value:
             return None
@@ -1709,6 +1741,7 @@ class FlowPackerStep(ExternalCommandStep):
 
     def list_items(self, ctx: StepContext, *, readonly: bool = False) -> list[WorkItem]:
         cfg = self._flowpacker_config()
+        self._validate_flowpacker_chain_config(ctx, cfg)
         input_pdb_dir = self._resolve_path(ctx, cfg.get("input_pdb_dir")) if cfg else None
         seq_fasta_dir = self._resolve_path(ctx, cfg.get("seq_fasta_dir")) if cfg else None
         if not input_pdb_dir or not input_pdb_dir.exists():
@@ -2728,34 +2761,113 @@ class AF3ScoreStep(ExternalCommandStep):
 
         commit_poll = float((ctx.work_queue or {}).get("af3score_commit_poll_s", 5.0) or 5.0)
         commit_batch = int((ctx.work_queue or {}).get("af3score_commit_batch", 25) or 25)
-        stop_evt = threading.Event()
+        infra_retries = int((ctx.work_queue or {}).get("af3score_infra_retries", 1) or 1)
+        infra_retry_sleep_s = float((ctx.work_queue or {}).get("af3score_infra_retry_sleep_s", 2.0) or 2.0)
 
-        def _commit_loop() -> None:
-            while not stop_evt.wait(commit_poll):
+        def _tail_log_bytes(path: str | None, *, max_bytes: int = 20000) -> str:
+            if not path:
+                return ""
+            try:
+                p = Path(str(path))
+                if not p.exists():
+                    return ""
+                with p.open("rb") as handle:
+                    handle.seek(0, os.SEEK_END)
+                    size = handle.tell()
+                    handle.seek(max(size - max_bytes, 0))
+                    data = handle.read()
+                return data.decode(errors="ignore")
+            except Exception:
+                return ""
+
+        def _is_infra_failure(exc: Exception, log_tail: str) -> bool:
+            text = (str(exc) + "\n" + str(log_tail)).lower()
+            signatures = [
+                "couldn't get temp cubin file name",
+                "no space left on device",
+                "disk quota exceeded",
+                "too many open files",
+                "fatal python error: aborted",
+                "gemm_fusion_autotuner",
+                "xla/service/gpu/autotuning",
+            ]
+            if any(sig in text for sig in signatures):
+                return True
+            if isinstance(exc, subprocess.CalledProcessError):
+                # Negative return codes correspond to signals (e.g. SIGABRT).
+                if int(getattr(exc, "returncode", 0) or 0) < 0:
+                    return True
+            return False
+
+        def _wipe_batch_outputs() -> None:
+            # Keep input_pdbs; wipe everything else so a retry starts fresh.
+            for key in [
+                "af3_input_batch",
+                "single_chain_cif",
+                "json",
+                "jax",
+                "af3score_outputs",
+                "af3score_subprocess_logs",
+                "progress.json",
+                "metrics.csv",
+            ]:
+                p = batch_dir / key
                 try:
-                    _scan_batch_outputs(max_per_pass=commit_batch)
+                    if p.is_dir():
+                        shutil.rmtree(p, ignore_errors=True)
+                    elif p.exists():
+                        p.unlink()
                 except Exception:
                     pass
 
-        commit_thread = threading.Thread(target=_commit_loop, daemon=True)
-        commit_thread.start()
-
         err: str | None = None
-        if valid_items:
+        last_exc: Exception | None = None
+        for attempt_idx in range(max(infra_retries, 0) + 1):
+            stop_evt = threading.Event()
+
+            def _commit_loop() -> None:
+                while not stop_evt.wait(commit_poll):
+                    try:
+                        _scan_batch_outputs(max_per_pass=commit_batch)
+                    except Exception:
+                        pass
+
+            commit_thread = threading.Thread(target=_commit_loop, daemon=True)
+            commit_thread.start()
             try:
-                run_command(
-                    cmd,
-                    env=os.environ.copy(),
-                    cwd=str(batch_dir),
-                    log_file=self.cfg.get("_log_file"),
-                    verbose=bool(self.cfg.get("_verbose")),
-                )
+                if attempt_idx > 0:
+                    # Reduce stampede: stagger retries across ranks.
+                    time.sleep(max(0.0, infra_retry_sleep_s) + float(ctx.local_rank or 0) * 0.5)
+                    _wipe_batch_outputs()
+                if valid_items:
+                    run_command(
+                        cmd,
+                        env=os.environ.copy(),
+                        cwd=str(batch_dir),
+                        log_file=self.cfg.get("_log_file"),
+                        verbose=bool(self.cfg.get("_verbose")),
+                    )
+                err = None
+                last_exc = None
             except Exception as exc:
                 err = str(exc)
-
-        stop_evt.set()
-        commit_thread.join(timeout=2.0)
-        _scan_batch_outputs()
+                last_exc = exc
+            finally:
+                stop_evt.set()
+                commit_thread.join(timeout=2.0)
+                _scan_batch_outputs()
+            if err is None:
+                break
+            log_tail = _tail_log_bytes(self.cfg.get("_log_file"))
+            if last_exc is not None and _is_infra_failure(last_exc, log_tail) and attempt_idx < max(infra_retries, 0):
+                step_label = str(self.cfg.get("name") or self.name)
+                print(
+                    f"[{step_label}] WARN batch subprocess failed with infra-like error; retrying "
+                    f"({attempt_idx + 1}/{max(infra_retries, 0) + 1}).",
+                    flush=True,
+                )
+                continue
+            break
 
         # Fallback: if wrapper metrics.csv exists, backfill missing ledger rows.
         metrics_src = batch_dir / "metrics.csv"
@@ -2829,6 +2941,28 @@ class AF3ScoreStep(ExternalCommandStep):
                     source = _job_source(job_dir, run_stem)
                     if source is not None:
                         _promote_cif_for_source(source, item)
+
+        # If a batched run crashed, try to salvage by falling back to per-item runs
+        # for any remaining missing items. This reduces blast radius for batch-level
+        # failures and makes transient infra issues self-healing.
+        fallback_enabled = bool((ctx.work_queue or {}).get("af3score_fallback_per_item", True))
+        if fallback_enabled and err is not None:
+            missing = [
+                item
+                for item in valid_items
+                if item.id not in forced_failed and not self.item_done(ctx, item)
+            ]
+            if missing:
+                step_label = str(self.cfg.get("name") or self.name)
+                print(
+                    f"[{step_label}] WARN batch failed; attempting per-item fallback for {len(missing)} items.",
+                    flush=True,
+                )
+                for item in missing:
+                    try:
+                        self.run_item(ctx, item)
+                    except Exception as exc:
+                        forced_failed.setdefault(item.id, f"per-item fallback failed: {exc}")
 
         all_done = all(self.item_done(ctx, item) for item in valid_items)
         if all_done:

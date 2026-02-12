@@ -225,12 +225,20 @@ class Step:
         meta_dir: Optional[Path] = None,
         items: Optional[list[Any]] = None,
     ) -> bool:
+        from ..state import canonicalize_tool_versions
+
         if not meta:
             return False
         current = self._work_queue_meta(ctx)
         for key in ("input_sha256", "tool_versions", "config_sha256"):
             if key in meta and current.get(key) is not None:
-                if meta.get(key) != current.get(key):
+                if key == "tool_versions":
+                    meta_val = canonicalize_tool_versions(meta.get(key))
+                    current_val = canonicalize_tool_versions(current.get(key))
+                else:
+                    meta_val = meta.get(key)
+                    current_val = current.get(key)
+                if meta_val != current_val:
                     self._warn(f"output metadata mismatch for {key}")
                     return False
         if items is not None:
@@ -470,13 +478,13 @@ class Step:
                 pass
 
     def _work_queue_meta(self, ctx: StepContext) -> dict:
+        from ..state import canonicalize_tool_versions, sha256_file
+
         job = (ctx.state or {}).get("job") or {}
         config_path = self.cfg.get("config_path")
         config_sha = None
         if config_path:
             try:
-                from ..state import sha256_file
-
                 p = Path(str(config_path))
                 if not p.is_absolute():
                     p = ctx.out_dir / p
@@ -486,7 +494,7 @@ class Step:
                 config_sha = None
         return {
             "input_sha256": job.get("input_sha256"),
-            "tool_versions": job.get("tool_versions"),
+            "tool_versions": canonicalize_tool_versions(job.get("tool_versions")),
             "config_path": str(config_path) if config_path else None,
             "config_sha256": config_sha,
         }

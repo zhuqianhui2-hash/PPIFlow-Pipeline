@@ -325,6 +325,8 @@ class WorkQueue:
             conn.close()
 
     def _validate_or_write_meta(self, meta: Dict[str, Any]) -> None:
+        from .state import canonicalize_tool_versions
+
         existing = self._read_meta()
         if not existing:
             self._write_meta(meta)
@@ -333,7 +335,12 @@ class WorkQueue:
         for key, value in meta.items():
             if key not in existing:
                 continue
-            if existing.get(key) != value:
+            existing_val = existing.get(key)
+            incoming_val = value
+            if key == "tool_versions":
+                existing_val = canonicalize_tool_versions(existing_val)
+                incoming_val = canonicalize_tool_versions(incoming_val)
+            if existing_val != incoming_val:
                 mismatched[key] = {"existing": existing.get(key), "incoming": value}
         if mismatched:
             if self.allow_reuse:

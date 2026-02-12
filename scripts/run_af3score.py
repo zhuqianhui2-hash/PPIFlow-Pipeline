@@ -37,6 +37,135 @@ def _quiet_enabled() -> bool:
     return value.strip().lower() in {"1", "true", "yes"}
 
 
+def _maybe_raise_nofile(*, desired: int = 65535) -> None:
+    """
+    Best-effort ulimit bump.
+
+    JAX/XLA/compilation can touch lots of files; low RLIMIT_NOFILE can cause
+    confusing I/O errors. We only bump the soft limit up to hard.
+    """
+    try:
+        import resource  # Unix only
+
+        soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+        if hard is None or soft is None:
+            return
+        target = int(desired)
+        # If hard is "infinity", keep it and just raise soft to desired.
+        if hard != resource.RLIM_INFINITY:
+            target = min(target, int(hard))
+        if target > int(soft):
+            resource.setrlimit(resource.RLIMIT_NOFILE, (target, hard))
+    except Exception:
+        return
+
+
+def _fs_free(path: Path) -> tuple[int | None, int | None]:
+    try:
+        st = os.statvfs(str(path))
+        free_bytes = int(st.f_bavail) * int(st.f_frsize)
+        free_inodes = int(getattr(st, "f_favail", 0) or 0)
+        return free_bytes, free_inodes
+    except Exception:
+        return None, None
+
+
+def _can_use_dir(path: Path, *, min_bytes: int, min_inodes: int) -> bool:
+    try:
+        path.mkdir(parents=True, exist_ok=True)
+        test = path / f".ppiflow_tmp_test_{os.getpid()}"
+        test.write_text("x")
+        test.unlink()
+    except Exception:
+        return False
+    free_bytes, free_inodes = _fs_free(path)
+    if free_bytes is not None and free_bytes < int(min_bytes):
+        return False
+    if free_inodes is not None and free_inodes > 0 and free_inodes < int(min_inodes):
+        return False
+    return True
+
+
+def _pick_runtime_dir(candidates: list[Path], *, min_bytes: int, min_inodes: int) -> Path:
+    for cand in candidates:
+        if _can_use_dir(cand, min_bytes=min_bytes, min_inodes=min_inodes):
+            return cand
+    # Fall back to first candidate even if it doesn't meet thresholds.
+    if candidates:
+        try:
+            candidates[0].mkdir(parents=True, exist_ok=True)
+        except Exception:
+            pass
+        return candidates[0]
+    return Path("/tmp")
+
+
+def _configure_runtime_env(env: dict, *, output_dir: Path) -> None:
+    """
+    Ensure JAX/XLA temp files and caches land on a writable filesystem.
+
+    Default behavior is to place runtime dirs under the wrapper output_dir
+    (which is already under pipeline scratch). Users shouldn't need to set TMPDIR.
+    """
+    rank = os.environ.get("RANK") or "0"
+    local_rank = os.environ.get("LOCAL_RANK") or "0"
+    tag = f"rank{rank}_local{local_rank}_pid{os.getpid()}"
+
+    # Conservative thresholds; we only use these to choose among candidates.
+    try:
+        min_gb = float(os.environ.get("PPIFLOW_AF3SCORE_TMP_MIN_GB", "1") or 1)
+    except Exception:
+        min_gb = 1.0
+    try:
+        min_inodes = int(os.environ.get("PPIFLOW_AF3SCORE_TMP_MIN_INODES", "10000") or 10000)
+    except Exception:
+        min_inodes = 10000
+    min_bytes = int(max(min_gb, 0.0) * (1024**3))
+
+    base = output_dir / "_runtime"
+    tmp_default = base / "tmp" / tag
+    cache_default = base / "cache" / tag
+
+    tmp_candidates = [
+        Path(str(env.get("TMPDIR") or "")) if env.get("TMPDIR") else None,
+        tmp_default,
+        Path("/tmp") / f"ppiflow_af3_tmp_{tag}",
+    ]
+    tmp_candidates = [p for p in tmp_candidates if p]
+    tmp_dir = _pick_runtime_dir(list(tmp_candidates), min_bytes=min_bytes, min_inodes=min_inodes)
+
+    cache_candidates = [
+        Path(str(env.get("XDG_CACHE_HOME") or "")) if env.get("XDG_CACHE_HOME") else None,
+        cache_default,
+        Path("/tmp") / f"ppiflow_af3_cache_{tag}",
+    ]
+    cache_candidates = [p for p in cache_candidates if p]
+    cache_dir = _pick_runtime_dir(list(cache_candidates), min_bytes=0, min_inodes=0)
+    cuda_cache_dir = cache_dir / "cuda"
+    jax_cache_dir = cache_dir / "jax"
+
+    try:
+        cuda_cache_dir.mkdir(parents=True, exist_ok=True)
+        jax_cache_dir.mkdir(parents=True, exist_ok=True)
+    except Exception:
+        pass
+
+    # Always set these for reliability; they are cheap no-ops if unused.
+    env["TMPDIR"] = str(tmp_dir)
+    env["TMP"] = str(tmp_dir)
+    env["TEMP"] = str(tmp_dir)
+    env["XDG_CACHE_HOME"] = str(cache_dir)
+    env.setdefault("CUDA_CACHE_PATH", str(cuda_cache_dir))
+    env.setdefault("JAX_COMPILATION_CACHE_DIR", str(jax_cache_dir))
+
+    # Fail-closed if tmp is obviously broken; better error than XLA SIGABRT.
+    free_bytes, free_inodes = _fs_free(tmp_dir)
+    if free_bytes is not None and free_bytes < 50 * 1024 * 1024:
+        raise RuntimeError(f"TMPDIR has <50MB free: {tmp_dir}")
+    if free_inodes is not None and free_inodes > 0 and free_inodes < 1000:
+        raise RuntimeError(f"TMPDIR has <1000 free inodes: {tmp_dir}")
+
+
 def _run_cmd(cmd: list[str], *, env: dict, log_path: Path | None = None, cwd: str | None = None) -> None:
     if log_path is None:
         subprocess.check_call(cmd, env=env, cwd=cwd)
@@ -333,6 +462,8 @@ def main() -> None:
 
     python_cmd = _resolve_python_cmd()
     env = os.environ.copy()
+    _maybe_raise_nofile(desired=int(os.environ.get("PPIFLOW_AF3SCORE_NOFILE", "65535") or 65535))
+    _configure_runtime_env(env, output_dir=output_dir)
     # Force quiet featurisation logging in AF3Score via sitecustomize.
     patch_dir = (Path(__file__).resolve().parent / "af3score_sitecustomize")
     if patch_dir.exists():

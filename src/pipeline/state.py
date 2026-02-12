@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import time
+from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, Optional
@@ -49,6 +50,44 @@ def collect_tool_versions(tools: dict) -> dict:
     for key, path in (tools or {}).items():
         versions[key] = _tool_stamp(path)
     return versions
+
+
+def canonicalize_tool_versions(tool_versions: Any) -> dict:
+    """
+    Return a stable comparison form for tool metadata.
+
+    Tool stamps may include volatile fields like mtime/size that change without
+    meaningfully changing the tool identity. Reuse checks should compare the
+    canonical shape instead of raw stamps.
+
+    Malformed legacy metadata should not crash callers; return a deterministic
+    sentinel shape so comparisons fail safely.
+    """
+    canonical: dict[str, Any] = {}
+    if tool_versions is None:
+        return canonical
+    if not isinstance(tool_versions, Mapping):
+        return {"__raw_tool_versions__": tool_versions}
+    for key, value in tool_versions.items():
+        if isinstance(value, Mapping):
+            entry: dict[str, Any] = {}
+            if "path" in value:
+                entry["path"] = value.get("path")
+            if "exists" in value:
+                entry["exists"] = value.get("exists")
+            # Prefer content hash when available (files).
+            if "sha256" in value:
+                entry["sha256"] = value.get("sha256")
+            # Preserve non-stamp keys for future extensibility.
+            for extra_key, extra_val in value.items():
+                if extra_key in {"path", "exists", "sha256", "mtime", "size", "ctime", "atime"}:
+                    continue
+                entry[extra_key] = extra_val
+            canonical[str(key)] = entry
+        else:
+            # Legacy/simple forms (e.g. {"tool": "1.0"}) are compared as-is.
+            canonical[str(key)] = value
+    return canonical
 
 
 def load_state(path: str | Path) -> Optional[dict]:
