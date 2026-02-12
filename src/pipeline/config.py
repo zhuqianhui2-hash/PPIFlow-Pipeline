@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, Iterable
@@ -228,9 +229,22 @@ def normalize_input(
         if candidate:
             tools["dockq_bin"] = resolve_optional_path(candidate, base_dir=base_dir)
         else:
-            local = _ROOT / "assets" / "external" / "DockQ" / "DockQ.py"
-            if local.exists():
-                tools["dockq_bin"] = str(local)
+            # Support both legacy and current DockQ repository layouts.
+            local_candidates = [
+                _ROOT / "assets" / "external" / "DockQ" / "DockQ.py",
+                _ROOT / "assets" / "external" / "DockQ" / "src" / "DockQ" / "DockQ.py",
+            ]
+            for local in local_candidates:
+                if local.exists():
+                    tools["dockq_bin"] = str(local)
+                    break
+            if not tools.get("dockq_bin"):
+                # Final fallback: use PATH entrypoints from pip/conda installs.
+                for exe_name in ("DockQ", "dockq"):
+                    exe = shutil.which(exe_name)
+                    if exe:
+                        tools["dockq_bin"] = str(Path(exe))
+                        break
 
     if not tools.get("rosetta_bin"):
         candidate = _ROOT / "assets" / "tools" / "rosetta_scripts"
