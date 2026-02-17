@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Any, Iterable, Optional
 
 from .run_lock import RunLockError, ensure_expected_lock_id, run_lock_disabled, validate_expected_lock_id
+from .sqlite_retry import run_with_lock_retry
 
 
 def _iso(ts: Optional[float] = None) -> str:
@@ -180,47 +181,48 @@ class MetricsLedger:
         attempt_i = int(attempt)
 
         conn = self.conn()
-        # Rely on busy_timeout, but add a short retry loop for transient "database is locked".
-        deadline = time.time() + 30.0
-        while True:
-            try:
-                conn.execute(
-                    """
-                    INSERT INTO metrics(
-                        item_id, design_id, structure_id, status, attempt,
-                        worker_id, error, updated_at, outputs_json, metrics_json
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                    ON CONFLICT(item_id) DO UPDATE SET
-                        design_id=excluded.design_id,
-                        structure_id=excluded.structure_id,
-                        status=excluded.status,
-                        attempt=excluded.attempt,
-                        worker_id=excluded.worker_id,
-                        error=excluded.error,
-                        updated_at=excluded.updated_at,
-                        outputs_json=excluded.outputs_json,
-                        metrics_json=excluded.metrics_json
-                    """,
-                    (
-                        item_id,
-                        design_id,
-                        structure_id,
-                        str(status),
-                        attempt_i,
-                        worker_id,
-                        error,
-                        now,
-                        outputs_json,
-                        metrics_json,
-                    ),
-                )
-                return
-            except sqlite3.OperationalError as exc:
-                msg = str(exc).lower()
-                if "locked" in msg and time.time() < deadline:
-                    time.sleep(0.1)
-                    continue
-                raise
+
+        def _upsert_once() -> None:
+            conn.execute(
+                """
+                INSERT INTO metrics(
+                    item_id, design_id, structure_id, status, attempt,
+                    worker_id, error, updated_at, outputs_json, metrics_json
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(item_id) DO UPDATE SET
+                    design_id=excluded.design_id,
+                    structure_id=excluded.structure_id,
+                    status=excluded.status,
+                    attempt=excluded.attempt,
+                    worker_id=excluded.worker_id,
+                    error=excluded.error,
+                    updated_at=excluded.updated_at,
+                    outputs_json=excluded.outputs_json,
+                    metrics_json=excluded.metrics_json
+                """,
+                (
+                    item_id,
+                    design_id,
+                    structure_id,
+                    str(status),
+                    attempt_i,
+                    worker_id,
+                    error,
+                    now,
+                    outputs_json,
+                    metrics_json,
+                ),
+            )
+
+        # Rely on busy_timeout, and retry transient lock/busy errors with bounded backoff.
+        run_with_lock_retry(
+            _upsert_once,
+            busy_timeout_ms=self.busy_timeout_ms,
+            minimum_seconds=2.5,
+            initial_sleep_s=0.02,
+            max_sleep_s=0.2,
+            jitter=True,
+        )
 
     def _decode_row(self, row: sqlite3.Row) -> LedgerRow:
         outputs: dict[str, Any] = {}

@@ -10,10 +10,11 @@ import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, Iterable, Optional
+from typing import Any, Callable, Dict, Iterable, Optional, TypeVar
 
 from .io import ensure_dir
 from .run_lock import RunLockError, ensure_expected_lock_id, fence_process, read_active_lock_id, run_lock_disabled
+from .sqlite_retry import run_with_lock_retry
 
 
 class WorkQueueError(RuntimeError):
@@ -41,6 +42,9 @@ class WaitResult:
     progress: Dict[str, Any] | None = None
     failed: bool = False
     complete: bool = False
+
+
+T = TypeVar("T")
 
 
 def _iso(ts: Optional[float] = None) -> str:
@@ -148,6 +152,46 @@ class WorkQueue:
         conn.execute(f"PRAGMA busy_timeout = {self.busy_timeout_ms}")
         return conn
 
+    def _run_db_write(
+        self,
+        fn: Callable[[sqlite3.Connection], T],
+        *,
+        begin_immediate: bool = False,
+        retry_kwargs: dict[str, Any] | None = None,
+    ) -> T:
+        def _attempt() -> T:
+            conn = self._connect()
+            tx_started = False
+            try:
+                if begin_immediate:
+                    conn.execute("BEGIN IMMEDIATE")
+                    tx_started = True
+                result = fn(conn)
+                if tx_started:
+                    conn.execute("COMMIT")
+                return result
+            except sqlite3.OperationalError:
+                if tx_started:
+                    try:
+                        conn.execute("ROLLBACK")
+                    except Exception:
+                        pass
+                raise
+            except Exception:
+                if tx_started:
+                    try:
+                        conn.execute("ROLLBACK")
+                    except Exception:
+                        pass
+                raise
+            finally:
+                conn.close()
+        return run_with_lock_retry(
+            _attempt,
+            busy_timeout_ms=self.busy_timeout_ms,
+            **(retry_kwargs or {}),
+        )
+
     def _drop_db_files(self) -> None:
         for suffix in ("", "-wal", "-shm"):
             path = Path(str(self.db_path) + suffix)
@@ -233,8 +277,7 @@ class WorkQueue:
 
     def _ensure_db(self) -> None:
         ensure_dir(self.base_dir)
-        conn = self._connect()
-        try:
+        def _ensure(conn: sqlite3.Connection) -> None:
             conn.execute(
                 """
                 CREATE TABLE IF NOT EXISTS items (
@@ -292,8 +335,7 @@ class WorkQueue:
             conn.execute("CREATE INDEX IF NOT EXISTS idx_items_status ON items(status)")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_items_updated ON items(updated_at)")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_claims_heartbeat ON claims(heartbeat_ts)")
-        finally:
-            conn.close()
+        self._run_db_write(_ensure, begin_immediate=True)
 
     def _read_meta(self) -> Dict[str, Any]:
         if not self.db_path.exists():
@@ -314,15 +356,13 @@ class WorkQueue:
             conn.close()
 
     def _write_meta(self, meta: Dict[str, Any]) -> None:
-        conn = self._connect()
-        try:
+        def _write(conn: sqlite3.Connection) -> None:
             for key, value in meta.items():
                 conn.execute(
                     "INSERT OR REPLACE INTO meta(key, value_json) VALUES (?, ?)",
                     (str(key), json.dumps(value, separators=(",", ":"))),
                 )
-        finally:
-            conn.close()
+        self._run_db_write(_write, begin_immediate=True)
 
     def _validate_or_write_meta(self, meta: Dict[str, Any]) -> None:
         from .state import canonicalize_tool_versions
@@ -431,77 +471,86 @@ class WorkQueue:
                 meta["items_hash"] = self._items_fingerprint(normalized)
             self._validate_or_write_meta(meta)
 
-            conn = self._connect()
-            try:
+            def _init_insert(conn: sqlite3.Connection) -> None:
                 # Serialize initial item insertion across ranks/workers. Without this, two workers can
                 # both observe COUNT(*) == 0 and concurrently INSERT, triggering UNIQUE violations.
-                conn.execute("BEGIN IMMEDIATE")
-                try:
-                    count = conn.execute("SELECT COUNT(*) AS c FROM items").fetchone()["c"]
-                    if count == 0:
-                        if not normalized:
-                            raise WorkQueueError(f"No work items provided for {self.step}")
-                        for item in normalized:
-                            payload = {
-                                "id": item.id,
-                                "payload": item.payload,
-                                "outputs": item.outputs or [],
-                            }
-                            conn.execute(
-                                """
-                                INSERT OR IGNORE INTO items(id, payload_json, status, attempts, last_error, updated_at)
-                                VALUES (?, ?, 'pending', 0, NULL, ?)
-                                """,
-                                (item.id, json.dumps(payload, separators=(",", ":")), _iso()),
-                            )
-                    else:
-                        if normalized:
-                            incoming_hash = self._items_fingerprint(normalized)
-                            existing_meta = self._read_meta()
-                            existing_hash = existing_meta.get("items_hash")
-                            if existing_hash and incoming_hash != existing_hash:
-                                if self.allow_reuse:
-                                    _warn(
-                                        f"items hash mismatch for {self.step}: existing={existing_hash} incoming={incoming_hash}"
-                                    )
-                                else:
-                                    raise WorkQueueError(
-                                        "Work queue items hash mismatch for "
-                                        f"{self.step}: existing={existing_hash} incoming={incoming_hash}"
-                                    )
-                    conn.execute("COMMIT")
-                except Exception:
-                    try:
-                        conn.execute("ROLLBACK")
-                    except Exception:
-                        pass
-                    raise
-            finally:
-                conn.close()
+                count = conn.execute("SELECT COUNT(*) AS c FROM items").fetchone()["c"]
+                if count == 0:
+                    if not normalized:
+                        raise WorkQueueError(f"No work items provided for {self.step}")
+                    for item in normalized:
+                        payload = {
+                            "id": item.id,
+                            "payload": item.payload,
+                            "outputs": item.outputs or [],
+                        }
+                        conn.execute(
+                            """
+                            INSERT OR IGNORE INTO items(id, payload_json, status, attempts, last_error, updated_at)
+                            VALUES (?, ?, 'pending', 0, NULL, ?)
+                            """,
+                            (item.id, json.dumps(payload, separators=(",", ":")), _iso()),
+                        )
+                else:
+                    if normalized:
+                        incoming_hash = self._items_fingerprint(normalized)
+                        existing_meta = self._read_meta()
+                        existing_hash = existing_meta.get("items_hash")
+                        if existing_hash and incoming_hash != existing_hash:
+                            if self.allow_reuse:
+                                _warn(
+                                    f"items hash mismatch for {self.step}: existing={existing_hash} incoming={incoming_hash}"
+                                )
+                            else:
+                                raise WorkQueueError(
+                                    "Work queue items hash mismatch for "
+                                    f"{self.step}: existing={existing_hash} incoming={incoming_hash}"
+                                )
+            self._run_db_write(_init_insert, begin_immediate=True)
 
             if rebuild and item_done_fn is not None:
                 # Mark done items based on existing outputs.
                 conn = self._connect()
                 try:
                     rows = conn.execute("SELECT id, payload_json FROM items").fetchall()
-                    for row in rows:
-                        item_id = row["id"]
-                        payload_json = row["payload_json"] or "{}"
-                        try:
-                            payload = json.loads(payload_json)
-                        except Exception:
-                            payload = {}
-                        work_item = WorkItem(id=item_id, payload=dict(payload.get("payload") or {}))
-                        try:
-                            if item_done_fn(work_item):
-                                conn.execute(
-                                    "UPDATE items SET status='done', attempts=0, last_error=NULL, updated_at=? WHERE id=?",
-                                    (_iso(), item_id),
-                                )
-                        except Exception:
-                            continue
                 finally:
                     conn.close()
+                done_ids: list[str] = []
+                for row in rows:
+                    item_id = row["id"]
+                    payload_json = row["payload_json"] or "{}"
+                    try:
+                        payload = json.loads(payload_json)
+                    except Exception:
+                        payload = {}
+                    work_item = WorkItem(id=item_id, payload=dict(payload.get("payload") or {}))
+                    try:
+                        if item_done_fn(work_item):
+                            done_ids.append(str(item_id))
+                    except Exception:
+                        continue
+                if done_ids:
+                    now = _iso()
+
+                    def _mark_done_existing(conn: sqlite3.Connection) -> None:
+                        for idx in range(0, len(done_ids), 200):
+                            chunk = done_ids[idx : idx + 200]
+                            placeholders = ",".join("?" for _ in chunk)
+                            conn.execute(
+                                f"UPDATE items SET status='done', attempts=0, last_error=NULL, updated_at=? WHERE id IN ({placeholders})",
+                                (now, *chunk),
+                            )
+
+                    self._run_db_write(
+                        _mark_done_existing,
+                        begin_immediate=True,
+                        retry_kwargs={
+                            "minimum_seconds": 3.0,
+                            "initial_sleep_s": 0.05,
+                            "max_sleep_s": 0.2,
+                            "jitter": True,
+                        },
+                    )
         finally:
             if lock_acquired:
                 self._release_rebuild_lock()
@@ -516,10 +565,9 @@ class WorkQueue:
         if not self.db_path.exists():
             return None
         self._validate_run_lock()
-        conn = self._connect()
-        now = time.time()
-        try:
-            conn.execute("BEGIN IMMEDIATE")
+
+        def _claim(conn: sqlite3.Connection) -> Optional[ClaimedItem]:
+            now = time.time()
             stale_rows = conn.execute(
                 """
                 SELECT items.id, items.attempts
@@ -576,7 +624,6 @@ class WorkQueue:
                 ),
             ).fetchone()
             if not row:
-                conn.execute("COMMIT")
                 return None
             item_id = row["id"]
             attempts = int(row["attempts"] or 0) + 1
@@ -588,7 +635,6 @@ class WorkQueue:
                 "INSERT OR REPLACE INTO claims(id, worker_id, heartbeat_ts, lease_seconds) VALUES (?, ?, ?, ?)",
                 (item_id, self.worker_id, now, int(self.lease_seconds)),
             )
-            conn.execute("COMMIT")
             payload_json = row["payload_json"] or "{}"
             try:
                 payload = json.loads(payload_json)
@@ -600,27 +646,38 @@ class WorkQueue:
                 outputs=list(payload.get("outputs") or []) or None,
             )
             return ClaimedItem(item=work_item, attempt=attempts)
-        except Exception:
-            try:
-                conn.execute("ROLLBACK")
-            except Exception:
-                pass
-            raise
-        finally:
-            conn.close()
+
+        return self._run_db_write(
+            _claim,
+            begin_immediate=True,
+            retry_kwargs={
+                "minimum_seconds": 4.0,
+                "initial_sleep_s": 0.05,
+                "max_sleep_s": 0.5,
+                "jitter": True,
+            },
+        )
 
     def heartbeat(self, item_id: str) -> None:
         if not self.db_path.exists():
             return
         self._validate_run_lock()
-        conn = self._connect()
-        try:
+
+        def _heartbeat(conn: sqlite3.Connection) -> None:
             conn.execute(
                 "UPDATE claims SET heartbeat_ts=? WHERE id=?",
                 (time.time(), str(item_id)),
             )
-        finally:
-            conn.close()
+
+        self._run_db_write(
+            _heartbeat,
+            retry_kwargs={
+                "minimum_seconds": 1.5,
+                "initial_sleep_s": 0.02,
+                "max_sleep_s": 0.2,
+                "jitter": True,
+            },
+        )
 
     def touch_items(self, item_ids: Iterable[str]) -> None:
         if not self.db_path.exists():
@@ -629,9 +686,9 @@ class WorkQueue:
         ids = [str(i) for i in item_ids if i]
         if not ids:
             return
-        conn = self._connect()
         now = time.time()
-        try:
+
+        def _touch(conn: sqlite3.Connection) -> None:
             for idx in range(0, len(ids), 200):
                 chunk = ids[idx : idx + 200]
                 placeholders = ",".join("?" for _ in chunk)
@@ -639,15 +696,23 @@ class WorkQueue:
                     f"UPDATE claims SET heartbeat_ts=? WHERE worker_id=? AND id IN ({placeholders})",
                     (now, self.worker_id, *chunk),
                 )
-        finally:
-            conn.close()
+
+        self._run_db_write(
+            _touch,
+            retry_kwargs={
+                "minimum_seconds": 1.5,
+                "initial_sleep_s": 0.03,
+                "max_sleep_s": 0.2,
+                "jitter": True,
+            },
+        )
 
     def mark_done(self, item_id: str, attempt: int, *, note: Optional[str] = None) -> None:
         if not self.db_path.exists():
             return
         self._validate_run_lock()
-        conn = self._connect()
-        try:
+
+        def _mark_done(conn: sqlite3.Connection) -> None:
             conn.execute(
                 "UPDATE items SET status='done', attempts=?, last_error=NULL, updated_at=? WHERE id=?",
                 (int(attempt), _iso(), str(item_id)),
@@ -657,15 +722,24 @@ class WorkQueue:
                 (str(item_id), int(attempt), "done", note, _iso(), self.worker_id),
             )
             conn.execute("DELETE FROM claims WHERE id=?", (str(item_id),))
-        finally:
-            conn.close()
+
+        self._run_db_write(
+            _mark_done,
+            begin_immediate=True,
+            retry_kwargs={
+                "minimum_seconds": 3.0,
+                "initial_sleep_s": 0.05,
+                "max_sleep_s": 0.4,
+                "jitter": True,
+            },
+        )
 
     def mark_failed(self, item_id: str, attempt: int, error: str) -> None:
         if not self.db_path.exists():
             return
         self._validate_run_lock()
-        conn = self._connect()
-        try:
+
+        def _mark_failed(conn: sqlite3.Connection) -> None:
             conn.execute(
                 "UPDATE items SET status='failed', attempts=?, last_error=?, updated_at=? WHERE id=?",
                 (int(attempt), str(error), _iso(), str(item_id)),
@@ -675,8 +749,17 @@ class WorkQueue:
                 (str(item_id), int(attempt), "failed", str(error), _iso(), self.worker_id),
             )
             conn.execute("DELETE FROM claims WHERE id=?", (str(item_id),))
-        finally:
-            conn.close()
+
+        self._run_db_write(
+            _mark_failed,
+            begin_immediate=True,
+            retry_kwargs={
+                "minimum_seconds": 3.0,
+                "initial_sleep_s": 0.05,
+                "max_sleep_s": 0.4,
+                "jitter": True,
+            },
+        )
 
     def mark_failed_items(self, item_ids: Iterable[str], *, reason: str = "prior failure") -> None:
         if not self.db_path.exists():
@@ -685,9 +768,9 @@ class WorkQueue:
         ids = [str(i) for i in item_ids if i]
         if not ids:
             return
-        conn = self._connect()
         now = _iso()
-        try:
+
+        def _mark_failed_items(conn: sqlite3.Connection) -> None:
             for idx in range(0, len(ids), 200):
                 chunk = ids[idx : idx + 200]
                 placeholders = ",".join("?" for _ in chunk)
@@ -695,15 +778,24 @@ class WorkQueue:
                     f"UPDATE items SET status='failed', last_error=?, updated_at=? WHERE id IN ({placeholders})",
                     (str(reason), now, *chunk),
                 )
-        finally:
-            conn.close()
+
+        self._run_db_write(
+            _mark_failed_items,
+            begin_immediate=True,
+            retry_kwargs={
+                "minimum_seconds": 3.0,
+                "initial_sleep_s": 0.05,
+                "max_sleep_s": 0.4,
+                "jitter": True,
+            },
+        )
 
     def mark_blocked(self, item_id: str, attempt: int, reason: str) -> None:
         if not self.db_path.exists():
             return
         self._validate_run_lock()
-        conn = self._connect()
-        try:
+
+        def _mark_blocked(conn: sqlite3.Connection) -> None:
             conn.execute(
                 "UPDATE items SET status='blocked', attempts=?, last_error=?, updated_at=? WHERE id=?",
                 (int(attempt), str(reason), _iso(), str(item_id)),
@@ -713,8 +805,17 @@ class WorkQueue:
                 (str(item_id), int(attempt), "blocked", str(reason), _iso(), self.worker_id),
             )
             conn.execute("DELETE FROM claims WHERE id=?", (str(item_id),))
-        finally:
-            conn.close()
+
+        self._run_db_write(
+            _mark_blocked,
+            begin_immediate=True,
+            retry_kwargs={
+                "minimum_seconds": 3.0,
+                "initial_sleep_s": 0.05,
+                "max_sleep_s": 0.4,
+                "jitter": True,
+            },
+        )
 
     def release_worker_claims(self) -> int:
         """
@@ -729,32 +830,35 @@ class WorkQueue:
         if not self.db_path.exists():
             return 0
         self._validate_run_lock()
-        conn = self._connect()
-        try:
-            conn.execute("BEGIN IMMEDIATE")
+
+        def _release(conn: sqlite3.Connection) -> int:
             rows = conn.execute(
                 "SELECT id FROM claims WHERE worker_id=?",
                 (self.worker_id,),
             ).fetchall()
             item_ids = [str(r["id"]) for r in rows]
             if not item_ids:
-                conn.execute("COMMIT")
                 return 0
             # Do not flip running -> pending here: pending items are only claimable when
             # attempts < max_attempts, so this can wedge resume if an interrupted claim
             # consumed the final attempt. Deleting claims is sufficient to make running
             # items immediately reclaimable (NULL claim heartbeat is treated as stale).
             conn.execute("DELETE FROM claims WHERE worker_id=?", (self.worker_id,))
-            conn.execute("COMMIT")
             return len(item_ids)
+
+        try:
+            return self._run_db_write(
+                _release,
+                begin_immediate=True,
+                retry_kwargs={
+                    "minimum_seconds": 2.0,
+                    "initial_sleep_s": 0.05,
+                    "max_sleep_s": 0.3,
+                    "jitter": True,
+                },
+            )
         except Exception:
-            try:
-                conn.execute("ROLLBACK")
-            except Exception:
-                pass
             return 0
-        finally:
-            conn.close()
 
     def counts(self) -> Dict[str, int]:
         counts = {"pending": 0, "running": 0, "done": 0, "failed": 0, "blocked": 0}
@@ -838,115 +942,164 @@ class WorkQueue:
     def acquire_leader(self) -> bool:
         self._validate_run_lock()
         self._ensure_db()
-        conn = self._connect()
         now = time.time()
-        try:
-            conn.execute("BEGIN IMMEDIATE")
+
+        def _acquire(conn: sqlite3.Connection) -> bool:
             row = conn.execute("SELECT * FROM leader WHERE id=1").fetchone()
             if row:
                 status = str(row["status"] or "")
                 if status == "completed":
-                    conn.execute("COMMIT")
                     return False
                 if status == "failed" and not self.retry_failed:
-                    conn.execute("COMMIT")
                     return False
                 heartbeat_ts = row["heartbeat_ts"]
                 lease_seconds = row["lease_seconds"]
                 if not self._claim_stale(heartbeat_ts, lease_seconds):
-                    conn.execute("COMMIT")
                     return False
             conn.execute(
                 "INSERT OR REPLACE INTO leader(id, worker_id, heartbeat_ts, lease_seconds, status, updated_at) VALUES (1, ?, ?, ?, ?, ?)",
                 (self.worker_id, now, int(self.leader_timeout), "running", _iso(now)),
             )
-            conn.execute("COMMIT")
             return True
-        except Exception:
-            try:
-                conn.execute("ROLLBACK")
-            except Exception:
-                pass
-            raise
-        finally:
-            conn.close()
+
+        return self._run_db_write(
+            _acquire,
+            begin_immediate=True,
+            retry_kwargs={
+                "minimum_seconds": 4.0,
+                "initial_sleep_s": 0.05,
+                "max_sleep_s": 0.5,
+                "jitter": True,
+            },
+        )
 
     def leader_heartbeat(self) -> None:
         if not self.db_path.exists():
             return
         self._validate_run_lock()
-        conn = self._connect()
-        try:
+
+        def _hb(conn: sqlite3.Connection) -> None:
             conn.execute(
                 "UPDATE leader SET heartbeat_ts=?, updated_at=? WHERE id=1 AND worker_id=?",
                 (time.time(), _iso(), self.worker_id),
             )
-        finally:
-            conn.close()
+
+        self._run_db_write(
+            _hb,
+            retry_kwargs={
+                "minimum_seconds": 1.5,
+                "initial_sleep_s": 0.02,
+                "max_sleep_s": 0.2,
+                "jitter": True,
+            },
+        )
 
     def write_complete(self) -> None:
         if not self.db_path.exists():
             return
         self._validate_run_lock()
-        conn = self._connect()
-        try:
+
+        def _write(conn: sqlite3.Connection) -> None:
             conn.execute(
                 "UPDATE leader SET status='completed', updated_at=? WHERE id=1",
                 (_iso(),),
             )
-        finally:
-            conn.close()
+
+        self._run_db_write(
+            _write,
+            retry_kwargs={
+                "minimum_seconds": 1.5,
+                "initial_sleep_s": 0.02,
+                "max_sleep_s": 0.2,
+                "jitter": True,
+            },
+        )
 
     def write_failed(self, *, error: str | None = None) -> None:
         if not self.db_path.exists():
             return
         self._validate_run_lock()
-        conn = self._connect()
-        try:
+
+        def _write(conn: sqlite3.Connection) -> None:
             conn.execute(
                 "UPDATE leader SET status='failed', updated_at=? WHERE id=1",
                 (_iso(),),
             )
-        finally:
-            conn.close()
+
+        self._run_db_write(
+            _write,
+            retry_kwargs={
+                "minimum_seconds": 1.5,
+                "initial_sleep_s": 0.02,
+                "max_sleep_s": 0.2,
+                "jitter": True,
+            },
+        )
 
     def release_leader(self) -> None:
         if not self.db_path.exists():
             return
         self._validate_run_lock()
-        conn = self._connect()
-        try:
+
+        def _release(conn: sqlite3.Connection) -> None:
             row = conn.execute("SELECT status FROM leader WHERE id=1").fetchone()
             status = str(row["status"] or "") if row else ""
             if status in {"completed", "failed"}:
                 return
             conn.execute("DELETE FROM leader WHERE id=1 AND worker_id=?", (self.worker_id,))
-        finally:
-            conn.close()
+
+        self._run_db_write(
+            _release,
+            begin_immediate=True,
+            retry_kwargs={
+                "minimum_seconds": 2.0,
+                "initial_sleep_s": 0.05,
+                "max_sleep_s": 0.3,
+                "jitter": True,
+            },
+        )
 
     def reset_items_for_retry(self) -> None:
         if not self.db_path.exists():
             return
         self._validate_run_lock()
-        conn = self._connect()
-        try:
+
+        def _reset(conn: sqlite3.Connection) -> None:
             conn.execute(
                 "UPDATE items SET status='pending', attempts=0, last_error=NULL, updated_at=? WHERE status IN ('failed','blocked','running')",
                 (_iso(),),
             )
             conn.execute("DELETE FROM claims")
-        finally:
-            conn.close()
+
+        self._run_db_write(
+            _reset,
+            begin_immediate=True,
+            retry_kwargs={
+                "minimum_seconds": 3.0,
+                "initial_sleep_s": 0.05,
+                "max_sleep_s": 0.4,
+                "jitter": True,
+            },
+        )
 
     def reset_leader_for_retry(self) -> None:
         if not self.db_path.exists():
             return
         self._validate_run_lock()
-        conn = self._connect()
-        try:
+
+        def _reset(conn: sqlite3.Connection) -> None:
             conn.execute("DELETE FROM leader WHERE id=1")
-        finally:
-            conn.close()
+
+        self._run_db_write(
+            _reset,
+            begin_immediate=True,
+            retry_kwargs={
+                "minimum_seconds": 2.0,
+                "initial_sleep_s": 0.05,
+                "max_sleep_s": 0.3,
+                "jitter": True,
+            },
+        )
 
     def attempt_log_path(self, item_id: str, attempt: int) -> Path:
         # Per-worker log file (prefixed lines handled by caller).
@@ -976,49 +1129,67 @@ def reset_all_claims_and_leaders(out_dir: str | Path) -> Dict[str, Any]:
         step_name = step_dir.name
         step_info: Dict[str, Any] = {"step": step_name, "db": str(db_path), "claims_deleted": 0, "leader_deleted": 0}
         last_exc: Exception | None = None
-        for _attempt in range(10):
+
+        def _is_missing_or_corrupt_schema_error(exc: sqlite3.OperationalError) -> bool:
+            msg = str(exc).lower()
+            if "no such table" in msg:
+                return True
+            if "corrupt" in msg:
+                return True
+            if "malformed" in msg:
+                return True
+            return False
+
+        def _reset_once() -> None:
+            conn = sqlite3.connect(db_path, timeout=1.0, isolation_level=None)
+            conn.row_factory = sqlite3.Row
             try:
-                conn = sqlite3.connect(db_path, timeout=1.0, isolation_level=None)
-                conn.row_factory = sqlite3.Row
+                conn.execute("PRAGMA busy_timeout = 1000")
+                conn.execute("BEGIN IMMEDIATE")
                 try:
-                    conn.execute("PRAGMA busy_timeout = 1000")
-                    conn.execute("BEGIN IMMEDIATE")
                     try:
-                        try:
-                            row = conn.execute("SELECT COUNT(*) AS c FROM claims").fetchone()
-                            step_info["claims_deleted"] = int(row["c"] or 0) if row else 0
-                            conn.execute("DELETE FROM claims")
-                        except sqlite3.OperationalError:
-                            # Table missing or corrupted schema; best-effort.
+                        row = conn.execute("SELECT COUNT(*) AS c FROM claims").fetchone()
+                        step_info["claims_deleted"] = int(row["c"] or 0) if row else 0
+                        conn.execute("DELETE FROM claims")
+                    except sqlite3.OperationalError as exc:
+                        # Table missing or corrupted schema; best-effort.
+                        if _is_missing_or_corrupt_schema_error(exc):
                             pass
-                        try:
-                            # leader is a single-row table (id=1); delete unconditionally.
-                            row = conn.execute("SELECT COUNT(*) AS c FROM leader").fetchone()
-                            step_info["leader_deleted"] = int(row["c"] or 0) if row else 0
-                            conn.execute("DELETE FROM leader")
-                        except sqlite3.OperationalError:
+                        else:
+                            raise
+                    try:
+                        # leader is a single-row table (id=1); delete unconditionally.
+                        row = conn.execute("SELECT COUNT(*) AS c FROM leader").fetchone()
+                        step_info["leader_deleted"] = int(row["c"] or 0) if row else 0
+                        conn.execute("DELETE FROM leader")
+                    except sqlite3.OperationalError as exc:
+                        # Table missing or corrupted schema; best-effort.
+                        if _is_missing_or_corrupt_schema_error(exc):
                             pass
-                        conn.execute("COMMIT")
-                        last_exc = None
-                        break
+                        else:
+                            raise
+                    conn.execute("COMMIT")
+                except Exception:
+                    try:
+                        conn.execute("ROLLBACK")
                     except Exception:
-                        try:
-                            conn.execute("ROLLBACK")
-                        except Exception:
-                            pass
-                        raise
-                finally:
-                    conn.close()
-            except sqlite3.OperationalError as exc:
-                last_exc = exc
-                msg = str(exc).lower()
-                if "locked" in msg or "busy" in msg:
-                    time.sleep(0.25)
-                    continue
-                break
-            except Exception as exc:
-                last_exc = exc
-                break
+                        pass
+                    raise
+            finally:
+                conn.close()
+
+        try:
+            run_with_lock_retry(
+                _reset_once,
+                busy_timeout_ms=1000,
+                minimum_seconds=3.0,
+                multiplier=3.0,
+                initial_sleep_s=0.25,
+                max_sleep_s=0.5,
+                jitter=True,
+            )
+        except Exception as exc:
+            last_exc = exc
         if last_exc is not None:
             step_info["error"] = str(last_exc)
         summary["steps"].append(step_info)
