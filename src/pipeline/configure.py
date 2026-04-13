@@ -67,13 +67,6 @@ def _step_config(name: str, run_id: int, input_data: dict) -> dict:
             "manifest": f"{manifests_dir}/rosetta_interface.csv",
             "input_dir": f"{run_dir}/af3score_round1/filtered_pdbs",
         })
-    elif name == "rosetta_interface2":
-        cfg.update({
-            "stage": "rosetta",
-            "output_dir": f"{run_dir}/rosetta_interface2",
-            "manifest": f"{manifests_dir}/rosetta_interface2.csv",
-            "input_dir": f"{run_dir}/relax",
-        })
     elif name == "interface_enrich":
         cfg.update({
             "stage": "rosetta",
@@ -115,7 +108,7 @@ def _step_config(name: str, run_id: int, input_data: dict) -> dict:
             "stage": "rosetta",
             "output_dir": f"{run_dir}/relax",
             "manifest": f"{manifests_dir}/relax.csv",
-            "input_dir": f"{run_dir}/af3score_round2/filtered_pdbs",
+            "input_dir": f"{run_dir}/flowpacker_round2/packed_pdbs",
         })
     elif name == "dockq":
         cfg.update({
@@ -144,6 +137,7 @@ def _step_config(name: str, run_id: int, input_data: dict) -> dict:
             "output_dir": f"{run_dir}/af3_refold",
             "manifest": f"{manifests_dir}/af3_refold.csv",
             "input_dir": f"{run_dir}/relax",
+            "filter_stems_dir": f"{run_dir}/af3score_round2/filtered_pdbs",
         })
     return cfg
 

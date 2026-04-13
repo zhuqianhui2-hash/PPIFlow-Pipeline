@@ -3678,6 +3678,24 @@ class AF3RefoldStep(ExternalCommandStep):
         pdbs = collect_pdbs(input_pdb_dir)
         if not pdbs:
             raise StepError(f"No PDBs found for af3_refold in {input_pdb_dir}")
+
+        # Filter to intersection with af3score2-passed stems if configured.
+        # This ensures af3_refold only processes relaxed PDBs that passed af3score2 filtering.
+        filter_stems_dir = self.cfg.get("filter_stems_dir")
+        if filter_stems_dir:
+            filter_path = Path(str(filter_stems_dir))
+            if not filter_path.is_absolute():
+                filter_path = ctx.out_dir / filter_path
+            if filter_path.exists():
+                allowed_stems = {fp.stem.lower() for fp in collect_pdbs(filter_path)}
+                if allowed_stems:
+                    pdbs = [p for p in pdbs if p.stem.lower() in allowed_stems]
+                    if not pdbs:
+                        raise StepError(
+                            f"No PDBs in {input_pdb_dir} matched af3score2 filter stems "
+                            f"from {filter_path} (intersection is empty)"
+                        )
+
         run_stems = compute_run_stems(pdbs, input_pdb_dir)
 
         items: list[WorkItem] = []

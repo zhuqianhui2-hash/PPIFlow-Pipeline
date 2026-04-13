@@ -6,9 +6,13 @@ __pycache__/
 # Project directories (ignores everything inside)
 runs/
 docs/
+weight/
 
 # File types
 *.ckpt
+*.pt
+*.bin
+*.zst
 
 tests/
 pytest.ini

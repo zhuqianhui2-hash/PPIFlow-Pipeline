@@ -165,8 +165,12 @@ class RankStep(Step):
         return None
 
     def _load_interface_scores(self, run_dir: Path) -> dict[str, float]:
-        # Interface scores must come from post-round2 analysis only.
-        candidates = list(run_dir.glob("rosetta_interface2/*.csv"))
+        # Interface scores come from post-relax analysis.
+        # New layout: relax/ contains interface_scores.csv (merged from former rosetta_interface2).
+        # Fallback: old layout with rosetta_interface2/ for backward compatibility.
+        candidates = list(run_dir.glob("relax/interface_scores.csv"))
+        candidates += list(run_dir.glob("relax/residue_energy.csv"))
+        candidates += list(run_dir.glob("rosetta_interface2/*.csv"))
         mapping: dict[str, float] = {}
         for path in candidates:
             try:

@@ -833,11 +833,107 @@ class RosettaRelaxStep(Step):
         target = out_dir / f"{name}.pdb"
         allow_reuse = bool((ctx.work_queue or {}).get("allow_reuse", True))
         promote_file_atomic(relaxed, target, allow_reuse=allow_reuse)
+
+        # -- Post-relax interface scoring (merged from former rosetta_interface2) --
+        # The Rosetta log already contains ResResE lines from the ScoreCutoffFilter;
+        # reuse them to compute per-residue interface energy for this item.
+        self._run_interface_scoring_item(ctx, item, input_dir, job_root, item_out)
+
         if output_enabled and not is_minimal(ctx):
             promote_tree(job_root, optional_dir(ctx) / "relax" / "rosetta_jobs", allow_reuse=allow_reuse)
         shutil.rmtree(item_dir, ignore_errors=True)
         if output_enabled:
             shutil.rmtree(job_root.parent, ignore_errors=True)
+
+    def _run_interface_scoring_item(
+        self,
+        ctx: StepContext,
+        item: WorkItem,
+        input_dir: Path,
+        job_root: Path,
+        item_out: Path,
+    ) -> None:
+        """Run get_interface_energy.py for a single item and record metrics in the ledger."""
+        script = _find_rosetta_resource("get_interface_energy.py")
+        binder_id = _resolve_binder_chain(ctx.input_data)
+        target_ids = _resolve_target_chains(ctx.input_data)
+        interface_dist = float(
+            (ctx.input_data.get("filters") or {}).get("rosetta", {}).get("interface_distance") or 12.0
+        )
+        target_id_arg = ",".join(target_ids)
+        cmd = [
+            sys.executable,
+            str(script),
+            "--input_pdbdir",
+            str(input_dir),
+            "--rosetta_dir",
+            str(job_root),
+            "--binder_id",
+            binder_id,
+            "--target_id",
+            target_id_arg,
+            "--output_dir",
+            str(item_out),
+            "--interface_dist",
+            str(interface_dist),
+            "--num-workers",
+            "1",
+            "--no-plot",
+        ]
+        env = os.environ.copy()
+        env.setdefault("MPLBACKEND", "Agg")
+        env["OMP_NUM_THREADS"] = "1"
+        env["MKL_NUM_THREADS"] = "1"
+        env["OPENBLAS_NUM_THREADS"] = "1"
+        env["NUMEXPR_NUM_THREADS"] = "1"
+        env["VECLIB_MAXIMUM_THREADS"] = "1"
+        env["BLIS_NUM_THREADS"] = "1"
+        run_command(
+            cmd,
+            env=env,
+            cwd=str(item_out),
+            log_file=self.cfg.get("_log_file"),
+            verbose=bool(self.cfg.get("_verbose")),
+        )
+
+        # Record interface energy metrics in the SQLite ledger.
+        residue_src = item_out / "residue_energy.csv"
+        out_dir = self.output_dir(ctx)
+        if residue_src.exists():
+            try:
+                import pandas as pd
+
+                df = pd.read_csv(residue_src)
+                if "pdbpath" in df.columns:
+                    pdb_path_str = str((item.payload or {}).get("pdb_path") or "")
+                    df["pdbpath"] = pdb_path_str
+                df.to_csv(residue_src, index=False)
+                if not getattr(df, "empty", False):
+                    row_dict = dict(df.iloc[0].to_dict())
+                    pdb_name = str(
+                        row_dict.get("pdbname")
+                        or Path(str(row_dict.get("pdbpath", ""))).stem
+                        or item.id
+                    )
+                    ledger = MetricsLedger(ctx.out_dir, out_dir)
+                    try:
+                        ledger.upsert(
+                            str(item.id),
+                            status="done",
+                            metrics=row_dict,
+                            outputs={"pdb_path": str(out_dir / f"{item.id}.pdb")},
+                            worker_id=os.environ.get("PPIFLOW_WORKER_ID")
+                            or f"{os.uname().nodename}:{os.getpid()}:{os.environ.get('RANK', '0')}",
+                            attempt=int((item.payload or {}).get("_attempt") or 1)
+                            if isinstance(item.payload, dict)
+                            else 1,
+                            design_id=extract_design_id(pdb_name),
+                            structure_id=structure_id_from_name(pdb_name),
+                        )
+                    finally:
+                        ledger.close()
+            except Exception:
+                pass
 
     def run_full(self, ctx: StepContext) -> None:
         input_dir = self.cfg.get("input_dir")
@@ -949,6 +1045,12 @@ class RosettaRelaxStep(Step):
                     target = out_dir / pdb.name.replace("_0001", "")
                     promote_file_atomic(pdb, target, allow_reuse=True)
                     break
+
+        # -- Post-relax interface scoring (merged from former rosetta_interface2) --
+        # The Rosetta log already contains ResResE lines from the ScoreCutoffFilter;
+        # reuse them to compute per-residue interface energy.
+        self._run_interface_scoring_full(ctx, input_path, rosetta_root, out_dir)
+
         if output_enabled and not is_minimal(ctx):
             try:
                 promote_tree(rosetta_root, optional_dir(ctx) / "relax" / "rosetta_jobs", allow_reuse=True)
@@ -956,6 +1058,91 @@ class RosettaRelaxStep(Step):
                 pass
         if output_enabled:
             shutil.rmtree(rosetta_root, ignore_errors=True)
+
+    def _run_interface_scoring_full(
+        self,
+        ctx: StepContext,
+        input_path: Path,
+        rosetta_root: Path,
+        out_dir: Path,
+    ) -> None:
+        """Run get_interface_energy.py on all relaxed structures (full/batch mode)."""
+        script = _find_rosetta_resource("get_interface_energy.py")
+        binder_id = _resolve_binder_chain(ctx.input_data)
+        target_ids = _resolve_target_chains(ctx.input_data)
+        interface_dist = float(
+            (ctx.input_data.get("filters") or {}).get("rosetta", {}).get("interface_distance") or 12.0
+        )
+        target_id_arg = ",".join(target_ids)
+        cmd = [
+            sys.executable,
+            str(script),
+            "--input_pdbdir",
+            str(input_path),
+            "--rosetta_dir",
+            str(rosetta_root),
+            "--binder_id",
+            binder_id,
+            "--target_id",
+            target_id_arg,
+            "--output_dir",
+            str(out_dir),
+            "--interface_dist",
+            str(interface_dist),
+            "--no-plot",
+        ]
+        env = os.environ.copy()
+        env.setdefault("MPLBACKEND", "Agg")
+        env["OMP_NUM_THREADS"] = "1"
+        env["MKL_NUM_THREADS"] = "1"
+        env["OPENBLAS_NUM_THREADS"] = "1"
+        env["NUMEXPR_NUM_THREADS"] = "1"
+        env["VECLIB_MAXIMUM_THREADS"] = "1"
+        env["BLIS_NUM_THREADS"] = "1"
+        start = time.time()
+        status = "OK"
+        try:
+            run_command(
+                cmd,
+                env=env,
+                log_file=self.cfg.get("_log_file"),
+                verbose=bool(self.cfg.get("_verbose")),
+            )
+        except Exception:
+            status = "FAILED"
+            raise
+        finally:
+            log_command_progress(
+                str(self.cfg.get("name") or self.name),
+                1,
+                1,
+                item="parse_interface",
+                status=status,
+                elapsed=time.time() - start,
+                log_file=self.cfg.get("_log_file"),
+            )
+
+        # Generate interface_scores.csv from residue_energy.csv
+        residue_csv = out_dir / "residue_energy.csv"
+        if residue_csv.exists():
+            try:
+                import ast
+                import pandas as pd
+
+                df = pd.read_csv(residue_csv)
+                rows = []
+                for _, row in df.iterrows():
+                    name = str(row.get("pdbname") or Path(str(row.get("pdbpath", ""))).stem)
+                    try:
+                        energy_dict = ast.literal_eval(row.get("binder_energy") or "{}")
+                    except Exception:
+                        energy_dict = {}
+                    interface_score = sum(float(v) for v in (energy_dict or {}).values())
+                    rows.append({"pdb_name": name, "interface_score": interface_score})
+                if rows:
+                    write_csv(out_dir / "interface_scores.csv", rows, ["pdb_name", "interface_score"])
+            except Exception:
+                pass
 
     def write_manifest(self, ctx: StepContext) -> None:
         out_dir = self.output_dir(ctx)
@@ -970,3 +1157,45 @@ class RosettaRelaxStep(Step):
             })
         if rows:
             write_csv(self.manifest_path(ctx), rows, ["design_id", "structure_id", "pdb_path"])
+
+        # Consolidate per-item interface energy metrics from the ledger into
+        # residue_energy.csv and interface_scores.csv (work-queue mode).
+        residue_csv = out_dir / "residue_energy.csv"
+        if not residue_csv.exists():
+            try:
+                ledger = MetricsLedger(ctx.out_dir, out_dir)
+                try:
+                    ledger_rows = [r.metrics for r in ledger.iter_rows(status="done")]
+                finally:
+                    ledger.close()
+                if ledger_rows:
+                    import pandas as pd
+
+                    df_all = pd.DataFrame(ledger_rows)
+                    tmp_residue = residue_csv.parent / f"{residue_csv.name}.tmp"
+                    df_all.to_csv(tmp_residue, index=False)
+                    os.replace(tmp_residue, residue_csv)
+            except Exception:
+                pass
+
+        # Generate interface_scores.csv from residue_energy.csv if not yet present
+        scores_csv = out_dir / "interface_scores.csv"
+        if not scores_csv.exists() and residue_csv.exists():
+            try:
+                import ast
+                import pandas as pd
+
+                df = pd.read_csv(residue_csv)
+                score_rows = []
+                for _, row in df.iterrows():
+                    name = str(row.get("pdbname") or Path(str(row.get("pdbpath", ""))).stem)
+                    try:
+                        energy_dict = ast.literal_eval(row.get("binder_energy") or "{}")
+                    except Exception:
+                        energy_dict = {}
+                    interface_score = sum(float(v) for v in (energy_dict or {}).values())
+                    score_rows.append({"pdb_name": name, "interface_score": interface_score})
+                if score_rows:
+                    write_csv(scores_csv, score_rows, ["pdb_name", "interface_score"])
+            except Exception:
+                pass
